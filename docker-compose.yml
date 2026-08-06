@@ -1,0 +1,20 @@
+services:
+  swarm-mcp:
+    build: .
+    container_name: swarm-mcp
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    environment:
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=3004
+    # state.db of Hermes agents is read for response polling
+    volumes:
+      - /opt/hermes/agents:/opt/hermes/agents:ro
+    networks:
+      - default
+      - faracrm_default
+
+networks:
+  faracrm_default:
+    external: true
