@@ -1,12 +1,13 @@
 services:
   swarm-mcp:
     build: .
-    container_name: swarm-mcp
+    image: demlabs/swarm-mcp:local
+    container_name: dev-swarm-mcp
     restart: unless-stopped
-    network_mode: host
-    environment:
-      - MCP_HOST=0.0.0.0
-      - MCP_PORT=3004
-    # state.db of Hermes agents is read for response polling
-    volumes:
-      - /opt/hermes/agents:/opt/hermes/agents:ro
+    env_file: ../swarm/.env
+    networks: [swarm]
+
+networks:
+  swarm:
+    external: true
+    name: demlabs-dev-swarm
