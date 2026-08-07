@@ -1,55 +1,173 @@
-# Swarm MCP Server
+# Swarm MCP
 
-This service is the authenticated communication plane for the Hermes
-development swarm. It exposes one MCP catalog per role. A role token is valid
-only at that role's endpoint; it cannot be reused to discover or call another
-catalog.
+Swarm MCP is the authenticated communication and authorization plane for the
+Hermes development swarm. Version 0.2 is implemented in Rust and exposes a
+separate Streamable HTTP MCP endpoint for every role. A bearer token grants one
+role catalog only; it cannot be reused against another role's endpoint.
 
-The endpoint template and hierarchy are configured in `../swarm/.env`:
+The retired Python implementation is preserved under `src/old_python/` for
+audit and migration reference. It is not copied into the runtime image and is
+not part of the deployed service. The Python `requirements.txt` has been
+removed.
+
+The detailed review of the retired implementation, completed fixes, known
+limits, and capability roadmap is in [REVIEW.md](REVIEW.md).
+
+## Role hierarchy
+
+The hierarchy is data-driven:
 
 ```dotenv
-SWARM_ROLE_MCP_PATH_TEMPLATE=/roles/{role}/mcp
+SWARM_AGENT_ROLES=developer,designer,lead-developer,tester,devops
+SWARM_MANAGER_ROLE=manager
 SWARM_ORDER_ACL={"manager":["*"],"lead-developer":["developer"]}
 ```
 
-With that ACL, the catalogs are:
+With this configuration the catalogs are:
 
 | Caller | Tools |
 |---|---|
-| manager | `order`, `order_all` |
-| lead-developer | `order`, `report`, `msg_to`, `msg_all` |
-| developer, designer, tester, devops | `report`, `msg_to`, `msg_all` |
+| `manager` | `order`, `order_all` |
+| `lead-developer` | `order`, `report`, `msg_to`, `msg_all` |
+| `developer`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
 
-`*` grants swarm-wide `order` and `order_all`. An explicit target list grants
-only `order`, and its MCP input schema enumerates only those targets. Roles
-without an ACL entry cannot issue orders. The `swarm://hierarchy` resource
-shows the authenticated caller's targets, supervisors, and capabilities.
+`"*"` grants swarm-wide `order` and `order_all`. An explicit list grants only
+single-target `order`; the generated JSON Schema enumerates exactly the targets
+allowed to that caller. Reverse ACL lookup determines the valid `report`
+recipients. Executors may coordinate only with other executors.
 
-`order` starts an asynchronous Hermes run and tells the subordinate to report
-back to the issuing authority. `report` accepts only recipients that supervise
-the caller according to the reverse ACL; it defaults to the manager for
-backward compatibility. Peer messages remain available to executor roles.
+Every mutating tool accepts an optional `idempotency_key`. Callers should reuse
+the same key when retrying the same logical action. Reusing a key with different
+arguments is rejected. Keys must not be recycled for unrelated work; their
+records expire with `SWARM_OPERATION_RETENTION_DAYS`.
 
-The authenticated `/activity` endpoint accepts lifecycle signals only from
-routes declared in `SWARM_ACTIVITY_ROUTES`. Developer start/completion/failure
-signals currently start a lead-developer run that verifies the recurring
-inspection cron and performs review when useful. Orders, reports, peer
-messages, and activity signals are copied to the shared Telegram group by the
-sender's bot.
+## Resources
 
-All role names, paths, ACLs, activity routes, tokens, timeouts, instructions,
-and English prompt templates live in `../swarm/.env`; see
-`../swarm/.env.example`. The service has no published host port.
+| URI | Visibility | Purpose |
+|---|---|---|
+| `swarm://hierarchy` | every role | Effective roles, ACL, supervisors, tools, and safeguards |
+| `swarm://executors` | manager | Compatibility alias for the hierarchy |
+| `swarm://operations` | every role | Recent durable operations sent or received by that role |
+| `swarm://activity` | ordering authorities | Current and recent passive subordinate lifecycle state |
+| `swarm://outbox` | every role | Telegram delivery state; manager sees all, executors see their own |
 
-Validate every role catalog and cross-role authentication after deployment:
+The activity endpoint records only lifecycle state. It never starts an agent,
+changes cron configuration, or sends Telegram messages. Timestamps make
+out-of-order delivery deterministic, repeated hook events are deduplicated, and
+stale `started` records are not reported as active forever.
+
+## Delivery and persistence
+
+Before contacting an agent API, the server reserves the operation in SQLite.
+The store provides:
+
+- WAL mode and an asynchronous connection pool;
+- a role-scoped operation ledger;
+- idempotency conflict and replay handling;
+- per-role persistent rate limits and a global in-flight dispatch bound;
+- explicit `accepted`, `partial`, `failed`, and `indeterminate` states;
+- automatic import of the old Python activity tables;
+- transactional, forward-version-checked schema migrations;
+- configurable operation/activity/outbox retention;
+- a durable Telegram outbox with bounded retries, `Retry-After` support, and
+  per-chunk checkpoints.
+
+Telegram delivery is asynchronous. A successful tool response reports an
+`outbox_id`; temporary Telegram failure does not turn a successfully accepted
+agent run into a failed command. Telegram delivery is at-least-once, so a crash
+between Telegram accepting a message and the local acknowledgement can produce
+a duplicate.
+
+The server reuses bounded HTTP clients, disables redirects, limits upstream
+response bodies, bounds semaphore wait time, and shuts down MCP sessions and
+background workers gracefully. Valid MCP and activity traffic is admitted
+through per-role request windows before it can create unbounded work.
+
+## HTTP endpoints and security
+
+| Endpoint | Authentication |
+|---|---|
+| `/roles/<role>/mcp` | the exact role's bearer token |
+| `/activity` | any configured executor token |
+| `/health` | none; liveness only, no roster or secrets |
+| `/ready` | none; obtains and rolls back a SQLite write transaction |
+
+All routes, including health and activity, enforce `Host`. Requests carrying an
+`Origin` header must match the configured origin allowlist. MCP and JSON bodies
+have a shared size limit. Secret values use a redacted debug representation and
+role comparisons use constant-time token equality.
+
+MCP is served on one Streamable HTTP endpoint per role, as required by the MCP
+transport model. POST and GET are handled by the official Rust SDK service.
+
+## Configuration
+
+Runtime configuration lives in `../swarm/.env`; non-secret examples are in
+`../swarm/.env.example`. Configuration is validated before binding a socket.
+Unknown hierarchy roles, duplicate tokens, invalid activity routes, incomplete
+prompt placeholders, unsafe URLs, and malformed limits fail startup.
+Both Compose files pass an explicit Swarm MCP environment allowlist rather than
+injecting unrelated provider, Forgejo, or desktop secrets from the shared file.
+
+Important groups:
+
+| Group | Variables |
+|---|---|
+| Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
+| Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_ORDER_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
+| Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY` |
+| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS` |
+| HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
+| State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
+| Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |
+| Telegram | `SWARM_TELEGRAM_ENABLED`, `<ROLE>_TELEGRAM_BOT_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_PROXY_URL`, `SWARM_OUTBOX_*` |
+| Prompts | `SWARM_*_INSTRUCTIONS`, `SWARM_*_PROMPT_TEMPLATE` |
+
+## Local verification
+
+Rust 1.89 or newer is required:
 
 ```bash
-docker exec dev-swarm-mcp python -m swarm_mcp.probe
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo build --locked --release
+cargo audit --file Cargo.lock
 ```
 
-Optional end-to-end checks:
+Start the server with the swarm environment and run non-destructive deployment
+probes:
 
 ```bash
-docker exec dev-swarm-mcp python -m swarm_mcp.smoke developer
-docker exec dev-swarm-mcp python -m swarm_mcp.report_smoke developer
+swarm-mcp serve
+swarm-mcp probe
+swarm-mcp activity-probe
 ```
+
+`probe` verifies every role's exact tool/resource catalog plus every wrong
+token/endpoint combination. `activity-probe` checks every configured route and
+also proves the event is absent from non-target authority resources. Neither
+probe invokes an agent tool.
+
+## Docker
+
+The image uses digest-pinned Rust, Dockerfile frontend, and minimal Debian base
+images. The runtime installs no packages and copies only the CA bundle and
+compiled binary. It runs as UID/GID 1000 with no Linux capabilities, a read-only
+root filesystem, and only the `/data` SQLite volume writable. The image
+healthcheck calls `/ready` through the same compiled binary.
+
+From the swarm directory:
+
+```bash
+docker compose build swarm-mcp
+docker compose up -d swarm-mcp
+docker compose exec -T swarm-mcp swarm-mcp probe
+docker compose exec -T swarm-mcp swarm-mcp activity-probe
+```
+
+The full deployment remains `swarm/deploy-agent-dev.sh`; it synchronizes this
+repository to `agent@agent-dev-0`, backs up SQLite and the previous image,
+starts Swarm MCP alone, runs both probes, and rolls back that state/image if the
+preflight fails. Hermes, Firefox, and Forgejo deployment inputs are pinned in
+`swarm/.env`.

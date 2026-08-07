@@ -1,4 +1,4 @@
-"""Operational probe for role-specific MCP catalogs and endpoint isolation."""
+"""Archived Python probe for role-specific MCP catalogs and endpoint isolation."""
 from __future__ import annotations
 
 import asyncio
@@ -57,6 +57,16 @@ def _expected_tools(role: str, manager: str, executors: tuple[str, ...]) -> list
     return sorted(tools)
 
 
+def _expected_resources(role: str, manager: str) -> list[str]:
+    acl = json.loads(os.environ["SWARM_ORDER_ACL"])
+    resources = ["swarm://hierarchy"]
+    if role == manager:
+        resources.append("swarm://executors")
+    if acl.get(role):
+        resources.append("swarm://activity")
+    return sorted(resources)
+
+
 async def main() -> None:
     port = os.environ["SWARM_MCP_PORT"]
     base = f"http://127.0.0.1:{port}"
@@ -68,11 +78,13 @@ async def main() -> None:
     ok = True
     for role, (tools, resources) in zip(roles, catalogs, strict=True):
         expected = _expected_tools(role, manager, executors)
-        role_ok = tools == expected and "swarm://hierarchy" in resources
+        expected_resources = _expected_resources(role, manager)
+        role_ok = tools == expected and resources == expected_resources
         results[role] = {
             "tools": tools,
             "expected": expected,
             "resources": resources,
+            "expected_resources": expected_resources,
             "ok": role_ok,
         }
         ok = ok and role_ok

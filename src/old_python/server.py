@@ -1,4 +1,4 @@
-"""Authenticated, role-aware communication plane for the development swarm."""
+"""Archived Python implementation of the development swarm communication plane."""
 from __future__ import annotations
 
 import asyncio
@@ -8,8 +8,11 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
@@ -71,6 +74,12 @@ TELEGRAM_TIMEOUT_SECONDS = _positive_int("SWARM_TELEGRAM_TIMEOUT_SECONDS")
 HERMES_MODEL_ALIAS = _required("SWARM_HERMES_MODEL_ALIAS")
 ROLE_MCP_PATH_TEMPLATE = _required("SWARM_ROLE_MCP_PATH_TEMPLATE")
 ACTIVITY_SIGNAL_PATH = _required("SWARM_ACTIVITY_SIGNAL_PATH")
+ACTIVITY_ENABLED = _env("SWARM_ACTIVITY_ENABLED", "false").lower() in {
+    "1", "true", "yes", "on",
+}
+STATE_DB_PATH = Path(_required("SWARM_STATE_DB_PATH"))
+ACTIVITY_RETENTION_DAYS = _positive_int("SWARM_ACTIVITY_RETENTION_DAYS")
+ACTIVITY_HISTORY_LIMIT = _positive_int("SWARM_ACTIVITY_HISTORY_LIMIT")
 _caller_role: contextvars.ContextVar[str] = contextvars.ContextVar(
     "swarm_caller_role", default=""
 )
@@ -209,6 +218,15 @@ def _validate_configuration() -> None:
         raise RuntimeError("SWARM_ORDER_ACL contains an unknown authority")
     if set(ACTIVITY_ROUTES) - set(AGENT_ROLES):
         raise RuntimeError("Only executor roles may emit activity signals")
+    for sender, targets in ACTIVITY_ROUTES.items():
+        unauthorized = [
+            target for target in targets if sender not in ORDER_ACL.get(target, ())
+        ]
+        if unauthorized:
+            raise RuntimeError(
+                f"SWARM_ACTIVITY_ROUTES.{sender} contains roles that do not "
+                f"supervise it: {unauthorized}"
+            )
     if set(AGENT_ROLES) - set(ORDER_ACL.get(MANAGER_ROLE, ())):
         raise RuntimeError("The manager must be authorized to order every executor")
 
@@ -384,6 +402,119 @@ def _caller(expected: str) -> str:
     if role != expected:
         raise RuntimeError("Authenticated role does not match this MCP catalog")
     return role
+
+
+def _activity_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(STATE_DB_PATH, timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _initialize_activity_store() -> None:
+    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _activity_connection() as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS activity_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                target TEXT NOT NULL,
+                event TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS activity_state (
+                sender TEXT NOT NULL,
+                target TEXT NOT NULL,
+                event TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (sender, target)
+            )
+            """
+        )
+
+
+def _record_activity(
+    sender: str,
+    target: str,
+    event: str,
+    turn_id: str,
+    detail: str,
+) -> None:
+    recorded_at = datetime.now(UTC).isoformat()
+    cutoff = (datetime.now(UTC) - timedelta(days=ACTIVITY_RETENTION_DAYS)).isoformat()
+    with _activity_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO activity_events(sender, target, event, turn_id, detail, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (sender, target, event, turn_id, detail, recorded_at),
+        )
+        connection.execute(
+            """
+            INSERT INTO activity_state(sender, target, event, turn_id, detail, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sender, target) DO UPDATE SET
+                event=excluded.event,
+                turn_id=excluded.turn_id,
+                detail=excluded.detail,
+                recorded_at=excluded.recorded_at
+            """,
+            (sender, target, event, turn_id, detail, recorded_at),
+        )
+        connection.execute(
+            "DELETE FROM activity_events WHERE recorded_at < ?",
+            (cutoff,),
+        )
+
+
+def _activity_snapshot(role: str) -> dict[str, Any]:
+    senders = ORDER_ACL.get(role, ())
+    if not senders:
+        return {
+            "caller": role,
+            "enabled": ACTIVITY_ENABLED,
+            "mode": "record-only",
+            "current": [],
+            "recent": [],
+        }
+    placeholders = ",".join("?" for _ in senders)
+    with _activity_connection() as connection:
+        current = connection.execute(
+            f"""
+            SELECT sender, event, turn_id, detail, recorded_at
+            FROM activity_state
+            WHERE target = ? AND sender IN ({placeholders})
+            ORDER BY recorded_at DESC
+            """,
+            (role, *senders),
+        ).fetchall()
+        recent = connection.execute(
+            f"""
+            SELECT sender, event, turn_id, detail, recorded_at
+            FROM activity_events
+            WHERE target = ? AND sender IN ({placeholders})
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (role, *senders, ACTIVITY_HISTORY_LIMIT),
+        ).fetchall()
+    return {
+        "caller": role,
+        "enabled": ACTIVITY_ENABLED,
+        "mode": "record-only",
+        "current": [dict(row) for row in current],
+        "recent": [dict(row) for row in recent],
+    }
 
 
 async def _dispatch_order(authority: str, target: str, command: str) -> dict[str, Any]:
@@ -603,6 +734,24 @@ def _register_hierarchy_resource(role: str, server: FastMCP) -> None:
             mime_type="application/json",
         )(hierarchy)
 
+    if ORDER_ACL.get(role):
+        async def activity() -> str:
+            """Return passive lifecycle state for subordinates visible to the caller."""
+            _caller(role)
+            return json.dumps(_activity_snapshot(role), ensure_ascii=False, indent=2)
+
+        activity.__name__ = f"activity_{_prefix(role).lower()}"
+        server.resource(
+            "swarm://activity",
+            name="activity",
+            title="Subordinate activity state",
+            description=(
+                "Passive lifecycle state and recent events for configured subordinates. "
+                "Reading this resource never starts an agent run or sends Telegram messages."
+            ),
+            mime_type="application/json",
+        )(activity)
+
 
 def _register_order_tools(role: str, server: FastMCP) -> None:
     allowed = ORDER_ACL.get(role, ())
@@ -677,39 +826,6 @@ def _role_for_token(supplied: str) -> str:
     return ""
 
 
-async def _activity_dispatch(
-    sender: str,
-    target: str,
-    event: str,
-    turn_id: str,
-    detail: str,
-) -> dict[str, Any]:
-    text = _format_template(
-        "SWARM_ACTIVITY_PROMPT_TEMPLATE",
-        sender=sender,
-        recipient=target,
-        event=event,
-        turn_id=turn_id,
-        message=detail,
-    )
-    try:
-        run_id = await _start_run(
-            target,
-            text,
-            _required("SWARM_ACTIVITY_RUN_INSTRUCTIONS"),
-        )
-        telegram = await _telegram(
-            sender,
-            "ACTIVITY",
-            target,
-            f"{event} turn={turn_id}\n{detail}".strip(),
-        )
-        return {"run_id": run_id, "telegram": telegram}
-    except (RuntimeError, httpx.HTTPError) as exc:
-        logger.exception("Activity signal failed: %s -> %s", sender, target)
-        return {"error": str(exc)}
-
-
 def main() -> None:
     import uvicorn
 
@@ -717,6 +833,7 @@ def main() -> None:
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
+        _initialize_activity_store()
         async with contextlib.AsyncExitStack() as stack:
             for server in ROLE_SERVERS.values():
                 await stack.enter_async_context(server.session_manager.run())
@@ -764,11 +881,15 @@ def main() -> None:
             "activity_routes": {
                 role: list(targets) for role, targets in ACTIVITY_ROUTES.items()
             },
+            "activity_enabled": ACTIVITY_ENABLED,
+            "activity_mode": "record-only",
         }
 
     @app.post(ACTIVITY_SIGNAL_PATH)
     async def activity_signal(request: Request) -> JSONResponse:
         sender = _caller_role.get()
+        if not ACTIVITY_ENABLED:
+            return JSONResponse({"ok": True, "disabled": True, "sender": sender})
         try:
             payload = await request.json()
             if not isinstance(payload, dict):
@@ -783,18 +904,28 @@ def main() -> None:
 
         targets = ACTIVITY_ROUTES.get(sender, ())
         if not targets:
-            return JSONResponse({"ok": True, "sender": sender, "results": {}})
-        dispatched = await asyncio.gather(
-            *(
-                _activity_dispatch(sender, target, event, turn_id, detail)
-                for target in targets
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "sender": sender,
+                    "event": event,
+                    "mode": "record-only",
+                    "results": {},
+                },
+                status_code=202,
             )
-        )
-        results = dict(zip(targets, dispatched, strict=True))
-        ok = all("run_id" in result for result in dispatched)
+        for target in targets:
+            _record_activity(sender, target, event, turn_id, detail)
+        results = {target: {"recorded": True} for target in targets}
         return JSONResponse(
-            {"ok": ok, "sender": sender, "event": event, "results": results},
-            status_code=202 if ok else 502,
+            {
+                "ok": True,
+                "sender": sender,
+                "event": event,
+                "mode": "record-only",
+                "results": results,
+            },
+            status_code=202,
         )
 
     for role, server in ROLE_SERVERS.items():

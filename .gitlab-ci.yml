@@ -1,0 +1,30 @@
+stages:
+  - verify
+
+default:
+  image: rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/
+      - target/
+
+quality:
+  stage: verify
+  before_script:
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all -- --check
+    - cargo clippy --locked --all-targets -- -D warnings
+    - cargo test --locked --all-targets
+    - cargo build --locked --release
+
+rustsec:
+  stage: verify
+  script:
+    - cargo install cargo-audit --locked --version 0.22.2
+    - cargo audit --file Cargo.lock
