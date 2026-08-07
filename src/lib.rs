@@ -4,6 +4,7 @@ pub mod http;
 pub mod mcp;
 pub mod probe;
 pub mod store;
+pub mod telegram;
 
 use std::sync::Arc;
 

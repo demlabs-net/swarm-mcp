@@ -49,7 +49,7 @@ records expire with `SWARM_OPERATION_RETENTION_DAYS`.
 | `swarm://executors` | manager | Compatibility alias for the hierarchy |
 | `swarm://operations` | every role | Recent durable operations sent or received by that role |
 | `swarm://activity` | ordering authorities | Current and recent passive subordinate lifecycle state |
-| `swarm://outbox` | every role | Telegram delivery state; manager sees all, executors see their own |
+| `swarm://outbox` | every role | Telegram delivery state; manager also sees the inbound offset and last successful poll |
 
 The activity endpoint records only lifecycle state. It never starts an agent,
 changes cron configuration, or sends Telegram messages. Timestamps make
@@ -77,6 +77,53 @@ Telegram delivery is asynchronous. A successful tool response reports an
 agent run into a failed command. Telegram delivery is at-least-once, so a crash
 between Telegram accepting a message and the local acknowledgement can produce
 a duplicate.
+
+## Shared Telegram gateway
+
+Telegram audit delivery has two mutually exclusive modes:
+
+| `SWARM_TELEGRAM_BOT_MODE` | Token source | Inbound commands |
+|---|---|---|
+| `per-role` | `<ROLE>_TELEGRAM_BOT_TOKEN` for every role | disabled |
+| `shared` | one `SWARM_TELEGRAM_BOT_TOKEN` owned by Swarm MCP | optional |
+
+In shared mode every `order`, `order_all`, `report`, `msg_to`, `msg_all`, and
+accepted Telegram command is copied to `TELEGRAM_GROUP_ID` by the same bot. The
+audit header still identifies the event, sender, and recipients, so individual
+Hermes containers do not need Telegram credentials. Executors report through
+Swarm MCP; their reports are therefore published by the shared bot as well.
+
+Set `SWARM_TELEGRAM_INBOUND_ENABLED=true` to let authorized people address the
+swarm through that bot. The gateway accepts only messages from the exact
+numeric `TELEGRAM_GROUP_ID` and positive numeric user IDs listed in
+`TELEGRAM_ALLOWED_USERS`. Plain group conversation is ignored. Supported
+commands are:
+
+```text
+/manager <message>
+/developer <message>
+/designer <message>
+/lead_developer <message>
+/tester <message>
+/devops <message>
+/to <role> <message>
+/all <message>
+/roles
+/help
+```
+
+`SWARM_TELEGRAM_INBOUND_TARGETS` limits which configured roles these commands
+may address; `*` enables all roles. Each accepted Telegram update is reserved
+under the manager identity in the same durable operation ledger as MCP calls.
+The Telegram update ID is its idempotency key, and the next polling offset is
+stored in SQLite after processing, preventing ordinary restart replays.
+
+The default `SWARM_TELEGRAM_PROCESS_BACKLOG=false` discards old queued updates
+the first time inbound polling starts. Change it only when deliberately
+replaying the existing bot backlog. The bot must not have a webhook configured,
+because Telegram does not allow `getUpdates` while a webhook is active. Run one
+Swarm MCP replica per bot token; two long pollers would race for the same update
+stream. Delivery and polling use the common `TELEGRAM_PROXY_URL` when set.
 
 The server reuses bounded HTTP clients, disables redirects, limits upstream
 response bodies, bounds semaphore wait time, and shuts down MCP sessions and
@@ -120,7 +167,8 @@ Important groups:
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
 | Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |
-| Telegram | `SWARM_TELEGRAM_ENABLED`, `<ROLE>_TELEGRAM_BOT_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_PROXY_URL`, `SWARM_OUTBOX_*` |
+| Telegram delivery | `SWARM_TELEGRAM_ENABLED`, `SWARM_TELEGRAM_BOT_MODE`, `SWARM_TELEGRAM_BOT_TOKEN`, `<ROLE>_TELEGRAM_BOT_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_PROXY_URL`, `SWARM_OUTBOX_*` |
+| Telegram inbound | `SWARM_TELEGRAM_INBOUND_ENABLED`, `TELEGRAM_ALLOWED_USERS`, `SWARM_TELEGRAM_INBOUND_TARGETS`, `SWARM_TELEGRAM_POLL_*`, `SWARM_TELEGRAM_PROCESS_BACKLOG`, `SWARM_TELEGRAM_INBOUND_*` |
 | Prompts | `SWARM_*_INSTRUCTIONS`, `SWARM_*_PROMPT_TEMPLATE` |
 
 ## Local verification

@@ -36,6 +36,18 @@ pub struct AgentConfig {
     pub telegram_bot_token: Option<Secret>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TelegramBotMode {
+    PerRole,
+    Shared,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TelegramBacklogMode {
+    Discard,
+    Process,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_ip: IpAddr,
@@ -76,6 +88,8 @@ pub struct Config {
     pub mcp_request_rate_window: Duration,
     pub report_statuses: Vec<String>,
     pub telegram_enabled: bool,
+    pub telegram_bot_mode: TelegramBotMode,
+    pub telegram_bot_token: Option<Secret>,
     pub telegram_timeout: Duration,
     pub telegram_message_limit: usize,
     pub telegram_group_id: Option<String>,
@@ -85,6 +99,14 @@ pub struct Config {
     pub outbox_max_attempts: i64,
     pub outbox_batch_size: i64,
     pub outbox_retention_days: i64,
+    pub telegram_inbound_enabled: bool,
+    pub telegram_allowed_users: BTreeSet<i64>,
+    pub telegram_inbound_targets: Vec<String>,
+    pub telegram_poll_timeout: Duration,
+    pub telegram_poll_limit: usize,
+    pub telegram_backlog_mode: TelegramBacklogMode,
+    pub telegram_inbound_instructions: String,
+    pub telegram_inbound_template: String,
     pub manager_instructions: String,
     pub executor_instructions: String,
     pub authority_instructions: String,
@@ -332,22 +354,99 @@ impl Config {
         );
 
         let telegram_enabled = bool_env("SWARM_TELEGRAM_ENABLED", false)?;
+        let telegram_bot_mode = match optional("SWARM_TELEGRAM_BOT_MODE")
+            .unwrap_or_else(|| "per-role".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "per-role" => TelegramBotMode::PerRole,
+            "shared" => TelegramBotMode::Shared,
+            _ => bail!("SWARM_TELEGRAM_BOT_MODE must be per-role or shared"),
+        };
+        let telegram_bot_token = optional("SWARM_TELEGRAM_BOT_TOKEN").map(Secret);
         let telegram_group_id = optional("TELEGRAM_GROUP_ID");
         if telegram_enabled {
             ensure!(telegram_group_id.is_some(), "TELEGRAM_GROUP_ID is required");
-            let missing = all_roles
-                .iter()
-                .filter(|role| {
-                    agents
-                        .get(*role)
-                        .is_none_or(|agent| agent.telegram_bot_token.is_none())
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            match telegram_bot_mode {
+                TelegramBotMode::PerRole => {
+                    let missing = all_roles
+                        .iter()
+                        .filter(|role| {
+                            agents
+                                .get(*role)
+                                .is_none_or(|agent| agent.telegram_bot_token.is_none())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        missing.is_empty(),
+                        "per-role Telegram mode is enabled but bot tokens are missing for: {}",
+                        missing.join(", ")
+                    );
+                }
+                TelegramBotMode::Shared => ensure!(
+                    telegram_bot_token.is_some(),
+                    "SWARM_TELEGRAM_BOT_TOKEN is required in shared Telegram mode"
+                ),
+            }
+        }
+
+        let telegram_inbound_enabled = bool_env("SWARM_TELEGRAM_INBOUND_ENABLED", false)?;
+        let telegram_allowed_users = optional("TELEGRAM_ALLOWED_USERS")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| {
+                        value
+                            .parse::<i64>()
+                            .with_context(|| format!("invalid Telegram user ID: {value}"))
+                    })
+                    .collect::<anyhow::Result<BTreeSet<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            telegram_allowed_users.iter().all(|user_id| *user_id > 0),
+            "TELEGRAM_ALLOWED_USERS must contain positive numeric user IDs"
+        );
+        let telegram_inbound_targets = match optional("SWARM_TELEGRAM_INBOUND_TARGETS") {
+            Some(value) if value.trim() == "*" => all_roles.clone(),
+            Some(value) => {
+                let raw = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>();
+                normalize_role_targets("__telegram__", &raw, &role_set)?
+            }
+            None => Vec::new(),
+        };
+        if telegram_inbound_enabled {
             ensure!(
-                missing.is_empty(),
-                "Telegram is enabled but bot tokens are missing for: {}",
-                missing.join(", ")
+                telegram_enabled,
+                "Telegram inbound requires Telegram delivery"
+            );
+            ensure!(
+                telegram_bot_mode == TelegramBotMode::Shared,
+                "Telegram inbound requires shared Telegram mode"
+            );
+            ensure!(
+                !telegram_allowed_users.is_empty(),
+                "TELEGRAM_ALLOWED_USERS is required for Telegram inbound"
+            );
+            ensure!(
+                !telegram_inbound_targets.is_empty(),
+                "SWARM_TELEGRAM_INBOUND_TARGETS is required for Telegram inbound"
+            );
+            let group = telegram_group_id
+                .as_deref()
+                .context("TELEGRAM_GROUP_ID is required for Telegram inbound")?;
+            ensure!(
+                group.parse::<i64>().is_ok_and(|value| value != 0),
+                "TELEGRAM_GROUP_ID must be a non-zero numeric chat ID for Telegram inbound"
             );
         }
 
@@ -378,6 +477,20 @@ impl Config {
             &peer_template,
             &["message_id", "sender", "recipient", "message"],
             &["message_id", "sender", "message"],
+        )?;
+        let telegram_inbound_template = required("SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE")?;
+        validate_template(
+            "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE",
+            &telegram_inbound_template,
+            &[
+                "update_id",
+                "message_id",
+                "user_id",
+                "username",
+                "recipient",
+                "message",
+            ],
+            &["update_id", "user_id", "recipient", "message"],
         )?;
 
         let telegram_proxy_url = optional_url("TELEGRAM_PROXY_URL")?;
@@ -432,6 +545,8 @@ impl Config {
             mcp_request_rate_window: seconds("SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS")?,
             report_statuses,
             telegram_enabled,
+            telegram_bot_mode,
+            telegram_bot_token,
             telegram_timeout: seconds("SWARM_TELEGRAM_TIMEOUT_SECONDS")?,
             telegram_message_limit: positive("SWARM_TELEGRAM_MESSAGE_LIMIT")?,
             telegram_group_id,
@@ -444,6 +559,18 @@ impl Config {
             outbox_max_attempts: positive("SWARM_OUTBOX_MAX_ATTEMPTS")?,
             outbox_batch_size: positive("SWARM_OUTBOX_BATCH_SIZE")?,
             outbox_retention_days: positive("SWARM_OUTBOX_RETENTION_DAYS")?,
+            telegram_inbound_enabled,
+            telegram_allowed_users,
+            telegram_inbound_targets,
+            telegram_poll_timeout: seconds("SWARM_TELEGRAM_POLL_TIMEOUT_SECONDS")?,
+            telegram_poll_limit: positive("SWARM_TELEGRAM_POLL_LIMIT")?,
+            telegram_backlog_mode: if bool_env("SWARM_TELEGRAM_PROCESS_BACKLOG", false)? {
+                TelegramBacklogMode::Process
+            } else {
+                TelegramBacklogMode::Discard
+            },
+            telegram_inbound_instructions: required("SWARM_TELEGRAM_INBOUND_RUN_INSTRUCTIONS")?,
+            telegram_inbound_template,
             manager_instructions: required("SWARM_MANAGER_MCP_INSTRUCTIONS")?,
             executor_instructions: required("SWARM_EXECUTOR_MCP_INSTRUCTIONS")?,
             authority_instructions,
@@ -545,6 +672,14 @@ impl Config {
             "SWARM_TELEGRAM_TIMEOUT_SECONDS must not exceed 60"
         );
         ensure!(
+            config.telegram_poll_timeout <= Duration::from_secs(50),
+            "SWARM_TELEGRAM_POLL_TIMEOUT_SECONDS must not exceed 50"
+        );
+        ensure!(
+            config.telegram_poll_limit <= 100,
+            "SWARM_TELEGRAM_POLL_LIMIT must not exceed 100"
+        );
+        ensure!(
             config.outbox_poll_interval <= Duration::from_secs(300),
             "SWARM_OUTBOX_POLL_INTERVAL_SECONDS must not exceed 300"
         );
@@ -582,6 +717,16 @@ impl Config {
         self.role_paths
             .iter()
             .find_map(|(role, configured)| (configured == normalized).then_some(role.as_str()))
+    }
+
+    pub fn telegram_token_for(&self, sender: &str) -> Option<&Secret> {
+        match self.telegram_bot_mode {
+            TelegramBotMode::Shared => self.telegram_bot_token.as_ref(),
+            TelegramBotMode::PerRole => self
+                .agents
+                .get(sender)
+                .and_then(|agent| agent.telegram_bot_token.as_ref()),
+        }
     }
 }
 

@@ -92,6 +92,12 @@ server will not blindly redeliver a side effect whose outcome is unknown.
    idempotency key for `sendMessage`. A crash after remote acceptance and before
    the local delivered update can duplicate an audit message.
 
+   Shared-bot inbound commands use a durable Telegram update offset and the
+   update ID as the dispatch idempotency key. This prevents ordinary restart
+   replay, but it does not change the outbound `sendMessage` limitation. The
+   bot uses long polling and therefore requires a single active Swarm MCP
+   replica and no configured Telegram webhook.
+
 3. **SQLite and local MCP sessions imply a single active replica.** Running two
    replicas against a shared filesystem is not a supported HA design. Horizontal
    scaling requires a network database, a distributed limiter/outbox claim, and

@@ -11,7 +11,9 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+const TELEGRAM_OFFSET_KEY: &str = "telegram_update_offset";
+const TELEGRAM_POLL_SUCCESS_KEY: &str = "telegram_poll_success";
 
 #[derive(Clone)]
 pub struct Store {
@@ -638,7 +640,17 @@ impl Store {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({"caller": role, "items": items}))
+        let mut response = json!({"caller": role, "items": items});
+        if role == manager_role {
+            let offset = self.telegram_update_offset().await?;
+            let last_poll_at = self
+                .service_state_value(TELEGRAM_POLL_SUCCESS_KEY)
+                .await?
+                .map(|(_, updated_ms)| millis_to_rfc3339(updated_ms));
+            response["inbound_update_offset"] = json!(offset);
+            response["inbound_last_poll_at"] = json!(last_poll_at);
+        }
+        Ok(response)
     }
 
     pub async fn due_outbox(&self, limit: i64) -> anyhow::Result<Vec<OutboxItem>> {
@@ -754,6 +766,56 @@ impl Store {
         .execute(&self.pool)
         .await?;
         self.recover_stale_pending(pending_stale_after).await?;
+        Ok(())
+    }
+
+    pub async fn telegram_update_offset(&self) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .service_state_value(TELEGRAM_OFFSET_KEY)
+            .await?
+            .map(|(value, _)| value))
+    }
+
+    async fn service_state_value(&self, key: &str) -> anyhow::Result<Option<(i64, i64)>> {
+        sqlx::query_as("SELECT value_int, updated_ms FROM service_state WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn mark_telegram_poll_success(&self) -> anyhow::Result<()> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"INSERT INTO service_state(key, value_int, updated_ms)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                 value_int = excluded.value_int,
+                 updated_ms = excluded.updated_ms"#,
+        )
+        .bind(TELEGRAM_POLL_SUCCESS_KEY)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn advance_telegram_update_offset(&self, offset: i64) -> anyhow::Result<()> {
+        ensure!(offset >= 0, "Telegram update offset must not be negative");
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"INSERT INTO service_state(key, value_int, updated_ms)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                 value_int = MAX(service_state.value_int, excluded.value_int),
+                 updated_ms = excluded.updated_ms"#,
+        )
+        .bind(TELEGRAM_OFFSET_KEY)
+        .bind(offset)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -876,6 +938,11 @@ const SCHEMA: &[&str] = &[
          delivered_ms INTEGER
        )"#,
     "CREATE INDEX IF NOT EXISTS telegram_outbox_due_idx ON telegram_outbox(status, next_attempt_ms)",
+    r#"CREATE TABLE IF NOT EXISTS service_state (
+         key TEXT PRIMARY KEY,
+         value_int INTEGER NOT NULL,
+         updated_ms INTEGER NOT NULL
+       )"#,
 ];
 
 #[cfg(test)]
@@ -1085,6 +1152,17 @@ mod tests {
         store.mark_outbox_chunk_sent("audit_1", 1).await?;
         store.mark_outbox_delivered("audit_1").await?;
         assert!(store.mark_outbox_delivered("audit_1").await.is_err());
+        assert_eq!(store.telegram_update_offset().await?, None);
+        store.advance_telegram_update_offset(42).await?;
+        store.advance_telegram_update_offset(12).await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(42));
+        store.mark_telegram_poll_success().await?;
+        let manager_outbox = store.recent_outbox("manager", "manager", 10).await?;
+        assert_eq!(manager_outbox["inbound_update_offset"], json!(42));
+        assert!(manager_outbox["inbound_last_poll_at"].is_string());
+        let executor_outbox = store.recent_outbox("developer", "manager", 10).await?;
+        assert!(executor_outbox.get("inbound_update_offset").is_none());
+        assert!(executor_outbox.get("inbound_last_poll_at").is_none());
 
         store.pool.close().await;
         remove_sqlite_files(&path).await;

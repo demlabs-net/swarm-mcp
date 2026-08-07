@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use url::Url;
 
-use crate::{AppState, config::Config, mcp::RoleMcp, store::ActivityRecord};
+use crate::{AppState, config::Config, mcp::RoleMcp, store::ActivityRecord, telegram};
 
 #[derive(Clone)]
 struct RoleAuth {
@@ -183,6 +183,8 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
     let outbox = state
         .dispatcher
         .spawn_outbox_worker(cancellation.child_token());
+    let telegram_inbound =
+        telegram::spawn_inbound_worker(state.clone(), cancellation.child_token());
     let cleanup_state = state.clone();
     let cleanup_cancellation = cancellation.child_token();
     let cleanup = tokio::spawn(async move {
@@ -221,6 +223,9 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
         .await;
     cancellation.cancel();
     let _ = outbox.await;
+    if let Some(worker) = telegram_inbound {
+        let _ = worker.await;
+    }
     let _ = cleanup.await;
     result?;
     Ok(())

@@ -130,6 +130,16 @@ pub struct MessageAllArgs {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct TelegramInboundArgs {
+    pub update_id: i64,
+    pub message_id: i64,
+    pub user_id: i64,
+    pub username: String,
+    pub message: String,
+    pub targets: Vec<String>,
+}
+
 fn completed_status() -> String {
     "completed".to_string()
 }
@@ -646,6 +656,152 @@ impl Dispatcher {
         self.finish(&message_id, status, &result, audit, !ok).await
     }
 
+    pub async fn telegram_inbound(&self, args: TelegramInboundArgs) -> ToolOutcome {
+        if !self.config.telegram_inbound_enabled {
+            return tool_error(json!({
+                "ok": false,
+                "error": "Telegram inbound is disabled",
+            }));
+        }
+        if args.update_id < 0 || args.message_id <= 0 || args.user_id <= 0 {
+            return tool_error(json!({
+                "ok": false,
+                "error": "Telegram update contains invalid identifiers",
+            }));
+        }
+        let message = match self.clean_text(&args.message, "message") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        let mut targets = Vec::new();
+        for raw_target in args.targets {
+            let target = raw_target.trim().to_lowercase();
+            if !self.config.telegram_inbound_targets.contains(&target) {
+                return tool_error(json!({
+                    "ok": false,
+                    "error": format!("Telegram is not authorized to target '{target}'"),
+                    "allowed": self.config.telegram_inbound_targets,
+                }));
+            }
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        if targets.is_empty() {
+            return tool_error(json!({
+                "ok": false,
+                "error": "Telegram command has no targets",
+            }));
+        }
+
+        let dispatch_id = format!("telegram_{}", args.update_id);
+        let idempotency_key = format!("telegram-update-{}", args.update_id);
+        let fingerprint = fingerprint(&json!({
+            "update_id": args.update_id,
+            "message_id": args.message_id,
+            "user_id": args.user_id,
+            "username": args.username,
+            "message": message,
+            "targets": targets,
+        }));
+        let manager = self.config.manager_role.clone();
+        if let Some(outcome) = self
+            .reserve_or_replay(
+                &dispatch_id,
+                &manager,
+                "telegram_inbound",
+                &targets,
+                Some(&idempotency_key),
+                &fingerprint,
+            )
+            .await
+        {
+            return outcome;
+        }
+
+        let update_id = args.update_id.to_string();
+        let message_id = args.message_id.to_string();
+        let user_id = args.user_id.to_string();
+        let requests = targets.iter().map(|target| async {
+            let body = render_template(
+                &self.config.telegram_inbound_template,
+                &BTreeMap::from([
+                    ("update_id", update_id.as_str()),
+                    ("message_id", message_id.as_str()),
+                    ("user_id", user_id.as_str()),
+                    ("username", args.username.as_str()),
+                    ("recipient", target.as_str()),
+                    ("message", message.as_str()),
+                ]),
+            );
+            let result = match body {
+                Ok(body) => {
+                    self.start_run(target, &body, &self.config.telegram_inbound_instructions)
+                        .await
+                }
+                Err(error) => Err(RunFailure::rejected(error)),
+            };
+            (target.clone(), result)
+        });
+        let mut results = Map::new();
+        let mut succeeded = 0_usize;
+        let mut indeterminate = 0_usize;
+        for (target, result) in join_all(requests).await {
+            match result {
+                Ok(run_id) => {
+                    succeeded += 1;
+                    results.insert(target, json!({"run_id": run_id}));
+                }
+                Err(error) => {
+                    warn!(%target, error = %error, "Telegram inbound dispatch failed");
+                    indeterminate += usize::from(error.indeterminate);
+                    results.insert(
+                        target,
+                        json!({
+                            "error": error.to_string(),
+                            "status": error.status(),
+                            "recovery_required": error.indeterminate,
+                        }),
+                    );
+                }
+            }
+        }
+        let ok = succeeded == targets.len();
+        let status = if ok {
+            "accepted"
+        } else if succeeded == 0 && indeterminate > 0 {
+            "indeterminate"
+        } else if succeeded == 0 {
+            "failed"
+        } else {
+            "partial"
+        };
+        let mut result = json!({
+            "ok": ok,
+            "dispatch_id": dispatch_id,
+            "source": "telegram",
+            "update_id": args.update_id,
+            "message_id": args.message_id,
+            "user_id": args.user_id,
+            "username": args.username,
+            "results": results,
+        });
+        let audit = self.audit(
+            &manager,
+            "TELEGRAM_INBOUND",
+            &targets.join(", "),
+            &format!(
+                "{dispatch_id} [{status}]\nTelegram user {} ({}) → {}:\n{message}\n\nDispatch result: {}",
+                args.username,
+                args.user_id,
+                targets.join(", "),
+                Value::Object(results.clone())
+            ),
+            &mut result,
+        );
+        self.finish(&dispatch_id, status, &result, audit, !ok).await
+    }
+
     pub fn spawn_outbox_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
         let dispatcher = self.clone();
         tokio::spawn(async move {
@@ -693,14 +849,15 @@ impl Dispatcher {
     }
 
     async fn send_telegram(&self, item: &OutboxItem) -> Result<(), TelegramFailure> {
-        let agent = self
+        let token = self
             .config
-            .agents
-            .get(&item.sender)
-            .ok_or_else(|| TelegramFailure::new("unknown Telegram sender", None))?;
-        let token = agent.telegram_bot_token.as_ref().ok_or_else(|| {
-            TelegramFailure::new("Telegram bot token is not configured for sender", None)
-        })?;
+            .telegram_token_for(&item.sender)
+            .ok_or_else(|| {
+                TelegramFailure::new(
+                    "Telegram bot token is not configured for delivery mode",
+                    None,
+                )
+            })?;
         let group = self
             .config
             .telegram_group_id

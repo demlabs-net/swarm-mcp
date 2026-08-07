@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     AppState,
+    config::TelegramBotMode,
     dispatch::{
         BroadcastArgs, MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, ToolOutcome,
         parse_arguments, render_template,
@@ -236,8 +237,12 @@ impl RoleMcp {
                 "rate_window_seconds": config.rate_window.as_secs(),
                 "max_inflight_dispatches": config.max_inflight_dispatches,
                 "telegram_outbox": config.telegram_enabled,
-                "telegram_sender_configured": config.agents.get(&self.role)
-                    .is_some_and(|agent| agent.telegram_bot_token.is_some()),
+                "telegram_bot_mode": match config.telegram_bot_mode {
+                    TelegramBotMode::PerRole => "per-role",
+                    TelegramBotMode::Shared => "shared",
+                },
+                "telegram_sender_configured": config.telegram_token_for(&self.role).is_some(),
+                "telegram_inbound": config.telegram_inbound_enabled,
                 "activity_mode": "record-only",
             }
         })
