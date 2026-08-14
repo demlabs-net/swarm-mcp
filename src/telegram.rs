@@ -731,4 +731,71 @@ mod tests {
         testutil::remove_db_files(&path).await;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn process_update_ignores_bots_and_textless_messages() -> anyhow::Result<()> {
+        let mut bot_update = allowed_update();
+        bot_update["message"]["from"]["is_bot"] = json!(true);
+        let mut textless = allowed_update();
+        textless["update_id"] = json!(6);
+        textless["message"]["text"] = Value::Null;
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([bot_update, textless]), sent.clone()),
+        )
+        .await?;
+
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(7));
+        assert_eq!(
+            sent.lock().expect("sent").len(),
+            0,
+            "bots and messages without text never reach the swarm"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_surfaces_bot_api_failures() -> anyhow::Result<()> {
+        // The Bot API answers with a non-JSON body: the payload decode must fail.
+        let (gateway, _store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            Arc::new(|path, _| {
+                if path.ends_with("getUpdates") {
+                    (200, json!("this is not an object"), None)
+                } else {
+                    (200, json!({"ok": true}), None)
+                }
+            }),
+        )
+        .await?;
+        assert!(gateway.poll_once().await.is_err());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_tolerates_send_message_failures() -> anyhow::Result<()> {
+        // sendMessage fails: the help reply is best-effort and must not fail the poll.
+        let mut update = allowed_update();
+        update["message"]["text"] = json!("/help");
+        let update = Arc::new(update);
+        let updates = update.clone();
+        let (gateway, _store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            Arc::new(move |path, _| {
+                if path.ends_with("getUpdates") {
+                    (200, json!({"ok": true, "result": [*updates.clone()]}), None)
+                } else {
+                    (500, json!({"ok": false}), None)
+                }
+            }),
+        )
+        .await?;
+        gateway.poll_once().await?;
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
 }

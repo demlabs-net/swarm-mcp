@@ -325,3 +325,29 @@ config 90.5 · store 89.5 · probe 89.5 · http 83.2 · **dispatch 84.7** · tel
 - telegram.rs (75.3) / mcp.rs (72.4): `send_telegram` failure branches, `process_update` help/notice paths, `call_tool`/`read_resource` via the live-router e2e.
 - Optional: `rust-toolchain.toml` pin.
 - Optional: coverage threshold → 85.
+
+---
+
+# Iteration 7 (2026-08-14) — coverage 90% reached
+
+Suite: **97 tests** (was 67). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **90.17%** (was 85.4%). CI threshold raised **80 → 90**.
+
+What closed the gap (per-module line targets from the missing-lines report):
+- **http.rs** — `serve_with_shutdown()` split (testable server lifecycle: bind → serve → graceful shutdown → worker cancellation); activity 413 (detail too long) / 422 (bad occurred_at) / disabled-mode branches; per-credential activity rate limit.
+- **store.rs** — `ready()` write-lock check; event dedup + `activity_state` upsert (replayed hook); empty-visibility snapshot; `mark_dispatch_indeterminate`; outbox transitions on non-pending items.
+- **config.rs** — `from_env()` wrapper (ambient-env tolerant), numeric-range matrix, cross-field constraints (body vs message size, report defaults, absolute DB path, bool parsing), `null` origin, socks5 proxy, IPv6 host with (mal)formed port.
+- **dispatch.rs** — invalid idempotency keys, empty/oversized commands, broken-template `failed` persistence, `order_all` authority check, `Retry-After` from the response body.
+- **mcp.rs** — `call_tool` arms (`order_all`, `report`, `msg_to`) and extra `read_resource` checks over the live router.
+- **telegram.rs** — bot/textless updates ignored, Bot API decode failure surfaces, best-effort `sendMessage` failures tolerated.
+- **main.rs/lib.rs** — `run()` extraction; healthcheck connection failure, `loopback_url`, `AppState::initialize`.
+
+## Final coverage snapshot (line %)
+
+config 91.7 · store 89.9 · probe 91.5 · http 86.4 · mcp 89.7 · dispatch 86.3 · telegram 80.5 · lib 92.9 · main 25.0 (bin entry: env-dependent Serve arm + probe wrappers remain untested by design).
+
+## Remaining (open, all optional)
+
+- main.rs bin entry (25%) — would require either a full valid env map duplicated in bin tests or subprocess/CLI harness tests.
+- http.rs `serve()` CLI-only signal wiring (covered via `serve_with_shutdown`).
+- `rust-toolchain.toml` — explicitly declined (runner will be upgraded; clippy passes on 1.89 and 1.97).

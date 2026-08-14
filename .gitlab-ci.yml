@@ -45,4 +45,4 @@ coverage:
     - rustup component add llvm-tools-preview
     - cargo install cargo-llvm-cov --locked
   script:
-    - cargo llvm-cov --locked --all-targets --fail-under-lines 80 --summary-only
+    - cargo llvm-cov --locked --all-targets --fail-under-lines 90 --summary-only

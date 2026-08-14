@@ -13,7 +13,7 @@ cargo fmt --all -- --check                     # 2. quality: formatting
 cargo clippy --locked --all-targets -- -D warnings   # 3. quality: clippy, warnings denied
 cargo build --locked --release                 # 4. quality: release build (image build sanity)
 cargo audit --file Cargo.lock                  # 5. rustsec job (cargo-audit 0.22.2 on CI)
-cargo llvm-cov --locked --all-targets --fail-under-lines 80 --summary-only  # 6. coverage job
+cargo llvm-cov --locked --all-targets --fail-under-lines 90 --summary-only  # 6. coverage job
 ```
 
 ## Toolchain notes
