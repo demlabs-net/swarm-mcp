@@ -279,3 +279,26 @@ config 90.5 · store 89.5 · http 82.3 · telegram 75.3 · mcp 72.4 · dispatch 
 - P-03/P-04: documented trade-offs only (N+1 in `recent_operations`; global reservation lock) — acceptable at current scale.
 - Optional: `rust-toolchain.toml` pin (CI 1.89 vs local 1.97 — clippy now passes on both).
 - Probe e2e (T-8) would lift probe.rs coverage and enable a higher threshold.
+
+---
+
+# Iteration 5 (2026-08-14) — LICENSE + probe e2e (T-8)
+
+Suite: **61 tests** (was 59). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **81.66%** (was 77.6%).
+
+| ID | Disposition |
+|---|---|
+| G-03 | **Fixed** — `LICENSE` added (MIT, "Copyright (c) 2026 Demlabs"), matching `license = "MIT"` in Cargo.toml. |
+| T-8 | **Fixed** — two e2e tests boot the real router (`http::build_router`, now `pub(crate)`) on an ephemeral port and run `catalog_probe` + `activity_probe` against it in-process — the same check the deployment runs (rmcp client → HTTP → per-role auth → MCP catalogs/resources → activity signal + non-target isolation). Note: the Host guard rejected `127.0.0.1` first — the e2e fixture must set `allowed_hosts` to the loopback address. |
+| Coverage | CI threshold raised **70 → 75** (probe.rs 31.9% → 89.5%, http.rs 83.2%, total 81.7%). |
+
+## Coverage snapshot (line %)
+
+config 90.5 · store 89.5 · probe 89.5 · http 83.2 · telegram 75.3 · mcp 72.4 · dispatch 67.8 · main/lib 0 (bin entry).
+
+## Remaining (open)
+
+- dispatch.rs 67.8% is the lowest runtime module — next candidates: `telegram_inbound` dispatcher path (partly covered via poll_once), `message`/`msg_all` flows, outbox flush worker, `finish`/`fail_run` persistence-error paths.
+- Optional: `rust-toolchain.toml` pin (clippy passes on both toolchains already).
+- Optional: bump the coverage threshold toward 80 once dispatch.rs is covered further.

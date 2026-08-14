@@ -377,4 +377,53 @@ mod tests {
         assert_eq!(result["skipped"], json!("no activity routes"));
         crate::testutil::remove_db_files(&path).await;
     }
+
+    /// Boot the real HTTP router (role MCP services + auth + activity endpoint)
+    /// on an ephemeral port and run both probes against it — the same check the
+    /// deployment runs, exercised in-process.
+    async fn spawn_live_router() -> anyhow::Result<(Arc<Config>, std::path::PathBuf, u16)> {
+        let path = crate::testutil::temp_db_path("probe-e2e");
+        let mut config = crate::testutil::fixture_config(&path);
+        // The probes connect to 127.0.0.1, so the Host guard must allow it.
+        config.allowed_hosts = vec!["127.0.0.1".to_string()];
+        let config = Arc::new(config);
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(crate::AppState {
+            config: config.clone(),
+            store,
+            dispatcher,
+        });
+        let router = crate::http::build_router(state, &tokio_util::sync::CancellationToken::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("live router serves");
+        });
+        Ok((config, path, port))
+    }
+
+    #[tokio::test]
+    async fn catalog_probe_passes_against_a_live_router() -> anyhow::Result<()> {
+        let (config, path, port) = spawn_live_router().await?;
+        let result = catalog_probe(config.clone(), &format!("http://127.0.0.1:{port}")).await?;
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["cross_auth_rejected"], json!(true));
+        assert_eq!(result["roles"].as_object().unwrap().len(), 3);
+        crate::testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_probe_passes_against_a_live_router() -> anyhow::Result<()> {
+        let (config, path, port) = spawn_live_router().await?;
+        let result = activity_probe(config.clone(), &format!("http://127.0.0.1:{port}")).await?;
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["mode"], json!("record-only"));
+        assert_eq!(result["checked"].as_array().unwrap().len(), 1);
+        crate::testutil::remove_db_files(&path).await;
+        Ok(())
+    }
 }

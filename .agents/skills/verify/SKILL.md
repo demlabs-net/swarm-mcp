@@ -13,7 +13,7 @@ cargo fmt --all -- --check                     # 2. quality: formatting
 cargo clippy --locked --all-targets -- -D warnings   # 3. quality: clippy, warnings denied
 cargo build --locked --release                 # 4. quality: release build (image build sanity)
 cargo audit --file Cargo.lock                  # 5. rustsec job (cargo-audit 0.22.2 on CI)
-cargo llvm-cov --locked --all-targets --fail-under-lines 70 --summary-only  # 6. coverage job
+cargo llvm-cov --locked --all-targets --fail-under-lines 75 --summary-only  # 6. coverage job
 ```
 
 ## Toolchain notes
@@ -27,7 +27,7 @@ cargo llvm-cov --locked --all-targets --fail-under-lines 70 --summary-only  # 6.
 - `tests` (stage `test`) — `cargo test --locked --all-targets`.
 - `quality` (stage `verify`) — fmt check, clippy with `-D warnings`, release build.
 - `rustsec` (stage `audit`) — installs `cargo-audit` 0.22.2 into `$CARGO_HOME/bin` (cached via `.cargo/bin/` cache path) and audits `Cargo.lock`.
-- `coverage` (stage `audit`) — `cargo-llvm-cov` (also cached in `.cargo/bin/`) with a 70% line threshold; run `cargo llvm-cov --summary-only` locally to see per-module numbers before pushing.
+- `coverage` (stage `audit`) — `cargo-llvm-cov` (also cached in `.cargo/bin/`) with a 75% line threshold; run `cargo llvm-cov --summary-only` locally to see per-module numbers before pushing.
 - Stages run sequentially, so three concurrent cargo builds never fight over the shared `target/` cache on a single runner.
 - `CARGO_HOME` is `$CI_PROJECT_DIR/.cargo` so the `.cargo/registry/` and `.cargo/bin/` cache paths take effect; `CARGO_TERM_COLOR=always` keeps logs readable.
 

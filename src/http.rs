@@ -148,7 +148,7 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_router(state: Arc<AppState>, cancellation: &CancellationToken) -> Router {
+pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToken) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready));
