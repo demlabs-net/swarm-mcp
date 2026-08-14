@@ -1706,4 +1706,268 @@ mod tests {
         testutil::remove_db_files(&path).await;
         Ok(())
     }
+
+    /// Dispatcher with Telegram delivery/inbound enabled (shared bot) and a mock
+    /// Bot API for sendMessage.
+    async fn dispatcher_with_telegram(
+        behavior: testutil::MockHermes,
+    ) -> anyhow::Result<(Dispatcher, Store, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("dispatch-tg");
+        let telegram_base = spawn_mock_telegram().await;
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = crate::config::TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(crate::config::Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        config.telegram_api_base_url = telegram_base.parse()?;
+        let mock = testutil::spawn_mock_hermes(behavior).await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = mock.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+        Ok((dispatcher, store, path))
+    }
+
+    async fn spawn_mock_telegram() -> String {
+        use axum::{Json, Router, routing::post};
+        let router = Router::new().route(
+            "/bot{token}/sendMessage",
+            post(|| async { Json(json!({"ok": true})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Telegram");
+        let address = listener.local_addr().expect("mock Telegram address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock Telegram serves");
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn message_reaches_peer_and_persists() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-msg"})))).await?;
+
+        let outcome = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "lead-developer".to_string(),
+                    message: " ping ".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!outcome.is_error, "unexpected: {outcome:?}");
+        assert_eq!(outcome.value["run_id"], json!("run-msg"));
+        let message_id = outcome.value["message_id"].as_str().expect("message id");
+        assert!(message_id.starts_with("msg_"));
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(message_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "accepted");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_rejects_non_peer_targets() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run"})))).await?;
+        let outcome = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "developer".to_string(),
+                    message: "self".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        let outcome = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "manager".to_string(),
+                    message: "not a peer".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_all_aggregates_partial_results() -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes = Arc::new(|bearer, _| {
+            if bearer.ends_with("api-key-developer") {
+                (202, json!({"run_id": "run-dev"}))
+            } else {
+                (500, json!({"error": "boom"}))
+            }
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+
+        // manager's peers are every executor; lead-developer fails with a server error.
+        let outcome = dispatcher
+            .message_all(
+                "manager",
+                MessageAllArgs {
+                    message: "sync".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert_eq!(outcome.value["ok"], json!(false));
+        assert_eq!(
+            outcome.value["results"]["developer"]["run_id"],
+            json!("run-dev")
+        );
+        assert_eq!(
+            outcome.value["results"]["lead-developer"]["status"],
+            json!("indeterminate")
+        );
+        let message_id = outcome.value["message_id"].as_str().expect("message id");
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(message_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "partial");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn order_all_all_server_failures_are_indeterminate() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (500, json!({"error": "boom"})))).await?;
+        let outcome = dispatcher
+            .order_all(
+                "manager",
+                BroadcastArgs {
+                    command: "sync".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert_eq!(outcome.value["ok"], json!(false));
+        assert_eq!(
+            outcome.value["results"]["developer"]["status"],
+            json!("indeterminate")
+        );
+        let dispatch_id = outcome.value["task_id"].as_str().expect("task id");
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(dispatch_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            status, "indeterminate",
+            "nothing accepted, all may have happened"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_inbound_deduplicates_by_update_id() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-tg"})))).await?;
+
+        let args = TelegramInboundArgs {
+            update_id: 5,
+            message_id: 100,
+            user_id: 42,
+            username: "alice".to_string(),
+            message: "hello".to_string(),
+            targets: vec!["developer".to_string()],
+        };
+        let first = dispatcher.telegram_inbound(args).await;
+        assert!(!first.is_error, "unexpected: {:?}", first.value);
+        assert_eq!(
+            first.value["results"]["developer"]["run_id"],
+            json!("run-tg")
+        );
+        assert!(first.value.get("deduplicated").is_none());
+
+        // The same update replayed (poll retry) must not re-dispatch.
+        let second = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 5,
+                message_id: 100,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+            })
+            .await;
+        assert_eq!(second.value["deduplicated"], json!(true));
+
+        // A different update with invalid identifiers is rejected before reservation.
+        let invalid = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: -1,
+                message_id: 100,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+            })
+            .await;
+        assert!(invalid.is_error);
+
+        // The audit outbox row was queued alongside the accepted dispatch.
+        let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(outbox, 1, "one audit entry for the accepted update");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_delivers_queued_audits() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-flush"}))))
+                .await?;
+
+        // An accepted order queues an audit message in the outbox.
+        dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "audit me".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox WHERE status='pending'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(pending, 1);
+
+        dispatcher.flush_outbox().await?;
+        let delivered: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox WHERE status='delivered'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(delivered, 1, "audit delivered through the mock Bot API");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
 }

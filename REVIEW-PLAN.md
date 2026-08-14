@@ -302,3 +302,26 @@ config 90.5 · store 89.5 · probe 89.5 · http 83.2 · telegram 75.3 · mcp 72.
 - dispatch.rs 67.8% is the lowest runtime module — next candidates: `telegram_inbound` dispatcher path (partly covered via poll_once), `message`/`msg_all` flows, outbox flush worker, `finish`/`fail_run` persistence-error paths.
 - Optional: `rust-toolchain.toml` pin (clippy passes on both toolchains already).
 - Optional: bump the coverage threshold toward 80 once dispatch.rs is covered further.
+
+---
+
+# Iteration 6 (2026-08-14) — dispatch.rs coverage push
+
+Suite: **67 tests** (was 61). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **85.43%** (was 81.7%). CI threshold raised **75 → 80**.
+
+Covered in this batch (dispatch.rs 67.8% → 84.7%):
+- `message`/`msg_all` flows (accept + persist, non-peer rejection, partial aggregation through `BroadcastSummary`).
+- `order_all` all-server-failure → `indeterminate` (nothing accepted, all may have happened).
+- `telegram_inbound` dedupe by update_id (replay → `deduplicated: true`), invalid identifier rejection, audit outbox row queued.
+- `flush_outbox` end-to-end: accepted order queues a pending audit → flush delivers it through a mock Bot API (`sendMessage` → `{"ok": true}`).
+
+## Coverage snapshot (line %)
+
+config 90.5 · store 89.5 · probe 89.5 · http 83.2 · **dispatch 84.7** · telegram 75.3 · mcp 72.4 · main/lib 0 (bin entry).
+
+## Remaining (open)
+
+- telegram.rs (75.3) / mcp.rs (72.4): `send_telegram` failure branches, `process_update` help/notice paths, `call_tool`/`read_resource` via the live-router e2e.
+- Optional: `rust-toolchain.toml` pin.
+- Optional: coverage threshold → 85.
