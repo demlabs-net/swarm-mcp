@@ -147,3 +147,50 @@ Acceptance: `verify` skill passes locally AND in CI; coverage ≥ 50% line (from
 - `.agents/skills/review/SKILL.md` — invariants checklist for future reviews.
 - `.agents/skills/testing/SKILL.md` — test patterns & mock-server recipes.
 - `.agents/skills/config-roles/SKILL.md` — role/config operations reference.
+
+---
+
+# Iteration 2 (2026-08-14)
+
+Scope: deployment config (compose commits `59444f6`/`52cfb5e`), Dockerfile/`.dockerignore`, CI fix verification,
+deeper checks of `http.rs` routing and edge cases. Baseline unchanged: fmt ✅ clippy ✅ (after C-01 fix) tests ✅ (17).
+
+## Resolved since iteration 1
+
+| ID | Disposition |
+|---|---|
+| C-01 | **Fixed & pushed** — `header.to_string()` → `header.clone()`; clippy now passes on 1.97 and 1.89. |
+| CI config | **Fixed & pushed** — `variables` moved out of `default:` (GitLab rejected the pipeline: "default config contains unknown keys: variables"); dedicated `tests` job in its own stage (`test` → `verify` → `audit`, sequential so three cargo builds never race on one runner's `target/` cache); `.cargo/bin/` added to cache (cargo-audit + rustup shims persist). Pushed as `4707b06` + `458107a`. |
+| D-02, D-03 | Not yet addressed (still open, Phase 0). |
+
+## New findings
+
+| ID | Sev | Location | Finding | Proposed fix |
+|---|---|---|---|---|
+| DEP-1 | Med | `docker-compose.yml:9-101` | `environment:` block uses `${VAR}` interpolation, which reads the **shell / root `.env` only — never `env_file: ../swarm/.env`** (Compose precedence: `environment:` > `env_file:`). Any var listed in `environment:` but missing from the shell interpolates to **empty and overrides the env_file value** → `Config::from_env` fails at startup with "…must be configured". So the env_file addition only works when the shell/root `.env` already defines every var — otherwise it silently defeats itself. | Drop the `environment:` mapping for vars that come from `env_file` (keep only the `:-default` ones: `SWARM_MCP_MEMORY_LIMIT`, `SWARM_MCP_CPU_LIMIT`, `SWARM_MCP_PIDS_LIMIT`, `SWARM_LOG_MAX_SIZE`, `SWARM_LOG_MAX_FILES`), or run compose with `--env-file ../swarm/.env`. |
+| DEP-2 | Low | `docker-compose.yml:74-101` | The `environment:` allowlist hardcodes 7 roles (`MANAGER_`, `DEVELOPER_`, `JUNIOR_`, `DESIGNER_`, `LEAD_DEVELOPER_`, `TESTER_`, `DEVOPS_`) — contradicts the commit goal "роли любого роя без правки allowlist". With `env_file` in place the allowlist is redundant. | Removed as part of the DEP-1 fix; update `.agents/skills/config-roles/SKILL.md` step 4 accordingly. |
+| DEP-3 | Low | `.dockerignore` | Stale `/src/old_python` entry (directory removed long ago). | Delete the line. |
+| DEP-4 | Info | `docker-compose.yml:118` | `network_mode: host` — HEALTHCHECK (`127.0.0.1:$SWARM_MCP_PORT/ready`) and webhook agents work only if `SWARM_MCP_PORT` is free on the host; `container_name`/`networks` are inert under host mode (already removed). `tmpfs /tmp` covers read-only root. Verified consistent. | No action; document in config-roles skill. |
+| DEP-5 | Info | `Dockerfile` | `EXPOSE 3004` is informational (host mode ignores it); HEALTHCHECK subcommand needs only `SWARM_MCP_PORT`. Verified consistent. | No action. |
+| V-1 | Info | `src/http.rs:174-181` | `.with_state::<()>(state.clone())` relies on axum's state-baking semantics: per-role routers carry their own middleware state (`RoleAuth`/`ActivityAuth`), the outer `Arc<AppState>` is baked into route handlers, and the final router state is `()`. Compiles, runs, and the deployment `probe` exercises it end-to-end — verified working, but non-obvious. | Add a short comment explaining the construction (guards against a future refactor removing `with_state`). |
+| B-06 | Low | `dispatch.rs:561-657` | `message_all` with a single-executor swarm (sender has no peers → `targets == []`) returns `ok: true`, status `accepted`, empty results — edge case, arguably should be a no-op error. `order_all` cannot hit this (manager is never an executor). | Document or reject; add a unit test locking the chosen behavior. |
+
+## Reconfirmed (no change)
+
+- **B-01** (idempotency replay of `failed` dispatches) — re-read the flow: `reserve_dispatch` returns `result_json` for **any** persisted status, so a retry with the same key after a failure replays the old error with `deduplicated: true`; re-execution is impossible. The README/instructions wording still needs to match the chosen semantics.
+- **P-01** — `rate_events`/`activity_events`/`dispatches` cleanup deletes scan without a `created_ms`/`updated_ms` index (`rate_events_actor_idx(actor, created_ms)` doesn't help `WHERE created_ms < ?`).
+- **P-02** — `activity_snapshot` still filters `activity_state` rows in memory.
+- B-02, B-03, B-04, B-05, P-03, P-04, D-01, C-02 — unchanged, see Part 1.
+- No panics/`unwrap` in request paths (only `expect()` on config-validated invariants, `unwrap_or` fallbacks). ✅
+
+## Revised execution order
+
+**Phase 0 — Quick wins** (updated)
+1. ✅ C-01 (clippy) + CI yaml restructure — **done, pushed**.
+2. D-01: fix README.md / REVIEW.md `old_python` references.
+3. DEP-1 + DEP-2: drop redundant `environment:` mapping (keep `:-default` entries only); update `config-roles` skill.
+4. DEP-3: remove stale `.dockerignore` entry.
+5. D-02/D-04: remove dead `role_for_path`; extract the broadcast helper (with T-2.3 tests).
+6. V-1: comment the `with_state::<()>` construction; B-06: decide + test `message_all` empty-peers edge.
+
+Phases 1–4 unchanged from Part 3.
