@@ -1,93 +1,221 @@
-# Swarm Mcp
+# Swarm MCP
 
+Swarm MCP is the authenticated communication and authorization plane for the
+Hermes development swarm. Version 0.2 is implemented in Rust and exposes a
+separate Streamable HTTP MCP endpoint for every role. A bearer token grants one
+role catalog only; it cannot be reused against another role's endpoint.
 
+The retired Python implementation is preserved under `src/old_python/` for
+audit and migration reference. It is not copied into the runtime image and is
+not part of the deployed service. The Python `requirements.txt` has been
+removed.
 
-## Getting started
+The detailed review of the retired implementation, completed fixes, known
+limits, and capability roadmap is in [REVIEW.md](REVIEW.md).
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Role hierarchy
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+The hierarchy is data-driven:
 
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```dotenv
+SWARM_AGENT_ROLES=developer,junior,designer,lead-developer,tester,devops
+SWARM_MANAGER_ROLE=manager
+SWARM_ORDER_ACL={"manager":["*"],"lead-developer":["developer","junior"]}
 ```
-cd existing_repo
-git remote add origin https://gitlab.demlabs.net/internal/ai/swarm-mcp.git
-git branch -M main
-git push -uf origin main
+
+With this configuration the catalogs are:
+
+| Caller | Tools |
+|---|---|
+| `manager` | `order`, `order_all` |
+| `lead-developer` | `order`, `report`, `msg_to`, `msg_all` |
+| `developer`, `junior`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
+
+`"*"` grants swarm-wide `order` and `order_all`. An explicit list grants only
+single-target `order`; the generated JSON Schema enumerates exactly the targets
+allowed to that caller. Reverse ACL lookup determines the valid `report`
+recipients. Executors may coordinate only with other executors.
+
+Every mutating tool accepts an optional `idempotency_key`. Callers should reuse
+the same key when retrying the same logical action. Reusing a key with different
+arguments is rejected. Keys must not be recycled for unrelated work; their
+records expire with `SWARM_OPERATION_RETENTION_DAYS`.
+
+## Resources
+
+| URI | Visibility | Purpose |
+|---|---|---|
+| `swarm://hierarchy` | every role | Effective roles, ACL, supervisors, tools, and safeguards |
+| `swarm://executors` | manager | Compatibility alias for the hierarchy |
+| `swarm://operations` | every role | Recent durable operations sent or received by that role |
+| `swarm://activity` | ordering authorities | Current and recent passive subordinate lifecycle state |
+| `swarm://outbox` | every role | Telegram delivery state; manager also sees the inbound offset and last successful poll |
+
+The activity endpoint records only lifecycle state. It never starts an agent,
+changes cron configuration, or sends Telegram messages. Timestamps make
+out-of-order delivery deterministic, repeated hook events are deduplicated, and
+stale `started` records are not reported as active forever.
+
+## Delivery and persistence
+
+Before contacting an agent API, the server reserves the operation in SQLite.
+The store provides:
+
+- WAL mode and an asynchronous connection pool;
+- a role-scoped operation ledger;
+- idempotency conflict and replay handling;
+- per-role persistent rate limits and a global in-flight dispatch bound;
+- explicit `accepted`, `partial`, `failed`, and `indeterminate` states;
+- automatic import of the old Python activity tables;
+- transactional, forward-version-checked schema migrations;
+- configurable operation/activity/outbox retention;
+- a durable Telegram outbox with bounded retries, `Retry-After` support, and
+  per-chunk checkpoints.
+
+Telegram delivery is asynchronous. A successful tool response reports an
+`outbox_id`; temporary Telegram failure does not turn a successfully accepted
+agent run into a failed command. Telegram delivery is at-least-once, so a crash
+between Telegram accepting a message and the local acknowledgement can produce
+a duplicate.
+
+## Shared Telegram gateway
+
+Telegram audit delivery has two mutually exclusive modes:
+
+| `SWARM_TELEGRAM_BOT_MODE` | Token source | Inbound commands |
+|---|---|---|
+| `per-role` | `<ROLE>_TELEGRAM_BOT_TOKEN` for every role | disabled |
+| `shared` | one `SWARM_TELEGRAM_BOT_TOKEN` owned by Swarm MCP | optional |
+
+In shared mode every `order`, `order_all`, `report`, `msg_to`, `msg_all`, and
+accepted Telegram command is copied to `TELEGRAM_GROUP_ID` by the same bot. The
+audit header still identifies the event, sender, and recipients, so individual
+Hermes containers do not need Telegram credentials. Executors report through
+Swarm MCP; their reports are therefore published by the shared bot as well.
+
+Set `SWARM_TELEGRAM_INBOUND_ENABLED=true` to let authorized people address the
+swarm through that bot. The gateway accepts only messages from the exact
+numeric `TELEGRAM_GROUP_ID` and positive numeric user IDs listed in
+`TELEGRAM_ALLOWED_USERS`. Plain group conversation is ignored. Supported
+commands are:
+
+```text
+/manager <message>
+/developer <message>
+/designer <message>
+/lead_developer <message>
+/tester <message>
+/devops <message>
+/to <role> <message>
+/all <message>
+/roles
+/help
 ```
 
-## Integrate with your tools
+`SWARM_TELEGRAM_INBOUND_TARGETS` limits which configured roles these commands
+may address; `*` enables all roles. Each accepted Telegram update is reserved
+under the manager identity in the same durable operation ledger as MCP calls.
+The Telegram update ID is its idempotency key, and the next polling offset is
+stored in SQLite after processing, preventing ordinary restart replays.
 
-- [ ] [Set up project integrations](https://gitlab.demlabs.net/internal/ai/swarm-mcp/-/settings/integrations)
+The default `SWARM_TELEGRAM_PROCESS_BACKLOG=false` discards old queued updates
+the first time inbound polling starts. Change it only when deliberately
+replaying the existing bot backlog. The bot must not have a webhook configured,
+because Telegram does not allow `getUpdates` while a webhook is active. Run one
+Swarm MCP replica per bot token; two long pollers would race for the same update
+stream. Delivery and polling use the common `TELEGRAM_PROXY_URL` when set.
 
-## Collaborate with your team
+The server reuses bounded HTTP clients, disables redirects, limits upstream
+response bodies, bounds semaphore wait time, and shuts down MCP sessions and
+background workers gracefully. Valid MCP and activity traffic is admitted
+through per-role request windows before it can create unbounded work.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## HTTP endpoints and security
 
-## Test and Deploy
+| Endpoint | Authentication |
+|---|---|
+| `/roles/<role>/mcp` | the exact role's bearer token |
+| `/activity` | any configured executor token |
+| `/health` | none; liveness only, no roster or secrets |
+| `/ready` | none; obtains and rolls back a SQLite write transaction |
 
-Use the built-in continuous integration in GitLab.
+All routes, including health and activity, enforce `Host`. Requests carrying an
+`Origin` header must match the configured origin allowlist. MCP and JSON bodies
+have a shared size limit. Secret values use a redacted debug representation and
+role comparisons use constant-time token equality.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+MCP is served on one Streamable HTTP endpoint per role, as required by the MCP
+transport model. POST and GET are handled by the official Rust SDK service.
 
-***
+## Configuration
 
-# Editing this README
+Runtime configuration lives in `../swarm/.env`; non-secret examples are in
+`../swarm/.env.example`. Configuration is validated before binding a socket.
+Unknown hierarchy roles, duplicate tokens, invalid activity routes, incomplete
+prompt placeholders, unsafe URLs, and malformed limits fail startup.
+Both Compose files pass an explicit Swarm MCP environment allowlist rather than
+injecting unrelated provider, Forgejo, or desktop secrets from the shared file.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Important groups:
 
-## Suggestions for a good README
+| Group | Variables |
+|---|---|
+| Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
+| Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_ORDER_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
+| Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY` |
+| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS` |
+| HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
+| State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
+| Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |
+| Telegram delivery | `SWARM_TELEGRAM_ENABLED`, `SWARM_TELEGRAM_BOT_MODE`, `SWARM_TELEGRAM_BOT_TOKEN`, `<ROLE>_TELEGRAM_BOT_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_PROXY_URL`, `SWARM_OUTBOX_*` |
+| Telegram inbound | `SWARM_TELEGRAM_INBOUND_ENABLED`, `TELEGRAM_ALLOWED_USERS`, `SWARM_TELEGRAM_INBOUND_TARGETS`, `SWARM_TELEGRAM_POLL_*`, `SWARM_TELEGRAM_PROCESS_BACKLOG`, `SWARM_TELEGRAM_INBOUND_*` |
+| Prompts | `SWARM_*_INSTRUCTIONS`, `SWARM_*_PROMPT_TEMPLATE` |
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## Local verification
 
-## Name
-Choose a self-explaining name for your project.
+Rust 1.89 or newer is required:
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo build --locked --release
+cargo audit --file Cargo.lock
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Start the server with the swarm environment and run non-destructive deployment
+probes:
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+```bash
+swarm-mcp serve
+swarm-mcp probe
+swarm-mcp activity-probe
+```
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+`probe` verifies every role's exact tool/resource catalog plus every wrong
+token/endpoint combination. `activity-probe` checks every configured route and
+also proves the event is absent from non-target authority resources. Neither
+probe invokes an agent tool.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+## Docker
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+The image uses digest-pinned Rust, Dockerfile frontend, and minimal Debian base
+images. The runtime installs no packages and copies only the CA bundle and
+compiled binary. It runs as UID/GID 1000 with no Linux capabilities, a read-only
+root filesystem, and only the `/data` SQLite volume writable. The image
+healthcheck calls `/ready` through the same compiled binary.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+From the swarm directory:
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```bash
+docker compose build swarm-mcp
+docker compose up -d swarm-mcp
+docker compose exec -T swarm-mcp swarm-mcp probe
+docker compose exec -T swarm-mcp swarm-mcp activity-probe
+```
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+The full deployment remains `swarm/deploy-agent-dev.sh`; it synchronizes this
+repository to `agent@agent-dev-0`, backs up SQLite and the previous image,
+starts Swarm MCP alone, runs both probes, and rolls back that state/image if the
+preflight fails. Hermes, Firefox, and Forgejo deployment inputs are pinned in
+`swarm/.env`.
