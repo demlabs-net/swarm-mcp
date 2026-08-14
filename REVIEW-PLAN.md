@@ -351,3 +351,26 @@ config 91.7 · store 89.9 · probe 91.5 · http 86.4 · mcp 89.7 · dispatch 86.
 - main.rs bin entry (25%) — would require either a full valid env map duplicated in bin tests or subprocess/CLI harness tests.
 - http.rs `serve()` CLI-only signal wiring (covered via `serve_with_shutdown`).
 - `rust-toolchain.toml` — explicitly declined (runner will be upgraded; clippy passes on 1.89 and 1.97).
+
+---
+
+# Iteration 8 (2026-08-14) — main.rs bin entry coverage
+
+Suite: **98 lib + 3 bin tests**. `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **90.70%** (was 90.17%).
+
+- **main.rs 25% → 86.1%** — `run_probe`/`run_activity_probe` wrappers covered without a live server:
+  catalog probe against a dead endpoint surfaces the error; activity probe with empty routes
+  short-circuits to `Ok`. The valid env map is rebuilt in the bin tests via `Config::from_env_with`
+  (no env mutation; the lib's `testutil` is invisible to the bin crate).
+- **probe.rs 91.6%** — `activity_probe` disabled-activity branch against a live router.
+
+## Coverage snapshot (line %)
+
+config 91.7 · lib 92.9 · probe 91.6 · store 89.9 · mcp 89.7 · **main 86.1** · http 86.4 · dispatch 86.3 · telegram 80.5.
+
+## Remaining (open)
+
+- telegram.rs 80.5% — the last sub-85 module: `spawn_inbound_worker`/`run()` backoff loop and
+  `send_text` paths are the residual gaps (config-validated init makes several branches near-unreachable).
+- http.rs `shutdown_signal()` — process-global signal handlers, intentionally not tested in-process.

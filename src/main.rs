@@ -115,4 +115,146 @@ mod tests {
         let cli = Cli::parse_from(["swarm-mcp", "healthcheck", "--port", "0"]);
         assert!(run(cli).await.is_err());
     }
+
+    /// Minimal valid configuration map, mirroring the config.rs fixture. The
+    /// binary cannot reuse the library's test fixtures, so the map is rebuilt
+    /// here (`from_env_with` keeps it race-free without touching the process env).
+    fn valid_env() -> std::collections::BTreeMap<String, String> {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "SWARM_AGENT_ROLES".into(),
+            "developer,lead-developer".into(),
+        );
+        env.insert("SWARM_MANAGER_ROLE".into(), "manager".into());
+        env.insert(
+            "SWARM_EXECUTOR_DESCRIPTIONS".into(),
+            r#"{"developer":"Dev","lead-developer":"Lead"}"#.into(),
+        );
+        env.insert(
+            "SWARM_ORDER_ACL".into(),
+            r#"{"manager":["*"],"lead-developer":["developer"]}"#.into(),
+        );
+        env.insert(
+            "SWARM_ACTIVITY_ROUTES".into(),
+            r#"{"developer":["lead-developer"]}"#.into(),
+        );
+        env.insert("SWARM_ROLE_MCP_PATH_TEMPLATE".into(), "/mcp/{role}".into());
+        env.insert("SWARM_ACTIVITY_SIGNAL_PATH".into(), "/activity".into());
+        for role in ["manager", "developer", "lead-developer"] {
+            let prefix = role.to_uppercase().replace('-', "_");
+            env.insert(
+                format!("{prefix}_API_URL"),
+                format!("http://127.0.0.1:1/{role}"),
+            );
+            env.insert(
+                format!("{prefix}_AGENT_API_KEY"),
+                format!("api-key-{role}-1234567890"),
+            );
+            env.insert(
+                format!("{prefix}_SWARM_MCP_TOKEN"),
+                format!("mcp-token-{role}-1234567890123456"),
+            );
+        }
+        env.insert("SWARM_MCP_ALLOWED_HOSTS".into(), "localhost".into());
+        env.insert(
+            "SWARM_MCP_ALLOWED_ORIGINS".into(),
+            "http://localhost".into(),
+        );
+        env.insert(
+            "SWARM_REPORT_STATUSES".into(),
+            "completed,failed,in_progress".into(),
+        );
+        env.insert(
+            "SWARM_AUTHORITY_MCP_INSTRUCTIONS".into(),
+            "you order {role} {targets}".into(),
+        );
+        env.insert(
+            "SWARM_ORDER_PROMPT_TEMPLATE".into(),
+            "{task_id}|{sender}|{recipient}|{message}".into(),
+        );
+        env.insert(
+            "SWARM_REPORT_PROMPT_TEMPLATE".into(),
+            "{sender}|{recipient}|{task_id}|{status}|{message}".into(),
+        );
+        env.insert(
+            "SWARM_PEER_PROMPT_TEMPLATE".into(),
+            "{message_id}|{sender}|{recipient}|{message}".into(),
+        );
+        env.insert(
+            "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE".into(),
+            "update {update_id} user {user_id} -> {recipient}: {message}".into(),
+        );
+        env.insert("SWARM_MCP_HOST".into(), "127.0.0.1".into());
+        env.insert("SWARM_MCP_PORT".into(), "3004".into());
+        env.insert("SWARM_MAX_MESSAGE_CHARS".into(), "10000".into());
+        env.insert("SWARM_MCP_MAX_REQUEST_BODY_BYTES".into(), "65536".into());
+        env.insert("SWARM_API_TIMEOUT_SECONDS".into(), "5".into());
+        env.insert("SWARM_HERMES_MODEL_ALIAS".into(), "hermes".into());
+        env.insert(
+            "SWARM_STATE_DB_PATH".into(),
+            "/tmp/swarm-main-test.db".into(),
+        );
+        env.insert("SWARM_DB_MAX_CONNECTIONS".into(), "4".into());
+        env.insert("SWARM_DB_BUSY_TIMEOUT_SECONDS".into(), "5".into());
+        env.insert("SWARM_ACTIVITY_RETENTION_DAYS".into(), "30".into());
+        env.insert("SWARM_ACTIVITY_HISTORY_LIMIT".into(), "50".into());
+        env.insert("SWARM_ACTIVITY_STALE_AFTER_SECONDS".into(), "3600".into());
+        env.insert("SWARM_ACTIVITY_CLOCK_SKEW_SECONDS".into(), "60".into());
+        env.insert("SWARM_RECENT_OPERATIONS_LIMIT".into(), "50".into());
+        env.insert("SWARM_OPERATION_RETENTION_DAYS".into(), "30".into());
+        env.insert("SWARM_DISPATCH_RATE_LIMIT".into(), "100".into());
+        env.insert("SWARM_DISPATCH_RATE_WINDOW_SECONDS".into(), "60".into());
+        env.insert("SWARM_MAX_INFLIGHT_DISPATCHES".into(), "16".into());
+        env.insert("SWARM_PENDING_STALE_SECONDS".into(), "300".into());
+        env.insert("SWARM_CLEANUP_INTERVAL_SECONDS".into(), "300".into());
+        env.insert("SWARM_MCP_REQUEST_RATE_LIMIT".into(), "1000".into());
+        env.insert("SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS".into(), "60".into());
+        env.insert("SWARM_TELEGRAM_TIMEOUT_SECONDS".into(), "10".into());
+        env.insert("SWARM_TELEGRAM_MESSAGE_LIMIT".into(), "4096".into());
+        env.insert(
+            "TELEGRAM_API_BASE_URL".into(),
+            "https://api.telegram.org".into(),
+        );
+        env.insert("SWARM_OUTBOX_POLL_INTERVAL_SECONDS".into(), "5".into());
+        env.insert("SWARM_OUTBOX_MAX_ATTEMPTS".into(), "5".into());
+        env.insert("SWARM_OUTBOX_BATCH_SIZE".into(), "10".into());
+        env.insert("SWARM_OUTBOX_RETENTION_DAYS".into(), "30".into());
+        env.insert("SWARM_TELEGRAM_POLL_TIMEOUT_SECONDS".into(), "25".into());
+        env.insert("SWARM_TELEGRAM_POLL_LIMIT".into(), "100".into());
+        env.insert(
+            "SWARM_TELEGRAM_INBOUND_RUN_INSTRUCTIONS".into(),
+            "run it".into(),
+        );
+        env.insert("SWARM_MANAGER_MCP_INSTRUCTIONS".into(), "manager".into());
+        env.insert("SWARM_EXECUTOR_MCP_INSTRUCTIONS".into(), "executor".into());
+        env.insert("SWARM_EXECUTOR_RUN_INSTRUCTIONS".into(), "run it".into());
+        env.insert("SWARM_SUPERVISOR_REPORT_INSTRUCTIONS".into(), "read".into());
+        env.insert("SWARM_PEER_RUN_INSTRUCTIONS".into(), "read".into());
+        env.insert("SWARM_LOG_LEVEL".into(), "info".into());
+        env
+    }
+
+    #[tokio::test]
+    async fn probe_wrappers_propagate_outcomes() -> anyhow::Result<()> {
+        let mut env = valid_env();
+        env.insert("SWARM_MCP_ALLOWED_HOSTS".into(), "127.0.0.1".into());
+        let config = Arc::new(Config::from_env_with(&|name| env.get(name).cloned())?);
+
+        // The catalog probe against a dead endpoint surfaces the error.
+        assert!(
+            run_probe(config.clone(), Some("http://127.0.0.1:1".into()))
+                .await
+                .is_err()
+        );
+
+        // With no activity routes the activity probe short-circuits successfully.
+        env.insert("SWARM_ACTIVITY_ROUTES".into(), "{}".into());
+        let config = Arc::new(Config::from_env_with(&|name| env.get(name).cloned())?);
+        assert!(
+            run_activity_probe(config, Some("http://127.0.0.1:1".into()))
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
 }
