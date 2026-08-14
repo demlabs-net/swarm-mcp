@@ -1199,10 +1199,15 @@ fn validate_idempotency(value: Option<&str>) -> anyhow::Result<Option<String>> {
         .transpose()
 }
 
+pub(crate) const MAX_IDENTIFIER_BYTES: usize = 160;
+
 pub(crate) fn validate_identifier(value: &str, field: &str) -> anyhow::Result<String> {
     let value = value.trim();
     ensure!(!value.is_empty(), "{field} must not be empty");
-    ensure!(value.len() <= 160, "{field} exceeds 160 bytes");
+    ensure!(
+        value.len() <= MAX_IDENTIFIER_BYTES,
+        "{field} exceeds {MAX_IDENTIFIER_BYTES} bytes"
+    );
     ensure!(
         value
             .bytes()
@@ -1327,6 +1332,24 @@ mod tests {
         assert_eq!(
             validate_idempotency(Some("  stable-key  ")).unwrap(),
             Some("stable-key".to_string())
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_and_key_order_independent() {
+        let first = fingerprint(&json!({"target": "developer", "command": "do it"}));
+        let second = fingerprint(&json!({"target": "developer", "command": "do it"}));
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64, "SHA-256 hex");
+        // serde_json::Map serializes keys sorted (BTreeMap), so object key
+        // insertion order must never change the fingerprint.
+        assert_eq!(
+            fingerprint(&json!({"a": 1, "b": 2})),
+            fingerprint(&json!({"b": 2, "a": 1}))
+        );
+        assert_ne!(
+            fingerprint(&json!({"command": "do it"})),
+            fingerprint(&json!({"command": "do it "}))
         );
     }
 

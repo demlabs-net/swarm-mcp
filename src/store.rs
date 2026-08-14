@@ -334,13 +334,23 @@ impl Store {
         history_limit: i64,
         stale_after: Duration,
     ) -> anyhow::Result<Value> {
-        let current_rows = sqlx::query(
-            r#"SELECT sender, event, turn_id, detail, occurred_ms, received_ms
-               FROM activity_state WHERE target = ? ORDER BY occurred_ms DESC"#,
-        )
-        .bind(role)
-        .fetch_all(&self.pool)
-        .await?;
+        let current_rows = if allowed_senders.is_empty() {
+            Vec::new()
+        } else {
+            let placeholders = std::iter::repeat_n("?", allowed_senders.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT sender, event, turn_id, detail, occurred_ms, received_ms
+                 FROM activity_state WHERE target = ? AND sender IN ({placeholders})
+                 ORDER BY occurred_ms DESC"
+            );
+            let mut query = sqlx::query(&sql).bind(role);
+            for sender in allowed_senders {
+                query = query.bind(sender);
+            }
+            query.fetch_all(&self.pool).await?
+        };
         let recent_rows = if allowed_senders.is_empty() {
             Vec::new()
         } else {
@@ -360,15 +370,13 @@ impl Store {
         };
         let now = Utc::now().timestamp_millis();
         let stale_ms = i64::try_from(stale_after.as_millis()).unwrap_or(i64::MAX);
+        // Both queries filter senders in SQL; the rows are already caller-scoped.
         let current = current_rows
             .iter()
-            .filter(|row| allowed_senders.contains(&row.get::<String, _>("sender")))
             .map(|row| activity_json(row, now, stale_ms))
             .collect::<Vec<_>>();
         let recent = recent_rows
             .iter()
-            .filter(|row| allowed_senders.contains(&row.get::<String, _>("sender")))
-            .take(usize::try_from(history_limit).unwrap_or(usize::MAX))
             .map(|row| activity_json(row, now, stale_ms))
             .collect::<Vec<_>>();
         let active = current
@@ -940,6 +948,12 @@ const SCHEMA: &[&str] = &[
          created_ms INTEGER NOT NULL
        )"#,
     "CREATE INDEX IF NOT EXISTS rate_events_actor_idx ON rate_events(actor, created_ms)",
+    // Window-pruning indexes for the cleanup and rate-window deletes, which
+    // filter on the timestamp column alone (the actor/target indexes do not
+    // help those scans).
+    "CREATE INDEX IF NOT EXISTS rate_events_created_idx ON rate_events(created_ms)",
+    "CREATE INDEX IF NOT EXISTS activity_events_received_idx ON activity_events(received_ms)",
+    "CREATE INDEX IF NOT EXISTS dispatches_updated_idx ON dispatches(updated_ms)",
     r#"CREATE TABLE IF NOT EXISTS telegram_outbox (
          id TEXT PRIMARY KEY,
          sender TEXT NOT NULL,
@@ -1694,6 +1708,56 @@ mod tests {
             operation["result"]["results"]["lead-developer"]["status"],
             json!("failed")
         );
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_reservations_share_one_rate_slot() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-parallel-reserve-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let targets = vec!["developer".to_string()];
+        let (first, second) = tokio::join!(
+            store.reserve_dispatch(
+                "p_1",
+                "manager",
+                "order",
+                &targets,
+                None,
+                "fp",
+                1,
+                Duration::from_secs(60),
+            ),
+            store.reserve_dispatch(
+                "p_2",
+                "manager",
+                "order",
+                &targets,
+                None,
+                "fp",
+                1,
+                Duration::from_secs(60),
+            ),
+        );
+        let outcomes = [first?, second?];
+        let reserved = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Reservation::Reserved))
+            .count();
+        let limited = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Reservation::RateLimited { .. }))
+            .count();
+        assert_eq!(
+            reserved, 1,
+            "exactly one dispatch wins the single rate slot"
+        );
+        assert_eq!(limited, 1, "the other reservation is rate limited");
 
         store.pool.close().await;
         remove_sqlite_files(&path).await;

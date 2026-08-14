@@ -38,3 +38,11 @@ rustsec:
   script:
     - cargo install cargo-audit --locked --version 0.22.2
     - cargo audit --file Cargo.lock
+
+coverage:
+  stage: audit
+  before_script:
+    - rustup component add llvm-tools-preview
+    - cargo install cargo-llvm-cov --locked
+  script:
+    - cargo llvm-cov --locked --all-targets --fail-under-lines 70 --summary-only

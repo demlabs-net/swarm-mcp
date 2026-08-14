@@ -100,7 +100,7 @@ impl RoleMcp {
                         },
                         "task_id": {
                             "type": "string",
-                            "maxLength": 160,
+                            "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
                             "default": ""
                         },
                         "status": {
@@ -449,7 +449,7 @@ fn idempotency_schema() -> Value {
     json!({
         "type": "string",
         "minLength": 1,
-        "maxLength": 160,
+        "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
         "pattern": "^[A-Za-z0-9_.:-]+$",
         "description": "Stable key for safe retries. Reusing it with different arguments is rejected."
     })

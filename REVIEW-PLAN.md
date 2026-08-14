@@ -246,3 +246,36 @@ Executed per the plan; suite grew **17 → 46 tests**, all green:
 - Phase 3: P-01/P-02 indexes + snapshot query pushdown (schema v4); B-03 text-policy helper; B-05 `break` in poll loop.
 - Phase 4: C-02 coverage job; G-03 LICENSE; G-04 worker init retry.
 - P-03/P-04: documented trade-offs (comments added where relevant).
+
+---
+
+# Iteration 4 (2026-08-14) — Phase 2 tail + Phase 3 + coverage
+
+Suite: **59 tests** (was 46). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ (59) ·
+`build --locked --release` ✅ · line coverage **77.6%** (was ~20% at iteration 1).
+
+## Resolved in this batch
+
+| ID | Disposition |
+|---|---|
+| P-01 | **Fixed** — pruning indexes added to SCHEMA (idempotent `CREATE INDEX IF NOT EXISTS`, no version bump): `rate_events_created_idx(created_ms)`, `activity_events_received_idx(received_ms)`, `dispatches_updated_idx(updated_ms)`. The window deletes no longer scan. |
+| P-02 | **Fixed** — `activity_snapshot` pushes `sender IN (...)` into both queries; redundant in-memory filters and re-`take()` removed. Caller visibility is enforced in SQL. |
+| B-05 | **Fixed** — `poll_once` breaks on the first below-offset update (sorted). |
+| B-03 | **Fixed (light)** — `MAX_IDENTIFIER_BYTES` const shared by runtime validation and both MCP schemas (`idempotency_schema`, report `task_id`); units documented at the definitions. |
+| G-04 | **Fixed** — inbound worker now retries `TelegramGateway::new` with capped exponential backoff instead of exiting forever; cancellation-aware. |
+| G-05 | **Fixed** — tests: `Secret` Debug redaction, `fingerprint` determinism (incl. key-order independence and whitespace sensitivity), parallel `reserve_dispatch` sharing one rate slot (global lock ⇒ exactly one `Reserved`). |
+| Config testability | **Fixed** — `Config::from_env` delegates to `from_env_with(&dyn Fn(&str) -> Option<String>)`; all helpers thread the source. Full validation matrix added: missing vars, duplicate executors, manager-as-executor, case normalization, ACL/route errors, short/duplicate credentials, template contract, path collisions, origin/host formats, Telegram mode contracts (12 config tests, parallel-safe, no env mutation). |
+| B-07 (new) | **Fixed** — config now rejects hosts with a non-numeric port (`http::uri::Authority` silently parses `localhost:bad-port` as "no port", which would turn a typo into a host-only rule matching ANY port). IPv6-aware check. Found by the validation matrix. |
+| Telegram inbound | **Covered** — `poll_once` tested against a mock Bot API (getUpdates/sendMessage): Discard-mode fast-forward (offset advances, nothing dispatched), Process-mode dispatch (update → `telegram_5` accepted via mock Hermes, offset advances), unlisted user ignored (offset still advances). |
+| C-02 | **Fixed** — `coverage` job added (stage `audit`): `cargo-llvm-cov` (binary cached in `.cargo/bin`) with `--fail-under-lines 70`; current 77.6%. |
+
+## Coverage snapshot (line %)
+
+config 90.5 · store 89.5 · http 82.3 · telegram 75.3 · mcp 72.4 · dispatch 67.8 · probe 31.9 (network-bound paths) · main/lib 0 (bin entry). Threshold 70% leaves headroom; raise to 75–80 once probe/main get e2e coverage.
+
+## Remaining (open)
+
+- G-03: LICENSE file (needs copyright holder).
+- P-03/P-04: documented trade-offs only (N+1 in `recent_operations`; global reservation lock) — acceptable at current scale.
+- Optional: `rust-toolchain.toml` pin (CI 1.89 vs local 1.97 — clippy now passes on both).
+- Probe e2e (T-8) would lift probe.rs coverage and enable a higher threshold.

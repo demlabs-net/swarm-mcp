@@ -55,14 +55,34 @@ pub fn spawn_inbound_worker(
 ) -> Option<JoinHandle<()>> {
     state.config.telegram_inbound_enabled.then(|| {
         tokio::spawn(async move {
-            match TelegramGateway::new(state) {
-                Ok(gateway) => {
-                    if let Err(error) = gateway.run(cancellation).await {
-                        error!(error = %error, "Telegram inbound gateway stopped");
-                    }
+            // Config validation makes init failure near-impossible, but never exit
+            // permanently on a transient failure: retry with capped backoff.
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                if cancellation.is_cancelled() {
+                    return;
                 }
-                Err(error) => {
-                    error!(error = %error, "initialize Telegram inbound gateway failed");
+                match TelegramGateway::new(state.clone()) {
+                    Ok(gateway) => {
+                        // run() only returns after cancellation (polling errors are
+                        // handled inside with their own backoff).
+                        if let Err(error) = gateway.run(cancellation.clone()).await {
+                            error!(error = %error, "Telegram inbound gateway stopped");
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        error!(
+                            error = %error,
+                            retry_seconds = backoff.as_secs(),
+                            "initialize Telegram inbound gateway failed; retrying"
+                        );
+                        tokio::select! {
+                            () = cancellation.cancelled() => return,
+                            () = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = backoff.saturating_mul(2).min(Duration::from_secs(60));
+                    }
                 }
             }
         })
@@ -169,8 +189,9 @@ impl TelegramGateway {
             .await?;
         updates.sort_by_key(|update| update.update_id);
         for update in updates {
+            // Updates are sorted, so the first below-threshold one means the rest are too.
             if update.update_id < offset {
-                continue;
+                break;
             }
             self.process_update(&update).await?;
             self.state
@@ -487,5 +508,142 @@ mod tests {
             "Telegram update ID overflow"
         );
         assert_eq!(next_offset(41).unwrap(), 42);
+    }
+
+    use std::{collections::BTreeSet, sync::Mutex};
+
+    use crate::{
+        config::{Secret, TelegramBotMode},
+        testutil,
+    };
+
+    /// Canned Telegram Bot API response served for both getUpdates and sendMessage.
+    async fn spawn_mock_telegram(result: Arc<Mutex<Value>>) -> String {
+        use axum::{Router, extract::State as AxumState, routing::post};
+        let handler = move |AxumState(result): AxumState<Arc<Mutex<Value>>>| async move {
+            axum::Json(result.lock().expect("mock telegram").clone())
+        };
+        let router = Router::new()
+            .route("/bot{token}/getUpdates", post(handler))
+            .route("/bot{token}/sendMessage", post(handler))
+            .with_state(result);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Telegram");
+        let address = listener.local_addr().expect("mock Telegram address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock Telegram serves");
+        });
+        format!("http://{address}")
+    }
+
+    fn allowed_update() -> Value {
+        json!({
+            "update_id": 5,
+            "message": {
+                "message_id": 100,
+                "from": {"id": 42, "is_bot": false, "username": "alice"},
+                "chat": {"id": -100_123},
+                "text": "/developer hello"
+            }
+        })
+    }
+
+    async fn gateway_with_mocks(
+        backlog: TelegramBacklogMode,
+        telegram_result: Arc<Mutex<Value>>,
+    ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("telegram");
+        let telegram_base = spawn_mock_telegram(telegram_result).await;
+        let hermes_base =
+            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "run-1"})))).await;
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        config.telegram_backlog_mode = backlog;
+        config.telegram_api_base_url = telegram_base.parse()?;
+        for agent in config.agents.values_mut() {
+            agent.api_url = hermes_base.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(AppState {
+            config,
+            store: store.clone(),
+            dispatcher,
+        });
+        let gateway = TelegramGateway::new(state)?;
+        Ok((gateway, store, path))
+    }
+
+    #[tokio::test]
+    async fn poll_once_fast_forwards_backlog_in_discard_mode() -> anyhow::Result<()> {
+        let result = Arc::new(Mutex::new(
+            json!({"ok": true, "result": [allowed_update()]}),
+        ));
+        let (gateway, store, path) =
+            gateway_with_mocks(TelegramBacklogMode::Discard, result).await?;
+
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        let dispatches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(dispatches, 0, "backlog is skipped, not dispatched");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_dispatches_updates_and_advances_offset() -> anyhow::Result<()> {
+        let result = Arc::new(Mutex::new(
+            json!({"ok": true, "result": [allowed_update()]}),
+        ));
+        let (gateway, store, path) =
+            gateway_with_mocks(TelegramBacklogMode::Process, result).await?;
+
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE id='telegram_5'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "accepted", "the Telegram command reached the swarm");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_ignores_unlisted_users_but_advances_offset() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["from"]["id"] = json!(999);
+        update["message"]["from"]["username"] = json!("stranger");
+        let result = Arc::new(Mutex::new(json!({"ok": true, "result": [update]})));
+        let (gateway, store, path) =
+            gateway_with_mocks(TelegramBacklogMode::Process, result).await?;
+
+        gateway.poll_once().await?;
+        assert_eq!(
+            store.telegram_update_offset().await?,
+            Some(6),
+            "the offset advances even for ignored updates"
+        );
+        let dispatches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(dispatches, 0, "an unlisted user must not reach the swarm");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
     }
 }
