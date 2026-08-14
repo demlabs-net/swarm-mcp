@@ -1,0 +1,11 @@
+.env
+/target/
+/.cargo/
+*.db
+*.db-shm
+*.db-wal
+*.pyc
+__pycache__/
+.venv/
+.idea/
+.vscode/
