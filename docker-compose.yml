@@ -4,6 +4,9 @@ services:
     image: demlabs/swarm-mcp:local
     container_name: dev-swarm-mcp
     restart: unless-stopped
+    # Полный конфиг роя (роли, креды, промпты) — в ../swarm/.env
+    env_file:
+      - ../swarm/.env
     environment:
       SWARM_MCP_HOST: ${SWARM_MCP_HOST}
       SWARM_MCP_PORT: ${SWARM_MCP_PORT}
