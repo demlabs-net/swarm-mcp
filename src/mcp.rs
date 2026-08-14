@@ -272,7 +272,7 @@ impl RoleMcp {
         }
         pieces.push(
             format!(
-                "Use a unique, stable idempotency_key when retrying any order, report, or message; never recycle it for another logical operation. Idempotency records are retained for {} days. Read swarm://operations to inspect accepted, partial, and indeterminate dispatches before retrying.",
+                "Use a unique, stable idempotency_key when retrying any order, report, or message; never recycle it for another logical operation. A dispatch that definitively failed releases its key, so retrying with the same key re-executes; accepted, partial, and indeterminate results replay. Idempotency records are retained for {} days. Read swarm://operations to inspect accepted, partial, and indeterminate dispatches before retrying.",
                 config.operation_retention_days
             )
         );
@@ -470,4 +470,104 @@ fn tool_result(outcome: ToolOutcome) -> CallToolResult {
 fn internal_error(error: impl std::fmt::Display) -> McpError {
     tracing::error!(error = %error, "MCP resource read failed");
     McpError::internal_error("persistent resource read failed", None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppState, testutil};
+
+    async fn role_mcp(role: &str) -> anyhow::Result<(RoleMcp, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("mcp");
+        let config = std::sync::Arc::new(testutil::fixture_config(&path));
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = std::sync::Arc::new(AppState {
+            config,
+            store,
+            dispatcher,
+        });
+        Ok((RoleMcp::new(state, role.to_string()), path))
+    }
+
+    fn tool_names(mcp: &RoleMcp) -> Vec<String> {
+        mcp.tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
+
+    fn resource_uris(mcp: &RoleMcp) -> Vec<String> {
+        mcp.resources()
+            .into_iter()
+            .map(|resource| resource.uri)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn manager_catalog_is_global_authority() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("manager").await?;
+        assert_eq!(tool_names(&mcp), vec!["order", "order_all"]);
+        let resources = resource_uris(&mcp);
+        assert!(resources.contains(&"swarm://executors".to_string()));
+        assert!(resources.contains(&"swarm://activity".to_string()));
+        // the order tool schema enumerates exactly the ACL targets
+        let order = mcp
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name == "order")
+            .unwrap();
+        let schema = serde_json::to_value(&order.input_schema).unwrap();
+        assert_eq!(
+            schema["properties"]["agent"]["enum"],
+            json!(["developer", "lead-developer"])
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_catalog_is_coordination_only() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("developer").await?;
+        assert_eq!(tool_names(&mcp), vec!["msg_all", "msg_to", "report"]);
+        let resources = resource_uris(&mcp);
+        assert!(!resources.contains(&"swarm://executors".to_string()));
+        assert!(!resources.contains(&"swarm://activity".to_string()));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authority_catalog_exposes_activity() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("lead-developer").await?;
+        assert_eq!(
+            tool_names(&mcp),
+            vec!["msg_all", "msg_to", "order", "report"]
+        );
+        let resources = resource_uris(&mcp);
+        assert!(resources.contains(&"swarm://activity".to_string()));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hierarchy_json_reports_effective_acl() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("lead-developer").await?;
+        let hierarchy = mcp.hierarchy();
+        assert_eq!(hierarchy["caller"], json!("lead-developer"));
+        assert_eq!(hierarchy["manager"], json!("manager"));
+        assert_eq!(hierarchy["caller_may_order"], json!(["developer"]));
+        assert_eq!(hierarchy["caller_supervisors"], json!(["manager"]));
+        assert_eq!(
+            hierarchy["safeguards"]["telegram_sender_configured"],
+            json!(false)
+        );
+        assert_eq!(
+            hierarchy["tools"],
+            json!(["msg_all", "msg_to", "order", "report"])
+        );
+        assert!(mcp.instructions().contains("releases its key"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
 }

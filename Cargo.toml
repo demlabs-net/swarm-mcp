@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

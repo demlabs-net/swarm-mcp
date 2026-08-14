@@ -16,6 +16,10 @@ use url::Url;
 pub struct Secret(String);
 
 impl Secret {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -712,13 +716,6 @@ impl Config {
             .collect()
     }
 
-    pub fn role_for_path(&self, path: &str) -> Option<&str> {
-        let normalized = path.trim_end_matches('/');
-        self.role_paths
-            .iter()
-            .find_map(|(role, configured)| (configured == normalized).then_some(role.as_str()))
-    }
-
     pub fn telegram_token_for(&self, sender: &str) -> Option<&Secret> {
         match self.telegram_bot_mode {
             TelegramBotMode::Shared => self.telegram_bot_token.as_ref(),
@@ -919,5 +916,59 @@ mod tests {
             validate_template("TEST", "{sender}: {secret}", &["sender"], &["sender"],).is_err()
         );
         assert!(validate_template("TEST", "{sender", &["sender"], &["sender"]).is_err());
+    }
+
+    #[test]
+    fn path_validation_rules() {
+        assert!(validate_path("/mcp/manager").is_ok());
+        assert!(validate_path("/a/b/c").is_ok());
+        assert!(validate_path("mcp/manager").is_err(), "must be absolute");
+        assert!(validate_path("/").is_err(), "must not be root");
+        assert!(validate_path("/a//b").is_err(), "empty segment");
+        assert!(validate_path("/a?b").is_err(), "query");
+        assert!(validate_path("/a#b").is_err(), "fragment");
+    }
+
+    #[test]
+    fn http_url_validation_rules() {
+        assert!(parse_http_url("TEST", "http://example.com:3004").is_ok());
+        assert!(parse_http_url("TEST", "https://example.com").is_ok());
+        assert!(
+            parse_http_url("TEST", "ftp://example.com").is_err(),
+            "scheme"
+        );
+        assert!(parse_http_url("TEST", "http://").is_err(), "missing host");
+        assert!(
+            parse_http_url("TEST", "http://user:pass@example.com").is_err(),
+            "credentials"
+        );
+        assert!(
+            parse_http_url("TEST", "http://example.com?a=1").is_err(),
+            "query"
+        );
+        assert!(
+            parse_http_url("TEST", "http://example.com#frag").is_err(),
+            "fragment"
+        );
+    }
+
+    #[test]
+    fn target_normalization_deduplicates_and_rejects_self() {
+        let executors = BTreeSet::from(["developer".to_string(), "designer".to_string()]);
+        assert_eq!(
+            normalize_targets(
+                "manager",
+                &[
+                    "developer".to_string(),
+                    "developer".to_string(),
+                    "designer".to_string()
+                ],
+                &executors,
+            )
+            .unwrap(),
+            vec!["developer".to_string(), "designer".to_string()]
+        );
+        assert!(normalize_targets("manager", &["unknown".to_string()], &executors).is_err());
+        assert!(normalize_targets("developer", &["developer".to_string()], &executors).is_err());
     }
 }

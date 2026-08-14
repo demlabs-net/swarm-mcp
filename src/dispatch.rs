@@ -88,6 +88,61 @@ impl std::fmt::Display for TelegramFailure {
     }
 }
 
+/// Shared aggregation of per-target broadcast outcomes (`order_all`, `msg_all`,
+/// Telegram inbound). A broadcast is `accepted` only when every target run was
+/// accepted; `indeterminate` when nothing was accepted and at least one target
+/// may have been reached; `partial` when some but not all runs were accepted.
+struct BroadcastSummary {
+    label: &'static str,
+    results: Map<String, Value>,
+    succeeded: usize,
+    indeterminate: usize,
+}
+
+impl BroadcastSummary {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            results: Map::new(),
+            succeeded: 0,
+            indeterminate: 0,
+        }
+    }
+
+    fn push(&mut self, target: String, result: Result<String, RunFailure>) {
+        match result {
+            Ok(run_id) => {
+                self.succeeded += 1;
+                self.results.insert(target, json!({"run_id": run_id}));
+            }
+            Err(error) => {
+                warn!(%target, error = %error, "{}", self.label);
+                self.indeterminate += usize::from(error.indeterminate);
+                self.results.insert(
+                    target,
+                    json!({
+                        "error": error.to_string(),
+                        "status": error.status(),
+                        "recovery_required": error.indeterminate,
+                    }),
+                );
+            }
+        }
+    }
+
+    fn status(&self, total: usize) -> &'static str {
+        if self.succeeded == total {
+            "accepted"
+        } else if self.succeeded == 0 && self.indeterminate > 0 {
+            "indeterminate"
+        } else if self.succeeded == 0 {
+            "failed"
+        } else {
+            "partial"
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrderArgs {
@@ -300,44 +355,17 @@ impl Dispatcher {
             };
             (target.clone(), result)
         });
-        let mut results = Map::new();
-        let mut succeeded = 0_usize;
-        let mut indeterminate = 0_usize;
+        let mut summary = BroadcastSummary::new("broadcast dispatch failed");
         for (target, result) in join_all(requests).await {
-            match result {
-                Ok(run_id) => {
-                    succeeded += 1;
-                    results.insert(target, json!({"run_id": run_id}));
-                }
-                Err(error) => {
-                    warn!(%target, error = %error, "broadcast dispatch failed");
-                    indeterminate += usize::from(error.indeterminate);
-                    results.insert(
-                        target,
-                        json!({
-                            "error": error.to_string(),
-                            "status": error.status(),
-                            "recovery_required": error.indeterminate,
-                        }),
-                    );
-                }
-            }
+            summary.push(target, result);
         }
-        let ok = succeeded == targets.len();
-        let status = if ok {
-            "accepted"
-        } else if succeeded == 0 && indeterminate > 0 {
-            "indeterminate"
-        } else if succeeded == 0 {
-            "failed"
-        } else {
-            "partial"
-        };
+        let ok = summary.succeeded == targets.len();
+        let status = summary.status(targets.len());
         let mut result = json!({
             "ok": ok,
             "task_id": task_id,
             "authority": sender,
-            "results": results,
+            "results": summary.results,
         });
         let audit = self.audit(
             sender,
@@ -575,6 +603,12 @@ impl Dispatcher {
             .filter(|role| role.as_str() != sender)
             .cloned()
             .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return tool_error(json!({
+                "ok": false,
+                "error": "no peer executors to message",
+            }));
+        }
         let fingerprint = fingerprint(&json!({"targets": targets, "message": message}));
         if let Some(outcome) = self
             .reserve_or_replay(
@@ -608,43 +642,16 @@ impl Dispatcher {
             };
             (target.clone(), result)
         });
-        let mut results = Map::new();
-        let mut succeeded = 0_usize;
-        let mut indeterminate = 0_usize;
+        let mut summary = BroadcastSummary::new("peer broadcast failed");
         for (target, result) in join_all(requests).await {
-            match result {
-                Ok(run_id) => {
-                    succeeded += 1;
-                    results.insert(target, json!({"run_id": run_id}));
-                }
-                Err(error) => {
-                    warn!(%target, error = %error, "peer broadcast failed");
-                    indeterminate += usize::from(error.indeterminate);
-                    results.insert(
-                        target,
-                        json!({
-                            "error": error.to_string(),
-                            "status": error.status(),
-                            "recovery_required": error.indeterminate,
-                        }),
-                    );
-                }
-            }
+            summary.push(target, result);
         }
-        let ok = succeeded == targets.len();
-        let status = if ok {
-            "accepted"
-        } else if succeeded == 0 && indeterminate > 0 {
-            "indeterminate"
-        } else if succeeded == 0 {
-            "failed"
-        } else {
-            "partial"
-        };
+        let ok = summary.succeeded == targets.len();
+        let status = summary.status(targets.len());
         let mut result = json!({
             "ok": ok,
             "message_id": message_id,
-            "results": results,
+            "results": summary.results,
         });
         let audit = self.audit(
             sender,
@@ -743,39 +750,12 @@ impl Dispatcher {
             };
             (target.clone(), result)
         });
-        let mut results = Map::new();
-        let mut succeeded = 0_usize;
-        let mut indeterminate = 0_usize;
+        let mut summary = BroadcastSummary::new("Telegram inbound dispatch failed");
         for (target, result) in join_all(requests).await {
-            match result {
-                Ok(run_id) => {
-                    succeeded += 1;
-                    results.insert(target, json!({"run_id": run_id}));
-                }
-                Err(error) => {
-                    warn!(%target, error = %error, "Telegram inbound dispatch failed");
-                    indeterminate += usize::from(error.indeterminate);
-                    results.insert(
-                        target,
-                        json!({
-                            "error": error.to_string(),
-                            "status": error.status(),
-                            "recovery_required": error.indeterminate,
-                        }),
-                    );
-                }
-            }
+            summary.push(target, result);
         }
-        let ok = succeeded == targets.len();
-        let status = if ok {
-            "accepted"
-        } else if succeeded == 0 && indeterminate > 0 {
-            "indeterminate"
-        } else if succeeded == 0 {
-            "failed"
-        } else {
-            "partial"
-        };
+        let ok = summary.succeeded == targets.len();
+        let status = summary.status(targets.len());
         let mut result = json!({
             "ok": ok,
             "dispatch_id": dispatch_id,
@@ -784,7 +764,7 @@ impl Dispatcher {
             "message_id": args.message_id,
             "user_id": args.user_id,
             "username": args.username,
-            "results": results,
+            "results": summary.results.clone(),
         });
         let audit = self.audit(
             &manager,
@@ -795,7 +775,7 @@ impl Dispatcher {
                 args.username,
                 args.user_id,
                 targets.join(", "),
-                Value::Object(results.clone())
+                Value::Object(summary.results)
             ),
             &mut result,
         );
@@ -1219,7 +1199,7 @@ fn validate_idempotency(value: Option<&str>) -> anyhow::Result<Option<String>> {
         .transpose()
 }
 
-fn validate_identifier(value: &str, field: &str) -> anyhow::Result<String> {
+pub(crate) fn validate_identifier(value: &str, field: &str) -> anyhow::Result<String> {
     let value = value.trim();
     ensure!(!value.is_empty(), "{field} must not be empty");
     ensure!(value.len() <= 160, "{field} exceeds 160 bytes");
@@ -1369,5 +1349,338 @@ mod tests {
             .unwrap(),
             "task_1|manager|designer|make a mockup"
         );
+    }
+
+    use std::collections::BTreeSet;
+
+    use crate::testutil;
+
+    /// Build a dispatcher whose agents all point at one mock Hermes server.
+    async fn dispatcher_with_mock(
+        behavior: testutil::MockHermes,
+    ) -> anyhow::Result<(Dispatcher, Store, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("dispatch");
+        let mut config = testutil::fixture_config(&path);
+        let mock = testutil::spawn_mock_hermes(behavior).await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = mock.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+        Ok((dispatcher, store, path))
+    }
+
+    #[tokio::test]
+    async fn order_accepts_and_persists_run() -> anyhow::Result<()> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_clone = seen.clone();
+        let behavior: testutil::MockHermes = Arc::new(move |bearer, body| {
+            seen_clone
+                .lock()
+                .expect("mock log")
+                .push(format!("{bearer} {body}"));
+            (202, json!({"run_id": "run-1"}))
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+
+        let outcome = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "  do the thing  ".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!outcome.is_error, "unexpected: {outcome:?}");
+        assert_eq!(outcome.value["run_id"], json!("run-1"));
+        let task_id = outcome.value["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        assert!(task_id.starts_with("task_"));
+
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "accepted");
+
+        {
+            let log = seen.lock().expect("mock log");
+            assert!(
+                log.iter()
+                    .any(|entry| entry.contains("fixture-api-key-developer")),
+                "the target agent's API key is sent as the bearer token; log: {log:?}"
+            );
+            assert!(
+                log.iter().any(|entry| entry.contains("fixture-model")),
+                "model alias is passed through"
+            );
+            assert!(
+                log.iter().any(|entry| entry.contains("do the thing")),
+                "trimmed command reaches the agent"
+            );
+        }
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn order_denies_unauthorized_targets() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run"})))).await?;
+
+        // developer has no order ACL entry at all.
+        let outcome = dispatcher
+            .order(
+                "developer",
+                OrderArgs {
+                    agent: "lead-developer".to_string(),
+                    command: "x".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("not authorized")
+        );
+
+        // manager cannot order itself.
+        let outcome = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "manager".to_string(),
+                    command: "x".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn order_all_aggregates_partial_results() -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes = Arc::new(|bearer, _| {
+            if bearer.ends_with("api-key-developer") {
+                (202, json!({"run_id": "run-dev"}))
+            } else {
+                // lead-developer: server error -> indeterminate (downstream may have accepted)
+                (500, json!({"error": "boom"}))
+            }
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+
+        let outcome = dispatcher
+            .order_all(
+                "manager",
+                BroadcastArgs {
+                    command: "sync".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert_eq!(outcome.value["ok"], json!(false));
+        assert_eq!(
+            outcome.value["results"]["developer"]["run_id"],
+            json!("run-dev")
+        );
+        assert_eq!(
+            outcome.value["results"]["lead-developer"]["status"],
+            json!("indeterminate")
+        );
+        assert_eq!(
+            outcome.value["results"]["lead-developer"]["recovery_required"],
+            json!(true)
+        );
+
+        let dispatch_id = outcome.value["task_id"].as_str().expect("task id");
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(dispatch_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "partial", "durable partial result");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn report_requires_authorized_supervisor() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-report"})))).await?;
+
+        // designer is not a supervisor of developer.
+        let outcome = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "done".to_string(),
+                    task_id: "t1".to_string(),
+                    status: "completed".to_string(),
+                    recipient: Some("designer".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a supervisor")
+        );
+
+        // lead-developer supervises developer (reverse ACL lookup).
+        let outcome = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "done".to_string(),
+                    task_id: "t1".to_string(),
+                    status: "completed".to_string(),
+                    recipient: Some("lead-developer".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!outcome.is_error, "unexpected: {outcome:?}");
+        assert_eq!(outcome.value["recipient_run_id"], json!("run-report"));
+
+        // unknown status is rejected.
+        let outcome = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "done".to_string(),
+                    task_id: "t1".to_string(),
+                    status: "weird".to_string(),
+                    recipient: Some("lead-developer".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_all_without_peers_is_rejected() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-no-peers");
+        let mut config = testutil::fixture_config(&path);
+        config.agent_roles = vec!["developer".to_string()];
+        config.all_roles = vec!["manager".to_string(), "developer".to_string()];
+        config.order_acl = BTreeMap::from([("manager".to_string(), vec!["developer".to_string()])]);
+        config.global_authorities = BTreeSet::from(["manager".to_string()]);
+        config.activity_routes = BTreeMap::new();
+        config
+            .agents
+            .retain(|role, _| role == "manager" || role == "developer");
+        config.descriptions.retain(|role, _| role == "developer");
+        config
+            .role_paths
+            .retain(|role, _| role == "manager" || role == "developer");
+        let mock =
+            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = mock.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        // developer has no peers: sending to nobody must not report success.
+        let outcome = dispatcher
+            .message_all(
+                "developer",
+                MessageAllArgs {
+                    message: "hi".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("no peer executors")
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idempotency_replays_accepted_and_reexecutes_failed() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let behavior: testutil::MockHermes = Arc::new(move |_, _| {
+            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // First attempt is definitively rejected (HTTP 400).
+                (400, json!({"error": "bad request"}))
+            } else {
+                (202, json!({"run_id": "run-ok"}))
+            }
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+
+        let first = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "retry me".to_string(),
+                    idempotency_key: Some("key-retry".to_string()),
+                },
+            )
+            .await;
+        assert!(first.is_error);
+        let first_status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE sender='manager' AND kind='order' AND idempotency_key='key-retry'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(first_status, "failed");
+
+        // Retry with the SAME key re-executes: the failed dispatch released the key.
+        let second = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "retry me".to_string(),
+                    idempotency_key: Some("key-retry".to_string()),
+                },
+            )
+            .await;
+        assert!(!second.is_error, "retry must re-execute: {second:?}");
+        assert_eq!(second.value["run_id"], json!("run-ok"));
+        assert!(second.value.get("deduplicated").is_none());
+        let second_id = second.value["task_id"].as_str().expect("task id");
+
+        // A further call with the same key replays the accepted result.
+        let third = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "retry me".to_string(),
+                    idempotency_key: Some("key-retry".to_string()),
+                },
+            )
+            .await;
+        assert_eq!(third.value["deduplicated"], json!(true));
+        assert_eq!(third.value["task_id"], json!(second_id));
+        testutil::remove_db_files(&path).await;
+        Ok(())
     }
 }

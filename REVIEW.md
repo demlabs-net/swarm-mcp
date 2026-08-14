@@ -13,8 +13,8 @@ message storms possible.
 
 The Rust rewrite replaces the runtime in the same repository. It uses the
 official `rmcp` Streamable HTTP server, Axum, Tokio, SQLx/SQLite, typed startup
-configuration, and shared Reqwest clients. `src/old_python/` remains only as an
-audit snapshot.
+configuration, and shared Reqwest clients. The Python sources were removed from
+the tree; they remain in git history as the audit snapshot.
 
 The review covered the old server, probes, activity hook, Docker image,
 standalone and swarm Compose definitions, deployment script, authentication,

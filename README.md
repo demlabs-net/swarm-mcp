@@ -5,10 +5,10 @@ Hermes development swarm. Version 0.2 is implemented in Rust and exposes a
 separate Streamable HTTP MCP endpoint for every role. A bearer token grants one
 role catalog only; it cannot be reused against another role's endpoint.
 
-The retired Python implementation is preserved under `src/old_python/` for
-audit and migration reference. It is not copied into the runtime image and is
-not part of the deployed service. The Python `requirements.txt` has been
-removed.
+The retired Python implementation was removed from the tree; the migration
+review of it lives in [REVIEW.md](REVIEW.md) (the code itself is preserved in
+git history under `src/swarm_mcp/`). It is not part of the deployed service,
+and the Python `requirements.txt` has been removed.
 
 The detailed review of the retired implementation, completed fixes, known
 limits, and capability roadmap is in [REVIEW.md](REVIEW.md).
@@ -38,8 +38,12 @@ recipients. Executors may coordinate only with other executors.
 
 Every mutating tool accepts an optional `idempotency_key`. Callers should reuse
 the same key when retrying the same logical action. Reusing a key with different
-arguments is rejected. Keys must not be recycled for unrelated work; their
-records expire with `SWARM_OPERATION_RETENTION_DAYS`.
+arguments is rejected. A dispatch that **definitively failed** (the agent API
+rejected it, nothing was started) releases its key: retrying with the same key
+re-executes. `accepted`, `partial`, and `indeterminate` results replay — an
+`indeterminate` result means the downstream may have accepted the operation, so
+do not re-run it; inspect `swarm://operations` first. Keys must not be recycled
+for unrelated work; their records expire with `SWARM_OPERATION_RETENTION_DAYS`.
 
 ## Resources
 

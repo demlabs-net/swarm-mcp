@@ -6,6 +6,9 @@ pub mod probe;
 pub mod store;
 pub mod telegram;
 
+#[cfg(test)]
+pub(crate) mod testutil;
+
 use std::sync::Arc;
 
 use anyhow::Context;

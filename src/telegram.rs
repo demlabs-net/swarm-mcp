@@ -445,4 +445,47 @@ mod tests {
     fn ignores_plain_group_messages() {
         assert!(parse_command("hello everyone", &targets()).is_none());
     }
+
+    #[test]
+    fn unknown_commands_and_empty_forms_fall_back_to_help() {
+        let ParsedCommand::Reply(help) =
+            parse_command("/frobnicate aggressively", &targets()).unwrap()
+        else {
+            panic!("unknown command must be a help reply");
+        };
+        assert!(help.contains("Allowed roles: manager, developer, lead-developer"));
+
+        assert!(matches!(
+            parse_command("/all   ", &targets()).unwrap(),
+            ParsedCommand::Reply(_)
+        ));
+        assert!(matches!(
+            parse_command("/to unknown-role hi", &targets()).unwrap(),
+            ParsedCommand::Reply(_)
+        ));
+        assert!(matches!(
+            parse_command("/developer", &targets()).unwrap(),
+            ParsedCommand::Reply(_)
+        ));
+    }
+
+    #[test]
+    fn strips_foreign_bot_mention_suffix() {
+        let ParsedCommand::Dispatch { targets, message } =
+            parse_command("/developer@some_other_bot do it now", &targets()).unwrap()
+        else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(targets, vec!["developer"]);
+        assert_eq!(message, "do it now");
+    }
+
+    #[test]
+    fn next_offset_rejects_overflow() {
+        assert_eq!(
+            next_offset(i64::MAX).unwrap_err().to_string(),
+            "Telegram update ID overflow"
+        );
+        assert_eq!(next_offset(41).unwrap(), 42);
+    }
 }

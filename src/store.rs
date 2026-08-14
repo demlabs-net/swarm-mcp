@@ -400,8 +400,22 @@ impl Store {
     ) -> anyhow::Result<Reservation> {
         let _guard = self.reservation_lock.lock().await;
         let mut tx = self.pool.begin().await?;
-        if let Some(key) = idempotency_key
-            && let Some(row) = sqlx::query(
+        if let Some(key) = idempotency_key {
+            // A 'failed' dispatch definitively produced no downstream side effects
+            // (the agent API rejected the run), so the key is released: a retry with
+            // the same key re-executes instead of replaying the old failure. All other
+            // terminal states (accepted/partial/indeterminate) replay, because the
+            // downstream may have accepted the operation.
+            sqlx::query(
+                r#"DELETE FROM dispatches
+                   WHERE sender = ? AND kind = ? AND idempotency_key = ? AND status = 'failed'"#,
+            )
+            .bind(sender)
+            .bind(kind)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(row) = sqlx::query(
                 r#"SELECT id, fingerprint, result_json FROM dispatches
                    WHERE sender = ? AND kind = ? AND idempotency_key = ?"#,
             )
@@ -410,18 +424,19 @@ impl Store {
             .bind(key)
             .fetch_optional(&mut *tx)
             .await?
-        {
-            if row.get::<String, _>("fingerprint") != fingerprint {
-                return Ok(Reservation::Conflict);
+            {
+                if row.get::<String, _>("fingerprint") != fingerprint {
+                    return Ok(Reservation::Conflict);
+                }
+                let existing_id = row.get::<String, _>("id");
+                let result = row.try_get::<Option<String>, _>("result_json")?;
+                return Ok(match result {
+                    Some(value) => Reservation::Existing(serde_json::from_str(&value)?),
+                    None => Reservation::Pending {
+                        dispatch_id: existing_id,
+                    },
+                });
             }
-            let existing_id = row.get::<String, _>("id");
-            let result = row.try_get::<Option<String>, _>("result_json")?;
-            return Ok(match result {
-                Some(value) => Reservation::Existing(serde_json::from_str(&value)?),
-                None => Reservation::Pending {
-                    dispatch_id: existing_id,
-                },
-            });
         }
 
         let now = Utc::now().timestamp_millis();
@@ -488,7 +503,7 @@ impl Store {
         let now = Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
-            "UPDATE dispatches SET status = ?, result_json = ?, updated_ms = ? WHERE id = ?",
+            "UPDATE dispatches SET status = ?, result_json = ?, updated_ms = ? WHERE id = ? AND status = 'pending'",
         )
         .bind(status)
         .bind(serde_json::to_string(result)?)
@@ -498,7 +513,9 @@ impl Store {
         .await?
         .rows_affected();
         if updated != 1 {
-            return Err(anyhow!("dispatch does not exist"));
+            return Err(anyhow!(
+                "dispatch is not pending or does not exist (already finalized?)"
+            ));
         }
         if let Some(audit) = audit {
             insert_outbox(&mut tx, &audit, now).await?;
@@ -524,9 +541,9 @@ impl Store {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        if updated > 1 {
-            return Err(anyhow!("multiple dispatches updated"));
-        }
+        // id is the primary key, so at most one row can match; zero rows means the
+        // dispatch was already finalized (or never existed) and has nothing to recover.
+        debug_assert!(updated <= 1);
         Ok(())
     }
 
@@ -1190,6 +1207,495 @@ mod tests {
 
         let result = Store::connect_path(&path, 1, Duration::from_secs(2)).await;
         assert!(result.is_err());
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_is_released_after_failed_dispatch() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-failed-key-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let targets = vec!["developer".to_string()];
+
+        // Definitively failed dispatch releases the key: the retry re-executes.
+        assert!(matches!(
+            store
+                .reserve_dispatch(
+                    "t_1",
+                    "manager",
+                    "order",
+                    &targets,
+                    Some("stable-key"),
+                    "fingerprint",
+                    100,
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Reserved
+        ));
+        store
+            .finish_dispatch("t_1", "failed", &json!({"ok": false}), None)
+            .await?;
+        assert!(matches!(
+            store
+                .reserve_dispatch(
+                    "t_2",
+                    "manager",
+                    "order",
+                    &targets,
+                    Some("stable-key"),
+                    "fingerprint",
+                    100,
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Reserved
+        ));
+
+        // An accepted result still replays forever.
+        store
+            .finish_dispatch("t_2", "accepted", &json!({"ok": true}), None)
+            .await?;
+        assert!(matches!(
+            store
+                .reserve_dispatch(
+                    "t_3",
+                    "manager",
+                    "order",
+                    &targets,
+                    Some("stable-key"),
+                    "fingerprint",
+                    100,
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Existing(_)
+        ));
+
+        // A non-failed row with different arguments is still a conflict.
+        assert!(matches!(
+            store
+                .reserve_dispatch(
+                    "t_4",
+                    "manager",
+                    "order",
+                    &targets,
+                    Some("stable-key"),
+                    "other-fingerprint",
+                    100,
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Conflict
+        ));
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_dispatch_rejects_already_finalized_rows() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-finish-guard-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let targets = vec!["developer".to_string()];
+
+        assert!(matches!(
+            store
+                .reserve_dispatch(
+                    "g_1",
+                    "manager",
+                    "order",
+                    &targets,
+                    None,
+                    "fingerprint",
+                    100,
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Reserved
+        ));
+        store
+            .finish_dispatch("g_1", "accepted", &json!({"ok": true}), None)
+            .await?;
+        // A second finish must not overwrite the persisted result.
+        assert!(
+            store
+                .finish_dispatch("g_1", "accepted", &json!({"ok": true}), None)
+                .await
+                .is_err()
+        );
+        // Unknown ids are rejected as before.
+        assert!(
+            store
+                .finish_dispatch("g_missing", "accepted", &json!({"ok": true}), None)
+                .await
+                .is_err()
+        );
+
+        // An indeterminate (recovered) row is also final.
+        assert!(matches!(
+            store
+                .reserve_dispatch(
+                    "g_2",
+                    "manager",
+                    "order",
+                    &targets,
+                    None,
+                    "fingerprint",
+                    100,
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Reserved
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store.recover_stale_pending(Duration::ZERO).await?;
+        assert!(
+            store
+                .finish_dispatch("g_2", "accepted", &json!({"ok": true}), None)
+                .await
+                .is_err()
+        );
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_snapshot_filters_by_caller_visibility() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-snapshot-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let now = chrono::Utc::now();
+        // 'started' is 10s old: active under a 1h stale window, stale under 1s.
+        let started_at = (now - chrono::Duration::seconds(10)).to_rfc3339();
+        store
+            .record_activity(ActivityRecord {
+                sender: "developer",
+                targets: &["lead-developer".to_string()],
+                event: "started",
+                turn_id: "turn_dev",
+                detail: "working",
+                occurred_at: Some(&started_at),
+                clock_skew: Duration::from_secs(60),
+            })
+            .await?;
+        store
+            .record_activity(ActivityRecord {
+                sender: "designer",
+                targets: &["lead-developer".to_string()],
+                event: "completed",
+                turn_id: "turn_design",
+                detail: "done",
+                occurred_at: Some(&now.to_rfc3339()),
+                clock_skew: Duration::from_secs(60),
+            })
+            .await?;
+
+        // Caller may only see 'developer' events.
+        let snapshot = store
+            .activity_snapshot(
+                "lead-developer",
+                &["developer".to_string()],
+                true,
+                10,
+                Duration::from_secs(3600),
+            )
+            .await?;
+        assert_eq!(snapshot["caller"], json!("lead-developer"));
+        let current = snapshot["current"].as_array().unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0]["sender"], json!("developer"));
+        assert_eq!(current[0]["event"], json!("started"));
+        assert_eq!(snapshot["active"], json!([current[0].clone()]));
+        let recent = snapshot["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["sender"], json!("developer"));
+
+        // A stale 'started' is not reported as active.
+        let stale_snapshot = store
+            .activity_snapshot(
+                "lead-developer",
+                &["developer".to_string()],
+                true,
+                10,
+                Duration::from_secs(1),
+            )
+            .await?;
+        assert_eq!(stale_snapshot["active"], json!([]));
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_outbox_failed_applies_backoff_and_dead() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-outbox-backoff-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        store
+            .reserve_dispatch(
+                "o_1",
+                "manager",
+                "order",
+                &["developer".to_string()],
+                None,
+                "fingerprint",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .finish_dispatch(
+                "o_1",
+                "accepted",
+                &json!({"ok": true}),
+                Some(AuditMessage {
+                    id: "audit_o1".to_string(),
+                    sender: "manager".to_string(),
+                    event: "ORDER".to_string(),
+                    recipients: "developer".to_string(),
+                    text: "task".to_string(),
+                }),
+            )
+            .await?;
+
+        // Exponential backoff: attempts=1 -> next_attempt = now + 2s.
+        store
+            .mark_outbox_failed("audit_o1", 1, 5, "boom", None)
+            .await?;
+        let row: (String, i64, i64, String) = sqlx::query_as(
+            "SELECT status, attempts, next_attempt_ms, last_error FROM telegram_outbox WHERE id='audit_o1'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(row.0, "pending");
+        assert_eq!(row.1, 1);
+        assert_eq!(row.3, "boom");
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            (now + 1_000..=now + 3_000).contains(&row.2),
+            "backoff ~2s, got {}",
+            row.2
+        );
+
+        // Retry-After override wins over backoff.
+        store
+            .mark_outbox_failed("audit_o1", 2, 5, "slow down", Some(30))
+            .await?;
+        let retry_after: i64 =
+            sqlx::query_scalar("SELECT next_attempt_ms FROM telegram_outbox WHERE id='audit_o1'")
+                .fetch_one(store.pool())
+                .await?;
+        assert!((now + 29_000..=now + 31_000).contains(&retry_after));
+
+        // Terminal attempt -> dead.
+        store
+            .mark_outbox_failed("audit_o1", 5, 5, "gave up", None)
+            .await?;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE id='audit_o1'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "dead");
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_enforces_retention_and_recovers_stale_pending() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-cleanup-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let old = now - 100 * 86_400_000;
+
+        sqlx::query(
+            "INSERT INTO activity_events(sender,target,event,event_rank,turn_id,detail,occurred_ms,received_ms)
+             VALUES ('developer','lead-developer','completed',2,'old_turn','x',?,?)",
+        )
+        .bind(old)
+        .bind(old)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO dispatches(id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
+             VALUES ('old_d','manager','order','fp','accepted',NULL,?,?)",
+        )
+        .bind(old)
+        .bind(old)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_outbox(id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms,delivered_ms)
+             VALUES ('old_o','manager','ORDER','developer','x','delivered',1,0,?,?,?)",
+        )
+        .bind(old)
+        .bind(old)
+        .bind(old)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO dispatches(id,sender,kind,fingerprint,status,created_ms,updated_ms)
+             VALUES ('stale_p','manager','order','fp','pending',?,?)",
+        )
+        .bind(old)
+        .bind(old)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO dispatches(id,sender,kind,fingerprint,status,created_ms,updated_ms)
+             VALUES ('fresh_p','manager','order','fp','pending',?,?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(store.pool())
+        .await?;
+
+        store
+            .cleanup(
+                30,
+                30,
+                30,
+                Duration::from_secs(60),
+                Duration::from_secs(3600),
+            )
+            .await?;
+
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activity_events")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(events, 0, "old activity purged");
+        let old_dispatch: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dispatches WHERE id='old_d'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(old_dispatch, 0, "old dispatch purged");
+        let old_outbox: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox WHERE id='old_o'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(old_outbox, 0, "delivered outbox purged");
+        let stale_status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE id='stale_p'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(stale_status, "indeterminate", "stale pending recovered");
+        let fresh_status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE id='fresh_p'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(fresh_status, "pending", "fresh pending untouched");
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn due_outbox_orders_by_created_and_honors_limit() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-due-outbox-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        for (id, created, due) in [
+            ("due_a", 1_i64, now - 1),
+            ("due_b", 2_i64, now - 1),
+            ("not_due", 3_i64, now + 60_000),
+        ] {
+            sqlx::query(
+                "INSERT INTO telegram_outbox(id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms)
+                 VALUES (?, 'manager', 'ORDER', 'developer', 'x', 'pending', 0, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(due)
+            .bind(created)
+            .execute(store.pool())
+            .await?;
+        }
+
+        let limited = store.due_outbox(2).await?;
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].id, "due_a");
+        assert_eq!(limited[1].id, "due_b");
+        let all = store.due_outbox(10).await?;
+        assert_eq!(all.len(), 2, "not-due item is excluded");
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_operations_sender_view_keeps_all_targets() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-sender-view-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        sqlx::query(
+            "INSERT INTO dispatches
+             (id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
+             VALUES ('broadcast_s','manager','order_all','fp','partial',?,2,2)",
+        )
+        .bind(
+            json!({
+                "ok": false,
+                "results": {
+                    "developer": {"run_id": "run-dev"},
+                    "lead-developer": {"error": "nope", "status": "failed"}
+                }
+            })
+            .to_string(),
+        )
+        .execute(store.pool())
+        .await?;
+        for target in ["developer", "lead-developer"] {
+            sqlx::query(
+                "INSERT INTO dispatch_targets(dispatch_id,target) VALUES ('broadcast_s',?)",
+            )
+            .bind(target)
+            .execute(store.pool())
+            .await?;
+        }
+
+        let sender_view = store.recent_operations("manager", 10).await?;
+        let operation = sender_view["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["id"] == "broadcast_s")
+            .expect("sender sees the broadcast");
+        assert_eq!(
+            operation["targets"],
+            json!(["developer", "lead-developer"]),
+            "sender view keeps all targets"
+        );
+        assert_eq!(
+            operation["result"]["results"]["lead-developer"]["status"],
+            json!("failed")
+        );
+
+        store.pool.close().await;
         remove_sqlite_files(&path).await;
         Ok(())
     }

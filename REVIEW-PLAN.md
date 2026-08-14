@@ -194,3 +194,55 @@ deeper checks of `http.rs` routing and edge cases. Baseline unchanged: fmt ✅ c
 6. V-1: comment the `with_state::<()>` construction; B-06: decide + test `message_all` empty-peers edge.
 
 Phases 1–4 unchanged from Part 3.
+
+---
+
+# Iteration 3 (2026-08-14) — Phase 0/1/2 execution
+
+Executed per the plan; suite grew **17 → 46 tests**, all green:
+`fmt` ✅ · `clippy -D warnings` ✅ (1.97) · `test --locked --all-targets` ✅ (46) · `build --locked --release` ✅.
+
+## Resolved (pushed in this batch)
+
+| ID | Disposition |
+|---|---|
+| B-01 | **Fixed** — `reserve_dispatch` now deletes `status='failed'` rows for a reused key (inside the reservation tx, under the global lock): a definitively failed dispatch releases its key, a retry with the same key re-executes; `accepted/partial/indeterminate` still replay; fingerprint conflicts still apply to non-failed rows. README + MCP instructions updated. Tests: `idempotency_key_is_released_after_failed_dispatch` (store), `idempotency_replays_accepted_and_reexecutes_failed` (dispatcher, mock Hermes). |
+| B-02 | **Fixed** — `finish_dispatch` guarded with `AND status='pending'`; second finish / finish-after-recovery now errors. Dead `updated > 1` branch removed from `mark_dispatch_indeterminate`. Test: `finish_dispatch_rejects_already_finalized_rows`. |
+| B-04 | **Fixed** — `validate_identifier` unified in `dispatch.rs` (`pub(crate)`), http.rs duplicate deleted; error messages now name the field. |
+| B-06 | **Fixed** — `message_all` with no peer executors returns an error instead of `ok: true`. Test: `message_all_without_peers_is_rejected`. |
+| D-02 | **Fixed** — dead `Config::role_for_path` removed. |
+| D-04 | **Fixed** — `BroadcastSummary` helper replaces 3 copy-pasted aggregation blocks (order_all/msg_all/telegram_inbound); behavior locked by tests. |
+| D-01 | **Fixed** — README.md / REVIEW.md no longer reference removed `src/old_python/`. |
+| DEP-1/2 | **Fixed** — compose `environment:` block dropped (was overriding `env_file` with empty `${}` interpolation); `env_file: ../swarm/.env` is now the single source. |
+| DEP-3 | **Fixed** — stale `/src/old_python` removed from `.dockerignore`; added `REVIEW-PLAN.md`/`.agents`. |
+| V-1 | **Fixed** — `with_state::<()>` state-baking construction commented; router construction extracted into `build_router()` and covered by http tests. |
+
+## What the plan forgot (now tracked)
+
+| ID | Sev | Item | Disposition |
+|---|---|---|---|
+| G-01 | Med | **Non-goal: DB engine.** The plan's SQLite-scaling notes (P-01/P-04) could invite a Postgres port. Decision (product owner): **SQLite-first; Postgres stays out of scope.** The store SQL is deliberately sqlite-specific (`INSERT OR IGNORE`, `PRAGMA`, `unixepoch`) — any future engine must be an optional, feature-gated port, not a refactor. | Documented in AGENTS.md + this plan. |
+| G-02 | Low | **AGENTS.md** missing — skills existed but nothing pointed agents at them or at project invariants. | **Added** root `AGENTS.md` (verify commands, skills index, non-negotiables, ops notes). |
+| G-03 | Low | `license = "MIT"` in Cargo.toml but **no LICENSE file** in the repo. | Open — add a LICENSE file with the correct copyright holder (needs owner input). |
+| G-04 | Low | `telegram.rs::spawn_inbound_worker` — if `TelegramGateway::new` fails (token/group config), the worker **logs and exits forever**; unreachable today because `from_env` validates, but a retry loop would be more robust. | Open — add retry-with-backoff or `expect` with a comment; test the init failure path. |
+| G-05 | Low | Test gaps found during Phase 2: no test asserting `Secret` Debug redaction; no `fingerprint()` determinism test; no parallel `reserve_dispatch` concurrency test (two reservations, one wins the rate slot). | Open — quick unit tests. |
+
+## Test coverage now (46 tests)
+
+| Module | Before | After | Added |
+|---|---|---|---|
+| config.rs | 1 | 4 | path/URL/target validation |
+| dispatch.rs | 6 | 12 | mock-Hermes flows: order accept/deny, order_all partial, report ACL, message_all no-peers, idempotency re-execute |
+| http.rs | 4 | 8 | router-level: token isolation, activity validation, host/origin guard, rate limit (tower::oneshot) |
+| mcp.rs | 0 | 4 | per-role catalogs, schema enums, hierarchy JSON, instructions |
+| probe.rs | 0 | 2 | expected catalogs, activity-probe skip |
+| store.rs | 3 | 10 | key release after failed, finish guard, snapshot visibility, outbox backoff/dead, cleanup, due-outbox, sender view |
+| telegram.rs | 3 | 6 | help fallback, @-suffix, offset overflow |
+| testutil | — | — | shared fixtures: `fixture_config`, temp DBs, mock Hermes server |
+
+## Remaining (next iterations)
+
+- Phase 2 tail: config `from_env` refactor (`from_env_with`) + validation matrix; telegram `poll_once` tests with mocked getUpdates; Secret-redaction/fingerprint/concurrency tests (G-05).
+- Phase 3: P-01/P-02 indexes + snapshot query pushdown (schema v4); B-03 text-policy helper; B-05 `break` in poll loop.
+- Phase 4: C-02 coverage job; G-03 LICENSE; G-04 worker init retry.
+- P-03/P-04: documented trade-offs (comments added where relevant).
