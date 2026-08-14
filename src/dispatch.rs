@@ -1289,7 +1289,7 @@ fn telegram_chunks(header: &str, text: &str, limit: usize) -> Vec<String> {
     let prefix = format!("{header}\n");
     let room = limit.saturating_sub(prefix.chars().count()).max(1);
     if text.is_empty() {
-        return vec![header.to_string()];
+        return vec![header.clone()];
     }
     let characters = text.chars().collect::<Vec<_>>();
     characters
