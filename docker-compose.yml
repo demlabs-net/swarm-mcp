@@ -115,9 +115,4 @@ services:
       - ../swarm/data/swarm-mcp:/data:rw
     tmpfs:
       - /tmp:size=16m,mode=1777
-    networks: [swarm]
-
-networks:
-  swarm:
-    external: true
-    name: demlabs-dev-swarm
+    network_mode: host
