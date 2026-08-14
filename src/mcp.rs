@@ -476,6 +476,8 @@ fn internal_error(error: impl std::fmt::Display) -> McpError {
 mod tests {
     use super::*;
     use crate::{AppState, testutil};
+    use rmcp::ServiceExt;
+    use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
 
     async fn role_mcp(role: &str) -> anyhow::Result<(RoleMcp, std::path::PathBuf)> {
         let path = testutil::temp_db_path("mcp");
@@ -567,6 +569,196 @@ mod tests {
             json!(["msg_all", "msg_to", "order", "report"])
         );
         assert!(mcp.instructions().contains("releases its key"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[test]
+    fn parse_arguments_validates_the_json_contract() {
+        let valid: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"agent":"developer","command":"x"}"#).unwrap(),
+        ));
+        assert!(valid.is_ok());
+        let unknown: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"agent":"developer","command":"x","extra":1}"#).unwrap(),
+        ));
+        assert!(unknown.is_err(), "deny_unknown_fields must reject extras");
+        let missing: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"agent":"developer"}"#).unwrap(),
+        ));
+        assert!(missing.is_err(), "required fields are enforced");
+        let empty: Result<OrderArgs, ToolOutcome> = parse_arguments(None);
+        assert!(empty.is_err(), "no arguments is an error");
+    }
+
+    /// Boot the real router (auth + MCP services) with a mock Hermes and return
+    /// the base URL plus the config needed to connect as any role.
+    async fn spawn_live_router()
+    -> anyhow::Result<(String, Arc<crate::config::Config>, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("mcp-e2e");
+        let hermes =
+            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "run-e2e"})))).await;
+        let mut config = testutil::fixture_config(&path);
+        config.allowed_hosts = vec!["127.0.0.1".to_string()];
+        for agent in config.agents.values_mut() {
+            agent.api_url = hermes.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(AppState {
+            config: config.clone(),
+            store,
+            dispatcher,
+        });
+        let router = crate::http::build_router(state, &tokio_util::sync::CancellationToken::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("live router serves");
+        });
+        Ok((format!("http://127.0.0.1:{port}"), config, path))
+    }
+
+    fn resource_text(response: &rmcp::model::ReadResourceResult) -> &str {
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } =
+            response.contents.first().expect("text content")
+        else {
+            panic!("resource must be text");
+        };
+        text.as_str()
+    }
+
+    #[tokio::test]
+    async fn call_tool_and_read_resource_via_live_router() -> anyhow::Result<()> {
+        let (base, config, path) = spawn_live_router().await?;
+        let client = rmcp::model::ClientInfo::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("mcp-e2e", env!("CARGO_PKG_VERSION")),
+        )
+        .serve(rmcp::transport::StreamableHttpClientTransport::with_client(
+            reqwest::Client::builder().build()?,
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                format!("{base}/mcp/manager"),
+            )
+            .auth_header(config.agents["manager"].mcp_token.expose()),
+        ))
+        .await?;
+
+        // order tool end-to-end: MCP call -> ACL -> mock Hermes -> durable result.
+        let call =
+            client
+                .call_tool(CallToolRequestParams::new("order").with_arguments(
+                    serde_json::from_str(r#"{"agent":"developer","command":"do it"}"#)?,
+                ))
+                .await?;
+        let structured = call.structured_content.expect("structured result");
+        assert_eq!(structured["ok"], json!(true));
+        assert_eq!(structured["run_id"], json!("run-e2e"));
+
+        // order_all goes through the same wire path as a global authority.
+        let call_all = client
+            .call_tool(
+                CallToolRequestParams::new("order_all")
+                    .with_arguments(serde_json::from_str(r#"{"command":"broadcast"}"#)?),
+            )
+            .await?;
+        let structured_all = call_all.structured_content.expect("structured result");
+        assert_eq!(structured_all["ok"], json!(true));
+        assert_eq!(
+            structured_all["results"]["developer"]["run_id"],
+            json!("run-e2e")
+        );
+
+        // Unknown tools are rejected with METHOD_NOT_FOUND, not silently ignored.
+        assert!(
+            client
+                .call_tool(CallToolRequestParams::new("frobnicate"))
+                .await
+                .is_err()
+        );
+
+        // Resources are served from the store through the HTTP transport.
+        let hierarchy = client
+            .read_resource(ReadResourceRequestParams::new("swarm://hierarchy"))
+            .await?;
+        let value: Value = serde_json::from_str(resource_text(&hierarchy))?;
+        assert_eq!(value["caller"], json!("manager"));
+        assert_eq!(value["tools"], json!(["order", "order_all"]));
+
+        let operations = client
+            .read_resource(ReadResourceRequestParams::new("swarm://operations"))
+            .await?;
+        assert_eq!(operations.contents.len(), 1);
+
+        // Unknown resources are rejected, never silently empty.
+        assert!(
+            client
+                .read_resource(ReadResourceRequestParams::new("swarm://nope"))
+                .await
+                .is_err()
+        );
+
+        client.cancel().await?;
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_client_gets_its_own_resources() -> anyhow::Result<()> {
+        let (base, config, path) = spawn_live_router().await?;
+        let client = rmcp::model::ClientInfo::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("mcp-e2e", env!("CARGO_PKG_VERSION")),
+        )
+        .serve(rmcp::transport::StreamableHttpClientTransport::with_client(
+            reqwest::Client::builder().build()?,
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                format!("{base}/mcp/lead-developer"),
+            )
+            .auth_header(config.agents["lead-developer"].mcp_token.expose()),
+        ))
+        .await?;
+        let activity = client
+            .read_resource(ReadResourceRequestParams::new("swarm://activity"))
+            .await?;
+        let value: Value = serde_json::from_str(resource_text(&activity))?;
+        assert_eq!(value["caller"], json!("lead-developer"));
+        assert_eq!(value["enabled"], json!(true));
+        assert_eq!(value["mode"], json!("record-only"));
+
+        // report and msg_to arms of call_tool.
+        let report =
+            client
+                .call_tool(CallToolRequestParams::new("report").with_arguments(
+                    serde_json::from_str(r#"{"summary":"done","task_id":"t1"}"#)?,
+                ))
+                .await?;
+        let report_value = report.structured_content.expect("structured result");
+        assert_eq!(report_value["ok"], json!(true));
+        assert_eq!(report_value["recipient"], json!("manager"));
+
+        let msg =
+            client
+                .call_tool(CallToolRequestParams::new("msg_to").with_arguments(
+                    serde_json::from_str(r#"{"agent":"developer","message":"ping"}"#)?,
+                ))
+                .await?;
+        let msg_value = msg.structured_content.expect("structured result");
+        assert_eq!(msg_value["ok"], json!(true));
+        assert_eq!(msg_value["agent"], json!("developer"));
+
+        // The executor must NOT see the manager-only alias.
+        assert!(
+            client
+                .read_resource(ReadResourceRequestParams::new("swarm://executors"))
+                .await
+                .is_err()
+        );
+
+        client.cancel().await?;
         testutil::remove_db_files(&path).await;
         Ok(())
     }

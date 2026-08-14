@@ -43,3 +43,18 @@ impl AppState {
         self.store.pool()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_builds_store_and_dispatcher() -> anyhow::Result<()> {
+        let path = crate::testutil::temp_db_path("lib");
+        let config = crate::testutil::fixture_config(&path);
+        let state = AppState::initialize(config).await?;
+        let _ = state.pool();
+        crate::testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+}

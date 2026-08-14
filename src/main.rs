@@ -37,7 +37,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    run(Cli::parse()).await
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Healthcheck { port } => {
             let port = port.map_or_else(port_from_env, Ok)?;
@@ -51,22 +54,26 @@ async fn main() -> anyhow::Result<()> {
                     let state = Arc::new(AppState::initialize((*config).clone()).await?);
                     http::serve(state).await
                 }
-                Command::Probe { base_url } => {
-                    let base_url = base_url.unwrap_or_else(|| loopback_url(config.port));
-                    let result = probe::catalog_probe(config, &base_url).await?;
-                    println!("{}", serde_json::to_string(&result)?);
-                    Ok(())
-                }
-                Command::ActivityProbe { base_url } => {
-                    let base_url = base_url.unwrap_or_else(|| loopback_url(config.port));
-                    let result = probe::activity_probe(config, &base_url).await?;
-                    println!("{}", serde_json::to_string(&result)?);
-                    Ok(())
-                }
+                Command::Probe { base_url } => run_probe(config, base_url).await,
+                Command::ActivityProbe { base_url } => run_activity_probe(config, base_url).await,
                 Command::Healthcheck { .. } => unreachable!(),
             }
         }
     }
+}
+
+async fn run_probe(config: Arc<Config>, base_url: Option<String>) -> anyhow::Result<()> {
+    let base_url = base_url.unwrap_or_else(|| loopback_url(config.port));
+    let result = probe::catalog_probe(config, &base_url).await?;
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+async fn run_activity_probe(config: Arc<Config>, base_url: Option<String>) -> anyhow::Result<()> {
+    let base_url = base_url.unwrap_or_else(|| loopback_url(config.port));
+    let result = probe::activity_probe(config, &base_url).await?;
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
 }
 
 fn port_from_env() -> anyhow::Result<u16> {
@@ -91,4 +98,21 @@ fn init_tracing(filter: &str) -> anyhow::Result<()> {
         .try_init()
         .context("initialize tracing")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_url_uses_loopback() {
+        assert_eq!(loopback_url(3004), "http://127.0.0.1:3004");
+    }
+
+    #[tokio::test]
+    async fn healthcheck_reports_connection_failure() {
+        // A closed port must surface as an error, never a hang or panic.
+        let cli = Cli::parse_from(["swarm-mcp", "healthcheck", "--port", "0"]);
+        assert!(run(cli).await.is_err());
+    }
 }

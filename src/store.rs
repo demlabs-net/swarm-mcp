@@ -1764,6 +1764,169 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn ready_obtains_and_rolls_back_a_write_lock() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-ready-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        store.ready().await?;
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_activity_deduplicates_repeated_events() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-dedupe-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let targets = vec!["lead-developer".to_string()];
+        let record = || ActivityRecord {
+            sender: "developer",
+            targets: &targets,
+            event: "completed",
+            turn_id: "turn_x",
+            detail: "done",
+            occurred_at: Some(&now),
+            clock_skew: Duration::from_secs(60),
+        };
+        let first = store.record_activity(record()).await?;
+        assert_eq!(first.0["lead-developer"]["recorded"], json!(true));
+        // A replayed hook event is deduplicated and only refreshes state.
+        let second = store.record_activity(record()).await?;
+        assert_eq!(second.0["lead-developer"]["recorded"], json!(false));
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activity_events")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(events, 1, "unique(sender,target,event,turn_id) enforced");
+        let state_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activity_state")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(state_rows, 1);
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_snapshot_with_empty_visibility_is_empty() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-empty-visibility-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .record_activity(ActivityRecord {
+                sender: "developer",
+                targets: &["lead-developer".to_string()],
+                event: "completed",
+                turn_id: "turn_x",
+                detail: "done",
+                occurred_at: Some(&now),
+                clock_skew: Duration::from_secs(60),
+            })
+            .await?;
+        let snapshot = store
+            .activity_snapshot("lead-developer", &[], true, 10, Duration::from_secs(3600))
+            .await?;
+        assert_eq!(snapshot["current"], json!([]));
+        assert_eq!(snapshot["recent"], json!([]));
+        assert_eq!(snapshot["active"], json!([]));
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_dispatch_indeterminate_records_recovery_result() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-indeterminate-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        store
+            .reserve_dispatch(
+                "ind_1",
+                "manager",
+                "order",
+                &["developer".to_string()],
+                None,
+                "fp",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .mark_dispatch_indeterminate("ind_1", "persistence failed")
+            .await?;
+        let (status, result): (String, String) =
+            sqlx::query_as("SELECT status, result_json FROM dispatches WHERE id='ind_1'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "indeterminate");
+        let result: Value = serde_json::from_str(&result)?;
+        assert_eq!(result["recovery_required"], json!(true));
+        assert_eq!(result["error"], json!("persistence failed"));
+        // Already-finalized rows are a no-op.
+        store.mark_dispatch_indeterminate("ind_1", "again").await?;
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_transitions_reject_non_pending_items() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-outbox-transitions-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        store
+            .reserve_dispatch(
+                "o_t",
+                "manager",
+                "order",
+                &["developer".to_string()],
+                None,
+                "fp",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .finish_dispatch(
+                "o_t",
+                "accepted",
+                &json!({"ok": true}),
+                Some(AuditMessage {
+                    id: "audit_ot".to_string(),
+                    sender: "manager".to_string(),
+                    event: "ORDER".to_string(),
+                    recipients: "developer".to_string(),
+                    text: "task".to_string(),
+                }),
+            )
+            .await?;
+        store.mark_outbox_delivered("audit_ot").await?;
+        assert!(
+            store.mark_outbox_chunk_sent("audit_ot", 1).await.is_err(),
+            "chunk checkpoint on a delivered item is rejected"
+        );
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
     async fn remove_sqlite_files(path: &Path) {
         for candidate in [
             path.to_path_buf(),

@@ -1298,4 +1298,99 @@ mod tests {
             "inbound needs allowed users: {error}"
         );
     }
+
+    #[test]
+    fn from_env_accepts_the_ambient_environment_or_fails_fast() {
+        // The thin wrapper must route through the same validation; the outcome
+        // depends on the ambient environment, but either way the wrapper runs.
+        match Config::from_env() {
+            Ok(_) => {}
+            Err(error) => assert!(error.to_string().contains("must be configured")),
+        }
+    }
+
+    #[test]
+    fn from_env_enforces_numeric_ranges() {
+        let cases = [
+            ("SWARM_DISPATCH_RATE_LIMIT", "20000"),
+            ("SWARM_DB_MAX_CONNECTIONS", "64"),
+            ("SWARM_MAX_INFLIGHT_DISPATCHES", "512"),
+            ("SWARM_CLEANUP_INTERVAL_SECONDS", "1"),
+            ("SWARM_MCP_REQUEST_RATE_LIMIT", "200000"),
+            ("SWARM_TELEGRAM_POLL_LIMIT", "200"),
+            ("SWARM_TELEGRAM_MESSAGE_LIMIT", "100"),
+            ("SWARM_API_TIMEOUT_SECONDS", "600"),
+            ("SWARM_PENDING_STALE_SECONDS", "10"),
+        ];
+        for (name, value) in cases {
+            let mut env = valid_env();
+            env.insert(name.to_string(), value.to_string());
+            assert!(load(&env).is_err(), "{name}={value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn from_env_enforces_cross_field_constraints() {
+        // body size must fit the max message length.
+        let mut env = valid_env();
+        env.insert("SWARM_MAX_MESSAGE_CHARS".into(), "100000".into());
+        env.insert("SWARM_MCP_MAX_REQUEST_BODY_BYTES".into(), "65536".into());
+        assert!(load(&env).is_err(), "body too small for the message limit");
+
+        // report statuses must include the default.
+        let mut env = valid_env();
+        env.insert("SWARM_REPORT_STATUSES".into(), "failed,in_progress".into());
+        assert!(load(&env).is_err(), "completed is the report default");
+
+        // the DB path must be absolute.
+        let mut env = valid_env();
+        env.insert("SWARM_STATE_DB_PATH".into(), "relative/state.db".into());
+        assert!(load(&env).is_err(), "state DB path must be absolute");
+
+        // unknown bool values are rejected.
+        let mut env = valid_env();
+        env.insert("SWARM_TELEGRAM_ENABLED".into(), "maybe".into());
+        assert!(load(&env).is_err(), "bool env must parse");
+    }
+
+    #[test]
+    fn from_env_accepts_edge_cases_in_origins_and_proxies() {
+        // "null" is a legitimate origin entry.
+        let mut env = valid_env();
+        env.insert(
+            "SWARM_MCP_ALLOWED_ORIGINS".into(),
+            "http://localhost,null".into(),
+        );
+        assert!(load(&env).is_ok(), "null origin is allowed when listed");
+
+        // socks5 proxies are supported, but credentials are not.
+        let mut env = valid_env();
+        env.insert(
+            "TELEGRAM_PROXY_URL".into(),
+            "socks5h://127.0.0.1:1080".into(),
+        );
+        assert!(load(&env).is_ok(), "socks5h proxy is valid");
+        let mut env = valid_env();
+        env.insert(
+            "TELEGRAM_PROXY_URL".into(),
+            "https://user:pass@proxy.example".into(),
+        );
+        assert!(load(&env).is_err(), "proxy must not embed credentials");
+    }
+
+    #[test]
+    fn from_env_accepts_a_bracketed_ipv6_host_with_port() {
+        let mut env = valid_env();
+        env.insert(
+            "SWARM_MCP_ALLOWED_HOSTS".into(),
+            "[::1]:3004,localhost".into(),
+        );
+        assert!(load(&env).is_ok(), "IPv6 host with port is valid");
+        let mut env = valid_env();
+        env.insert("SWARM_MCP_ALLOWED_HOSTS".into(), "[::1]:bad".into());
+        assert!(
+            load(&env).is_err(),
+            "IPv6 host with a malformed port is rejected"
+        );
+    }
 }

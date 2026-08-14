@@ -1712,8 +1712,19 @@ mod tests {
     async fn dispatcher_with_telegram(
         behavior: testutil::MockHermes,
     ) -> anyhow::Result<(Dispatcher, Store, std::path::PathBuf)> {
+        dispatcher_with_telegram_bot(behavior, Arc::new(|_, _| (200, json!({"ok": true}), None)))
+            .await
+    }
+
+    type MockBot = Arc<dyn Fn(&str, &str) -> (u16, Value, Option<String>) + Send + Sync>;
+
+    /// Dispatcher with Telegram delivery/inbound enabled and a custom Bot API behavior.
+    async fn dispatcher_with_telegram_bot(
+        behavior: testutil::MockHermes,
+        bot: MockBot,
+    ) -> anyhow::Result<(Dispatcher, Store, std::path::PathBuf)> {
         let path = testutil::temp_db_path("dispatch-tg");
-        let telegram_base = spawn_mock_telegram().await;
+        let telegram_base = spawn_mock_telegram_with(bot).await;
         let mut config = testutil::fixture_config(&path);
         config.telegram_enabled = true;
         config.telegram_bot_mode = crate::config::TelegramBotMode::Shared;
@@ -1733,12 +1744,34 @@ mod tests {
         Ok((dispatcher, store, path))
     }
 
-    async fn spawn_mock_telegram() -> String {
-        use axum::{Json, Router, routing::post};
-        let router = Router::new().route(
-            "/bot{token}/sendMessage",
-            post(|| async { Json(json!({"ok": true})) }),
-        );
+    async fn spawn_mock_telegram_with(behavior: MockBot) -> String {
+        use axum::{
+            Json, Router,
+            extract::{OriginalUri, State as AxumState},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::post,
+        };
+        let handler = move |AxumState(behavior): AxumState<MockBot>,
+                            uri: OriginalUri,
+                            Json(body): Json<Value>| async move {
+            let (status, payload, retry_after) = behavior(uri.path(), &body.to_string());
+            let mut response = (
+                StatusCode::from_u16(status).expect("mock status"),
+                Json(payload),
+            )
+                .into_response();
+            if let Some(after) = retry_after {
+                response.headers_mut().insert(
+                    reqwest::header::RETRY_AFTER,
+                    after.parse().expect("retry-after header"),
+                );
+            }
+            response
+        };
+        let router = Router::new()
+            .route("/bot{token}/sendMessage", post(handler))
+            .with_state(behavior);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock Telegram");
@@ -1967,6 +2000,239 @@ mod tests {
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(delivered, 1, "audit delivered through the mock Bot API");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    fn outbox_item() -> OutboxItem {
+        OutboxItem {
+            id: "audit_x".to_string(),
+            sender: "manager".to_string(),
+            event: "ORDER".to_string(),
+            recipients: "developer".to_string(),
+            text: "task_1\nmake a mockup".repeat(300),
+            attempts: 0,
+            next_chunk: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_telegram_applies_retry_after_on_429() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(|_, _| {
+                (
+                    429,
+                    json!({"ok": false, "description": "flood"}),
+                    Some("30".into()),
+                )
+            }),
+        )
+        .await?;
+        let error = dispatcher.send_telegram(&outbox_item()).await.unwrap_err();
+        assert_eq!(error.retry_after_seconds, Some(30));
+        assert!(error.to_string().contains("429"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_rejects_invalid_success_responses() -> anyhow::Result<()> {
+        // {"ok": false} with HTTP 200 is still a failure.
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(|_, _| (200, json!({"ok": false}), None)),
+        )
+        .await?;
+        let error = dispatcher.send_telegram(&outbox_item()).await.unwrap_err();
+        assert!(error.retry_after_seconds.is_none());
+        assert!(error.to_string().contains("invalid success response"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_resumes_from_the_chunk_cursor() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |_, body| {
+                sent_clone.lock().expect("sent").push(body.to_string());
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+
+        // The first chunk (index 0) was already acknowledged.
+        let mut item = outbox_item();
+        item.next_chunk = 1;
+        // The chunk checkpoint needs a real pending outbox row.
+        sqlx::query(
+            "INSERT INTO telegram_outbox(id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms)
+             VALUES ('audit_x','manager','ORDER','developer',?,'pending',0,0,0,0)",
+        )
+        .bind(&item.text)
+        .execute(store.pool())
+        .await?;
+        dispatcher.send_telegram(&item).await.unwrap();
+        let bodies = {
+            let bodies = sent.lock().expect("sent");
+            assert_eq!(bodies.len(), 1, "only the remaining chunks are sent");
+            bodies[0].clone()
+        };
+        let expected_chunks = telegram_chunks(
+            "[ORDER] manager -> developer",
+            &item.text,
+            dispatcher.config.telegram_message_limit,
+        );
+        assert!(expected_chunks.len() > 1, "fixture text must span chunks");
+        let sent_body: Value = serde_json::from_str(&bodies).expect("sendMessage body");
+        assert_eq!(
+            sent_body["text"],
+            json!(expected_chunks[1]),
+            "chunk 0 must be skipped, delivery resumes at chunk 1"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_rejects_an_invalid_cursor() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(|_, _| (200, json!({"ok": true}), None)),
+        )
+        .await?;
+        let mut item = outbox_item();
+        item.next_chunk = 10_000;
+        let error = dispatcher.send_telegram(&item).await.unwrap_err();
+        assert!(error.to_string().contains("cursor is invalid"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn order_rejects_invalid_arguments_and_oversized_text() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await?;
+
+        // idempotency keys must match the identifier alphabet.
+        let outcome = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "x".to_string(),
+                    idempotency_key: Some("bad key with spaces!".to_string()),
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+
+        // commands are trimmed and bounded.
+        let outcome = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "   ".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        let outcome = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "x".repeat(20_000),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error, "oversized commands are rejected");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_failures_persist_as_failed_dispatches() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-broken-template");
+        let mut config = testutil::fixture_config(&path);
+        // The fixture bypasses startup template validation, so a broken template
+        // reaches render time and must fail the dispatch durably.
+        config.order_template = "{task_id}|{sender}|{recipient}|{message}|{unknown}".to_string();
+        let mock =
+            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = mock.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        let outcome = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "do it".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        // The status lives in the durable ledger, not in the tool payload.
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE status='failed'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "failed");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn order_all_requires_global_authority() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await?;
+        let outcome = dispatcher
+            .order_all(
+                "developer",
+                BroadcastArgs {
+                    command: "sync".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("no broadcast authority")
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_reads_retry_after_from_the_response_body() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(|_, _| {
+                (
+                    429,
+                    json!({"ok": false, "parameters": {"retry_after": 15}}),
+                    None,
+                )
+            }),
+        )
+        .await?;
+        let error = dispatcher.send_telegram(&outbox_item()).await.unwrap_err();
+        assert_eq!(error.retry_after_seconds, Some(15), "body retry_after wins");
         testutil::remove_db_files(&path).await;
         Ok(())
     }

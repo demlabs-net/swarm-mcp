@@ -94,6 +94,15 @@ struct ActivityInput {
 }
 
 pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
+    serve_with_shutdown(state, shutdown_signal()).await
+}
+
+/// Serve until `shutdown` resolves (the CLI waits for SIGTERM/Ctrl-C). Split out
+/// so tests can exercise the full server lifecycle with an immediate shutdown.
+async fn serve_with_shutdown(
+    state: Arc<AppState>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let cancellation = CancellationToken::new();
     let app = build_router(state.clone(), &cancellation);
 
@@ -134,7 +143,7 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
     let shutdown_token = cancellation.clone();
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            shutdown.await;
             shutdown_token.cancel();
         })
         .await;
@@ -772,6 +781,88 @@ mod tests {
             .await
             .expect("request");
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        drop(state);
+        testutil::remove_db_files(&db_path).await;
+    }
+
+    #[tokio::test]
+    async fn serve_lifecycle_starts_and_shuts_down_cleanly() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("http-serve");
+        let (state, db_path) = test_state(testutil::fixture_config(&path)).await;
+        // An immediately-ready shutdown future exercises the whole server
+        // lifecycle: bind, serve, graceful shutdown, worker cancellation.
+        serve_with_shutdown(state.clone(), std::future::ready(())).await?;
+        drop(state);
+        testutil::remove_db_files(&db_path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_endpoint_validation_and_mode_branches() {
+        // detail too long -> 413; bad occurred_at -> 422; disabled mode -> 202 no record.
+        let path = testutil::temp_db_path("http");
+        let mut config = testutil::fixture_config(&path);
+        config.max_message_chars = 10;
+        let (state, db_path) = test_state(config).await;
+        let router = build_router(state.clone(), &CancellationToken::new());
+
+        let response = post_activity(
+            &router,
+            Some(DEVELOPER_TOKEN),
+            json!({"event": "completed", "turn_id": "turn_long", "detail": "x".repeat(20)}),
+        )
+        .await;
+        assert_eq!(response, StatusCode::PAYLOAD_TOO_LARGE);
+        let response = post_activity(
+            &router,
+            Some(DEVELOPER_TOKEN),
+            json!({"event": "completed", "turn_id": "turn_bad", "occurred_at": "not-a-date"}),
+        )
+        .await;
+        assert_eq!(response, StatusCode::UNPROCESSABLE_ENTITY);
+
+        drop(state);
+        testutil::remove_db_files(&db_path).await;
+
+        let path = testutil::temp_db_path("http");
+        let mut config = testutil::fixture_config(&path);
+        config.activity_enabled = false;
+        let (state, db_path) = test_state(config).await;
+        let router = build_router(state.clone(), &CancellationToken::new());
+        let response = post_activity(
+            &router,
+            Some(DEVELOPER_TOKEN),
+            json!({"event": "completed", "turn_id": "turn_disabled"}),
+        )
+        .await;
+        assert_eq!(response, StatusCode::ACCEPTED);
+        drop(state);
+        testutil::remove_db_files(&db_path).await;
+    }
+
+    #[tokio::test]
+    async fn activity_endpoint_rate_limits_per_credential() {
+        let path = testutil::temp_db_path("http");
+        let mut config = testutil::fixture_config(&path);
+        config.mcp_request_rate_limit = 1;
+        let (state, db_path) = test_state(config).await;
+        let router = build_router(state.clone(), &CancellationToken::new());
+
+        let first = post_activity(
+            &router,
+            Some(DEVELOPER_TOKEN),
+            json!({"event": "completed", "turn_id": "turn_1"}),
+        )
+        .await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+        let second = post_activity(
+            &router,
+            Some(DEVELOPER_TOKEN),
+            json!({"event": "completed", "turn_id": "turn_2"}),
+        )
+        .await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
 
         drop(state);
         testutil::remove_db_files(&db_path).await;

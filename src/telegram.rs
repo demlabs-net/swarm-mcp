@@ -517,16 +517,38 @@ mod tests {
         testutil,
     };
 
-    /// Canned Telegram Bot API response served for both getUpdates and sendMessage.
-    async fn spawn_mock_telegram(result: Arc<Mutex<Value>>) -> String {
-        use axum::{Router, extract::State as AxumState, routing::post};
-        let handler = move |AxumState(result): AxumState<Arc<Mutex<Value>>>| async move {
-            axum::Json(result.lock().expect("mock telegram").clone())
+    /// Behavior of the mock Bot API: `(path, json_body) -> (status, payload, retry_after)`.
+    type MockBot = Arc<dyn Fn(&str, &str) -> (u16, Value, Option<String>) + Send + Sync>;
+
+    async fn spawn_mock_telegram(behavior: MockBot) -> String {
+        use axum::{
+            Json, Router,
+            extract::{OriginalUri, State as AxumState},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::post,
+        };
+        let handler = move |AxumState(behavior): AxumState<MockBot>,
+                            uri: OriginalUri,
+                            Json(body): Json<Value>| async move {
+            let (status, payload, retry_after) = behavior(uri.path(), &body.to_string());
+            let mut response = (
+                StatusCode::from_u16(status).expect("mock status"),
+                Json(payload),
+            )
+                .into_response();
+            if let Some(after) = retry_after {
+                response.headers_mut().insert(
+                    reqwest::header::RETRY_AFTER,
+                    after.parse().expect("retry-after header"),
+                );
+            }
+            response
         };
         let router = Router::new()
             .route("/bot{token}/getUpdates", post(handler))
             .route("/bot{token}/sendMessage", post(handler))
-            .with_state(result);
+            .with_state(behavior);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock Telegram");
@@ -537,6 +559,19 @@ mod tests {
                 .expect("mock Telegram serves");
         });
         format!("http://{address}")
+    }
+
+    /// Bot API behavior that serves fixed updates for getUpdates and accepts
+    /// sendMessage, recording the sent texts.
+    fn canned_bot(updates: Value, sent: Arc<Mutex<Vec<String>>>) -> MockBot {
+        Arc::new(move |path, body| {
+            if path.ends_with("getUpdates") {
+                (200, json!({"ok": true, "result": updates.clone()}), None)
+            } else {
+                sent.lock().expect("mock sent").push(body.to_string());
+                (200, json!({"ok": true}), None)
+            }
+        })
     }
 
     fn allowed_update() -> Value {
@@ -553,10 +588,10 @@ mod tests {
 
     async fn gateway_with_mocks(
         backlog: TelegramBacklogMode,
-        telegram_result: Arc<Mutex<Value>>,
+        bot: MockBot,
     ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
         let path = testutil::temp_db_path("telegram");
-        let telegram_base = spawn_mock_telegram(telegram_result).await;
+        let telegram_base = spawn_mock_telegram(bot).await;
         let hermes_base =
             testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "run-1"})))).await;
         let mut config = testutil::fixture_config(&path);
@@ -586,11 +621,11 @@ mod tests {
 
     #[tokio::test]
     async fn poll_once_fast_forwards_backlog_in_discard_mode() -> anyhow::Result<()> {
-        let result = Arc::new(Mutex::new(
-            json!({"ok": true, "result": [allowed_update()]}),
-        ));
-        let (gateway, store, path) =
-            gateway_with_mocks(TelegramBacklogMode::Discard, result).await?;
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Discard,
+            canned_bot(json!([allowed_update()]), Arc::new(Mutex::new(Vec::new()))),
+        )
+        .await?;
 
         gateway.poll_once().await?;
         assert_eq!(store.telegram_update_offset().await?, Some(6));
@@ -605,11 +640,11 @@ mod tests {
 
     #[tokio::test]
     async fn poll_once_dispatches_updates_and_advances_offset() -> anyhow::Result<()> {
-        let result = Arc::new(Mutex::new(
-            json!({"ok": true, "result": [allowed_update()]}),
-        ));
-        let (gateway, store, path) =
-            gateway_with_mocks(TelegramBacklogMode::Process, result).await?;
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([allowed_update()]), Arc::new(Mutex::new(Vec::new()))),
+        )
+        .await?;
 
         gateway.poll_once().await?;
         assert_eq!(store.telegram_update_offset().await?, Some(6));
@@ -628,9 +663,11 @@ mod tests {
         let mut update = allowed_update();
         update["message"]["from"]["id"] = json!(999);
         update["message"]["from"]["username"] = json!("stranger");
-        let result = Arc::new(Mutex::new(json!({"ok": true, "result": [update]})));
-        let (gateway, store, path) =
-            gateway_with_mocks(TelegramBacklogMode::Process, result).await?;
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([update]), Arc::new(Mutex::new(Vec::new()))),
+        )
+        .await?;
 
         gateway.poll_once().await?;
         assert_eq!(
@@ -643,6 +680,54 @@ mod tests {
             .await?;
         assert_eq!(dispatches, 0, "an unlisted user must not reach the swarm");
 
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_replies_with_help() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = json!("/help");
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([update]), sent.clone()),
+        )
+        .await?;
+
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        {
+            let sent = sent.lock().expect("sent");
+            assert_eq!(sent.len(), 1, "help must be answered in the group");
+            assert!(
+                sent[0].contains("Swarm commands:"),
+                "help text: {}",
+                sent[0]
+            );
+        }
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_ignores_messages_from_other_chats() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["chat"]["id"] = json!(999);
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([update]), sent.clone()),
+        )
+        .await?;
+
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        assert_eq!(
+            sent.lock().expect("sent").len(),
+            0,
+            "a foreign chat must be ignored silently"
+        );
         testutil::remove_db_files(&path).await;
         Ok(())
     }
