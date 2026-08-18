@@ -374,3 +374,25 @@ config 91.7 · lib 92.9 · probe 91.6 · store 89.9 · mcp 89.7 · **main 86.1**
 - telegram.rs 80.5% — the last sub-85 module: `spawn_inbound_worker`/`run()` backoff loop and
   `send_text` paths are the residual gaps (config-validated init makes several branches near-unreachable).
 - http.rs `shutdown_signal()` — process-global signal handlers, intentionally not tested in-process.
+
+---
+
+# Iteration 9 (2026-08-14) — cosmetics: shutdown select + telegram worker/backoff
+
+Suite: **104 lib + 3 bin tests**. `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **91.31%** (was 90.7%).
+
+- **http.rs 86.4% → 93.1%** — `shutdown_signal_with(ctrl_c, terminate)` split: the select over both
+  shutdown sources is now driven by injectable futures (ready/pending), covering both arms without
+  installing process-global signal handlers (the real `shutdown_signal` wiring stays CLI-only).
+- **telegram.rs 80.5% → 89.4%** — `spawn_inbound_worker` covered in all three modes (absent when
+  disabled, runs-and-stops on cancellation, retries gateway init with backoff when the fixture
+  bypasses token validation); `run()` backoff loop (first poll fails → 1s backoff → retry succeeds →
+  backoff reset); transport-error mapping for a dead Bot API endpoint.
+
+## Coverage snapshot (line %)
+
+http 93.1 · lib 92.9 · config 91.7 · probe 91.6 · store 89.9 · mcp 89.7 · **telegram 89.4** · main 86.1 · dispatch 86.3.
+
+All runtime modules ≥ 86%; the only remaining gaps are the CLI-only `shutdown_signal` signal
+installation and the Serve arm of the bin entry — both consciously untested in-process.

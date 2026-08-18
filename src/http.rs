@@ -490,6 +490,15 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    shutdown_signal_with(ctrl_c, terminate).await;
+}
+
+/// Waits for either shutdown source; split out so tests can drive the select
+/// with ready futures instead of installing process-global signal handlers.
+async fn shutdown_signal_with(
+    ctrl_c: impl std::future::Future<Output = ()>,
+    terminate: impl std::future::Future<Output = ()>,
+) {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
@@ -839,6 +848,12 @@ mod tests {
         assert_eq!(response, StatusCode::ACCEPTED);
         drop(state);
         testutil::remove_db_files(&db_path).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_selects_on_either_signal_source() {
+        shutdown_signal_with(std::future::ready(()), std::future::pending::<()>()).await;
+        shutdown_signal_with(std::future::pending::<()>(), std::future::ready(())).await;
     }
 
     #[tokio::test]

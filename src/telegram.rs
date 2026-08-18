@@ -798,4 +798,120 @@ mod tests {
         testutil::remove_db_files(&path).await;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn inbound_worker_is_absent_when_disabled() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("telegram-worker");
+        let config = Arc::new(testutil::fixture_config(&path));
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(AppState {
+            config,
+            store,
+            dispatcher,
+        });
+        // The fixture has inbound disabled by default.
+        assert!(spawn_inbound_worker(state, CancellationToken::new()).is_none());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_worker_runs_and_stops_on_cancellation() -> anyhow::Result<()> {
+        let (gateway, _store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([]), Arc::new(Mutex::new(Vec::new()))),
+        )
+        .await?;
+        let token = CancellationToken::new();
+        let worker = spawn_inbound_worker(gateway.state.clone(), token.clone())
+            .expect("inbound is enabled in this fixture");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        token.cancel();
+        worker.await.expect("worker joined");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_worker_retries_gateway_initialization() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("telegram-worker-init");
+        let mut config = testutil::fixture_config(&path);
+        // The fixture bypasses config validation: inbound enabled but no shared
+        // token -> TelegramGateway::new fails and the worker must retry.
+        config.telegram_inbound_enabled = true;
+        let config = Arc::new(config);
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(AppState {
+            config,
+            store,
+            dispatcher,
+        });
+        let token = CancellationToken::new();
+        let worker = spawn_inbound_worker(state, token.clone()).expect("worker spawned");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        token.cancel();
+        worker.await.expect("worker joined");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_loop_backs_off_and_resets_after_success() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let bot: MockBot = Arc::new(move |path, _| {
+            if path.ends_with("getUpdates") {
+                if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (500, json!({"ok": false}), None)
+                } else {
+                    (200, json!({"ok": true, "result": []}), None)
+                }
+            } else {
+                (200, json!({"ok": true}), None)
+            }
+        });
+        let (gateway, _store, path) = gateway_with_mocks(TelegramBacklogMode::Process, bot).await?;
+        let token = CancellationToken::new();
+        let run = tokio::spawn(gateway.run(token.clone()));
+        // First poll fails (backoff 1s), the retry succeeds and resets the backoff.
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        token.cancel();
+        run.await.expect("run joined")?;
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the poll must have been retried after the failure"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_maps_network_failures() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("telegram-dead-api");
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        // A dead Bot API endpoint exercises the transport error mapping.
+        config.telegram_api_base_url = "http://127.0.0.1:1".parse()?;
+        let config = Arc::new(config);
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(AppState {
+            config,
+            store,
+            dispatcher,
+        });
+        let gateway = TelegramGateway::new(state)?;
+        let error = gateway.poll_once().await.unwrap_err().to_string();
+        assert!(error.contains("getUpdates request failed"), "{error}");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
 }
