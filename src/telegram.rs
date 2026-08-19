@@ -189,9 +189,11 @@ impl TelegramGateway {
             .await?;
         updates.sort_by_key(|update| update.update_id);
         for update in updates {
-            // Updates are sorted, so the first below-threshold one means the rest are too.
+            // A stale item can precede fresh items in the same sorted response.
+            // Skip only that item; breaking here would starve every later update
+            // and make the gateway fetch the same batch forever.
             if update.update_id < offset {
-                break;
+                continue;
             }
             self.process_update(&update).await?;
             self.state
@@ -653,6 +655,38 @@ mod tests {
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(status, "accepted", "the Telegram command reached the swarm");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_stale_updates_without_starving_fresh_ones() -> anyhow::Result<()> {
+        let stale = allowed_update();
+        let mut fresh = allowed_update();
+        fresh["update_id"] = json!(6);
+        fresh["message"]["message_id"] = json!(101);
+        fresh["message"]["text"] = json!("/developer fresh command");
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([stale, fresh]), Arc::new(Mutex::new(Vec::new()))),
+        )
+        .await?;
+        store.advance_telegram_update_offset(6).await?;
+
+        gateway.poll_once().await?;
+
+        assert_eq!(store.telegram_update_offset().await?, Some(7));
+        let stale_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dispatches WHERE id='telegram_5'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(stale_count, 0, "the stale update must stay ignored");
+        let fresh_status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE id='telegram_6'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(fresh_status, "accepted");
 
         testutil::remove_db_files(&path).await;
         Ok(())

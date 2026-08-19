@@ -27,7 +27,7 @@ cargo llvm-cov --locked --all-targets --fail-under-lines 90 --summary-only  # 6.
 - `tests` (stage `test`) — `cargo test --locked --all-targets`.
 - `quality` (stage `verify`) — fmt check, clippy with `-D warnings`, release build.
 - `rustsec` (stage `audit`) — installs `cargo-audit` 0.22.2 into `$CARGO_HOME/bin` (cached via `.cargo/bin/` cache path) and audits `Cargo.lock`.
-- `coverage` (stage `audit`) — `cargo-llvm-cov` (also cached in `.cargo/bin/`) with a 75% line threshold; run `cargo llvm-cov --summary-only` locally to see per-module numbers before pushing.
+- `coverage` (stage `audit`) — `cargo-llvm-cov` (also cached in `.cargo/bin/`) with a 90% line threshold; run `cargo llvm-cov --summary-only` locally to see per-module numbers before pushing.
 - Stages run sequentially, so three concurrent cargo builds never fight over the shared `target/` cache on a single runner.
 - `CARGO_HOME` is `$CI_PROJECT_DIR/.cargo` so the `.cargo/registry/` and `.cargo/bin/` cache paths take effect; `CARGO_TERM_COLOR=always` keeps logs readable.
 
@@ -42,5 +42,5 @@ Probes require the full configuration environment (they load `Config::from_env`)
 
 ## Test layout
 
-- Unit tests live in `#[cfg(test)]` modules inside each source file; they run without any external service (temp SQLite files, no network).
+- Unit tests live in `#[cfg(test)]` modules inside each source file; they run without any external service (temp SQLite files and loopback mock servers, no external network).
 - `cargo test` must pass with no network access: store tests use `std::env::temp_dir()` + random UUID filenames and clean up `.db`, `-wal`, `-shm` files.

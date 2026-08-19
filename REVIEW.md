@@ -119,6 +119,29 @@ server will not blindly redeliver a side effect whose outcome is unknown.
    state until restart. Switching fully to stateless MCP requires confirming
    every deployed Hermes client negotiates the newer protocol first.
 
+## Feedback-loop follow-up review (2026-08-20)
+
+The post-incident review covered every retry, polling, broadcast, authorization,
+and outbox path in the Rust server. It found and corrected six related gaps:
+
+- messaging controls now enforce manager authority inside `Dispatcher`, not
+  only through MCP catalog visibility;
+- disabling or clearing a role cancels undelivered audits both from and to that
+  role, including manager orders already waiting for Telegram;
+- permanent local delivery failures and non-retryable Telegram responses are
+  dead-lettered immediately;
+- a transient Telegram failure stops the selected batch and persists transport
+  backoff for the remaining affected rows;
+- delivery revalidates each snapshotted outbox row under the messaging gate;
+  preserved rows involving a disabled role are held outside the due batch and
+  cannot leak through a disable race or starve unrelated delivery;
+- a stale Telegram update is skipped without starving newer updates returned in
+  the same batch.
+
+The documented single-replica/at-least-once limits still apply: an outbound
+Telegram acceptance followed by a process crash can duplicate the last chunk,
+and multiple active server replicas require a distributed outbox claim.
+
 ## Remediation and capability plan
 
 ### Phase 0 — migration gate

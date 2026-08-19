@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
+    config::{Config, TelegramBotMode},
     store::{AuditMessage, OutboxItem, Reservation, Store},
 };
 
@@ -885,10 +885,11 @@ impl Dispatcher {
         }
         for item in self.store.due_outbox(self.config.outbox_batch_size).await? {
             let _messaging_guard = self.messaging_gate.read().await;
-            if !self.store.role_messaging_enabled(&item.sender).await? {
-                self.store
-                    .clear_role_outbox(&item.sender, false, "messaging-circuit-breaker")
-                    .await?;
+            // The due list is a snapshot taken before this per-item gate. A
+            // manager may disable and cancel a role between those two points,
+            // so re-check the persisted row and every role involved while the
+            // read gate prevents a concurrent control transition.
+            if !self.store.outbox_delivery_eligible(&item.id).await? {
                 continue;
             }
             match self.send_telegram(&item).await {
@@ -903,7 +904,8 @@ impl Dispatcher {
                         item.attempts + 1
                     };
                     warn!(outbox_id = %item.id, attempts, error = %error, "Telegram audit delivery failed");
-                    self.store
+                    let next_attempt_ms = self
+                        .store
                         .mark_outbox_failed(
                             &item.id,
                             attempts,
@@ -912,6 +914,19 @@ impl Dispatcher {
                             error.retry_after_seconds,
                         )
                         .await?;
+                    if !error.permanent {
+                        let sender_scope = match self.config.telegram_bot_mode {
+                            TelegramBotMode::Shared => None,
+                            TelegramBotMode::PerRole => Some(item.sender.as_str()),
+                        };
+                        self.store
+                            .defer_pending_outbox_until(sender_scope, next_attempt_ms)
+                            .await?;
+                        // `due_outbox` is a snapshot. Continuing would ignore the
+                        // newly persisted transport backoff for rows already in
+                        // this batch and hammer the same Telegram transport.
+                        break;
+                    }
                 }
             }
         }
@@ -923,16 +938,13 @@ impl Dispatcher {
             .config
             .telegram_token_for(&item.sender)
             .ok_or_else(|| {
-                TelegramFailure::new(
-                    "Telegram bot token is not configured for delivery mode",
-                    None,
-                )
+                TelegramFailure::permanent("Telegram bot token is not configured for delivery mode")
             })?;
         let group = self
             .config
             .telegram_group_id
             .as_ref()
-            .ok_or_else(|| TelegramFailure::new("Telegram group is not configured", None))?;
+            .ok_or_else(|| TelegramFailure::permanent("Telegram group is not configured"))?;
         let url = format!(
             "{}/bot{}/sendMessage",
             self.config
@@ -945,9 +957,8 @@ impl Dispatcher {
         let chunks = telegram_chunks(&header, &item.text, self.config.telegram_message_limit);
         let start = usize::try_from(item.next_chunk).unwrap_or(usize::MAX);
         if start > chunks.len() {
-            return Err(TelegramFailure::new(
+            return Err(TelegramFailure::permanent(
                 "Telegram outbox chunk cursor is invalid",
-                None,
             ));
         }
         for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
@@ -1054,6 +1065,9 @@ impl Dispatcher {
     }
 
     pub async fn disable_messaging(&self, sender: &str, args: DisableMessagingArgs) -> ToolOutcome {
+        if let Err(outcome) = self.authorize_messaging_control(sender) {
+            return outcome;
+        }
         let target = match self.control_target(&args.agent) {
             Ok(target) => target,
             Err(outcome) => return outcome,
@@ -1084,6 +1098,9 @@ impl Dispatcher {
     }
 
     pub async fn enable_messaging(&self, sender: &str, args: EnableMessagingArgs) -> ToolOutcome {
+        if let Err(outcome) = self.authorize_messaging_control(sender) {
+            return outcome;
+        }
         let target = match self.control_target(&args.agent) {
             Ok(target) => target,
             Err(outcome) => return outcome,
@@ -1110,6 +1127,9 @@ impl Dispatcher {
         sender: &str,
         args: ClearMessageQueueArgs,
     ) -> ToolOutcome {
+        if let Err(outcome) = self.authorize_messaging_control(sender) {
+            return outcome;
+        }
         let target = match self.control_target(&args.agent) {
             Ok(target) => target,
             Err(outcome) => return outcome,
@@ -1165,6 +1185,16 @@ impl Dispatcher {
                 })))
             }
         }
+    }
+
+    fn authorize_messaging_control(&self, sender: &str) -> Result<(), ToolOutcome> {
+        if sender != self.config.manager_role {
+            return Err(tool_error(json!({
+                "ok": false,
+                "error": "messaging controls require the swarm manager role",
+            })));
+        }
+        Ok(())
     }
 
     fn control_target(&self, value: &str) -> Result<String, ToolOutcome> {
@@ -1382,7 +1412,11 @@ async fn validate_telegram_response(response: reqwest::Response) -> Result<(), T
             .checked_add(chunk.len())
             .ok_or_else(|| TelegramFailure::new("Telegram response is too large", None))?;
         if next_len > MAX_RESPONSE_BYTES {
-            return Err(TelegramFailure::new("Telegram response is too large", None));
+            return Err(if telegram_status_is_retryable(status) {
+                TelegramFailure::new("Telegram response is too large", None)
+            } else {
+                TelegramFailure::permanent("Telegram response is too large")
+            });
         }
         body.extend_from_slice(&chunk);
     }
@@ -1395,10 +1429,7 @@ async fn validate_telegram_response(response: reqwest::Response) -> Result<(), T
         .map(|seconds| seconds.clamp(1, 86_400));
     if !status.is_success() {
         let message = format!("Telegram API returned HTTP {status}");
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || status.is_server_error()
-        {
+        if telegram_status_is_retryable(status) {
             return Err(TelegramFailure::new(message, retry_after_seconds));
         }
         return Err(TelegramFailure::permanent(message));
@@ -1409,6 +1440,12 @@ async fn validate_telegram_response(response: reqwest::Response) -> Result<(), T
         ));
     }
     Ok(())
+}
+
+fn telegram_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
 }
 
 pub fn parse_arguments<T: for<'de> Deserialize<'de>>(
@@ -1716,6 +1753,136 @@ mod tests {
             )
             .await;
         assert!(outcome.is_error);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn messaging_controls_require_manager_and_gate_both_directions() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (202, json!({"run_id": "run-after-enable"}))
+        }))
+        .await?;
+
+        let unauthorized = dispatcher
+            .disable_messaging(
+                "developer",
+                DisableMessagingArgs {
+                    agent: "lead-developer".to_string(),
+                    reason: "not allowed".to_string(),
+                    clear_queue: true,
+                },
+            )
+            .await;
+        assert!(unauthorized.is_error);
+        assert!(store.role_messaging_enabled("lead-developer").await?);
+
+        let disabled = dispatcher
+            .disable_messaging(
+                "manager",
+                DisableMessagingArgs {
+                    agent: "developer".to_string(),
+                    reason: "contain feedback loop".to_string(),
+                    clear_queue: true,
+                },
+            )
+            .await;
+        assert!(!disabled.is_error, "unexpected: {disabled:?}");
+        assert!(!store.role_messaging_enabled("developer").await?);
+
+        let unauthorized_enable = dispatcher
+            .enable_messaging(
+                "developer",
+                EnableMessagingArgs {
+                    agent: "developer".to_string(),
+                },
+            )
+            .await;
+        assert!(unauthorized_enable.is_error);
+        assert!(!store.role_messaging_enabled("developer").await?);
+
+        let unauthorized_clear = dispatcher
+            .clear_message_queue(
+                "developer",
+                ClearMessageQueueArgs {
+                    agent: "developer".to_string(),
+                    include_dead: true,
+                },
+            )
+            .await;
+        assert!(unauthorized_clear.is_error);
+
+        let blocked_order = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "must not start".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert_eq!(blocked_order.value["disabled_agents"], json!(["developer"]));
+
+        let blocked_report = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "must not leave".to_string(),
+                    task_id: "task-blocked".to_string(),
+                    status: "completed".to_string(),
+                    recipient: Some("manager".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            blocked_report.value["error"],
+            json!("messaging is disabled for the sending role")
+        );
+
+        let blocked_peer = dispatcher
+            .message(
+                "lead-developer",
+                MessageArgs {
+                    agent: "developer".to_string(),
+                    message: "must not arrive".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert_eq!(blocked_peer.value["disabled_agents"], json!(["developer"]));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "blocked traffic must never reach Hermes"
+        );
+
+        let enabled = dispatcher
+            .enable_messaging(
+                "manager",
+                EnableMessagingArgs {
+                    agent: "developer".to_string(),
+                },
+            )
+            .await;
+        assert!(!enabled.is_error, "unexpected: {enabled:?}");
+        let accepted = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "resume".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!accepted.is_error, "unexpected: {accepted:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -2233,6 +2400,151 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn flush_outbox_holds_preserved_messages_for_a_disabled_role() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "run-held"}))),
+            Arc::new(move |_, _| {
+                calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+        dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "audit after resume".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let disabled = dispatcher
+            .disable_messaging(
+                "manager",
+                DisableMessagingArgs {
+                    agent: "developer".to_string(),
+                    reason: "hold queue".to_string(),
+                    clear_queue: false,
+                },
+            )
+            .await;
+        assert!(!disabled.is_error);
+
+        dispatcher.flush_outbox().await?;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let held_status: String =
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='ORDER'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(held_status, "pending");
+
+        dispatcher
+            .enable_messaging(
+                "manager",
+                EnableMessagingArgs {
+                    agent: "developer".to_string(),
+                },
+            )
+            .await;
+        dispatcher.flush_outbox().await?;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let resumed_status: String =
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='ORDER'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(resumed_status, "delivered");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_does_not_retry_permanent_telegram_errors() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "run-flush"}))),
+            Arc::new(|_, _| (403, json!({"ok": false}), None)),
+        )
+        .await?;
+        dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "audit once".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+
+        dispatcher.flush_outbox().await?;
+
+        let (status, attempts): (String, i64) =
+            sqlx::query_as("SELECT status, attempts FROM telegram_outbox WHERE event='ORDER'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "dead");
+        assert_eq!(attempts, dispatcher.config.outbox_max_attempts);
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_applies_transport_backoff_to_the_remaining_batch() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "run-flush"}))),
+            Arc::new(move |_, _| {
+                calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    429,
+                    json!({"ok": false, "description": "flood"}),
+                    Some("30".to_string()),
+                )
+            }),
+        )
+        .await?;
+        for command in ["first audit", "second audit"] {
+            dispatcher
+                .order(
+                    "manager",
+                    OrderArgs {
+                        agent: "developer".to_string(),
+                        command: command.to_string(),
+                        idempotency_key: None,
+                    },
+                )
+                .await;
+        }
+        let before = chrono::Utc::now().timestamp_millis();
+
+        dispatcher.flush_outbox().await?;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the worker must stop the selected batch after a transient failure"
+        );
+        let (attempts, earliest_retry): (i64, i64) = sqlx::query_as(
+            "SELECT SUM(attempts), MIN(next_attempt_ms) FROM telegram_outbox WHERE status='pending'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(attempts, 1, "only the attempted row consumes a retry");
+        assert!(
+            earliest_retry >= before + 29_000,
+            "Retry-After must defer every pending row on the shared transport"
+        );
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
     fn outbox_item() -> OutboxItem {
         OutboxItem {
             id: "audit_x".to_string(),
@@ -2260,6 +2572,7 @@ mod tests {
         .await?;
         let error = dispatcher.send_telegram(&outbox_item()).await.unwrap_err();
         assert_eq!(error.retry_after_seconds, Some(30));
+        assert!(!error.permanent, "429 must remain retryable");
         assert!(error.to_string().contains("429"));
         testutil::remove_db_files(&path).await;
         Ok(())
@@ -2275,6 +2588,10 @@ mod tests {
         .await?;
         let error = dispatcher.send_telegram(&outbox_item()).await.unwrap_err();
         assert!(error.retry_after_seconds.is_none());
+        assert!(
+            error.permanent,
+            "an invalid 2xx payload will not heal on retry"
+        );
         assert!(error.to_string().contains("invalid success response"));
         testutil::remove_db_files(&path).await;
         Ok(())
@@ -2336,7 +2653,22 @@ mod tests {
         let mut item = outbox_item();
         item.next_chunk = 10_000;
         let error = dispatcher.send_telegram(&item).await.unwrap_err();
+        assert!(error.permanent, "a corrupt cursor must not be replayed");
         assert!(error.to_string().contains("cursor is invalid"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_dead_letters_permanent_http_errors() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(|_, _| (403, json!({"ok": false}), None)),
+        )
+        .await?;
+        let error = dispatcher.send_telegram(&outbox_item()).await.unwrap_err();
+        assert!(error.permanent);
+        assert!(error.to_string().contains("403"));
         testutil::remove_db_files(&path).await;
         Ok(())
     }

@@ -78,18 +78,23 @@ The store provides:
   per-chunk checkpoints.
 
 The manager can atomically disable an executor's Swarm MCP send/receive path
-and cancel its pending/dead Telegram audit items. Disabled state survives a
-restart. A disabled executor cannot send reports or peer messages and cannot
-receive orders, peer messages, broadcasts, or Telegram-inbound dispatches.
-`messaging_enable` never revives cancelled outbox records. Delivered audit
-history remains intact.
+and cancel pending/dead Telegram audit items sent by or addressed to it.
+Disabled state survives a restart. A disabled executor cannot send reports or
+peer messages and cannot receive orders, peer messages, broadcasts, or
+Telegram-inbound dispatches. `messaging_enable` never revives cancelled outbox
+records. With `clear_queue=false`, pending audits involving the disabled role
+are held without occupying the delivery batch and resume only after the role is
+explicitly enabled. Delivered audit history remains intact.
 
 Telegram delivery is asynchronous. A successful tool response reports an
 `outbox_id`; temporary Telegram failure does not turn a successfully accepted
 agent run into a failed command. Telegram delivery is at-least-once, so a crash
 between Telegram accepting a message and the local acknowledgement can produce
 a duplicate. Non-retryable Telegram 4xx responses are dead-lettered on the
-first attempt instead of being replayed repeatedly.
+first attempt instead of being replayed repeatedly. A retryable transport
+failure stops the current batch and defers every pending item sharing that bot
+transport, so `Retry-After` cannot be bypassed by later rows from the same
+already-selected batch.
 
 Peer-delivery prompts are deliberately one-way by default: ACK, closure,
 stand-by, and unchanged-evidence messages must not trigger another `msg_to`.

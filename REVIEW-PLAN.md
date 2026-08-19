@@ -430,3 +430,28 @@ Exhaustive search on both toolchains (fresh builds, all targets): `fmt` ✅, `cl
 `test` ✅, `build debug+release` ✅, `check` ✅, `doc` ✅, `audit` (0 vulnerabilities, exit 0) ✅,
 `llvm-cov` ✅ — **no warnings reproducible anywhere**. If a warning was seen in a specific place
 (GitLab pipeline log, IDE), it would need that context to reproduce.
+
+---
+
+# Iteration 11 (2026-08-20) — Telegram feedback-loop containment review
+
+Scope: every dispatch, polling, retry/backoff, outbox, role-control, broadcast,
+and authorization path after the production ACK/closure feedback-loop incident.
+
+| ID | Sev | Finding | Disposition |
+|---|---:|---|---|
+| L-01 | High | Manager-only messaging controls relied on MCP catalog visibility; the dispatcher methods themselves did not verify the caller role. | Runtime manager authorization added to all three controls, with direct-dispatcher negative tests. |
+| L-02 | High | Disabling a role cancelled audits whose `sender` was that role but left pending manager/peer audits addressed to it deliverable. | Queue cancellation and `swarm://messaging` counts now match exact role tokens in both sender and recipient directions; delivered history remains untouched. |
+| L-03 | High | A retryable Telegram error delayed one row but the worker continued through its previously selected batch, bypassing transport `Retry-After`. | The first transient failure stops the batch and persistently defers all pending rows sharing the affected bot transport. |
+| L-04 | Medium | Missing Telegram configuration and a corrupt chunk cursor were retried even though another attempt could not repair them. | Permanent local failures and non-retryable HTTP responses dead-letter on the first attempt. |
+| L-05 | Medium | The inbound poller sorted updates and then `break`ed on a stale ID, starving newer updates later in the same response forever. | Stale updates now `continue`; regression coverage asserts the fresh update is dispatched and the offset advances. |
+| L-06 | Low | The review/verify skills still described schema v3, terminal failed idempotency keys, and a 75% coverage threshold. | Operator guidance updated to schema v4, current retry semantics, manager controls, and the actual 90% CI gate. |
+| L-07 | High | A due-row snapshot could race a role disable and leak one audit after the control returned; the worker also cancelled rows even when `clear_queue=false`. | Delivery eligibility is revalidated under the messaging gate. Preserved disabled-role rows stay pending but are excluded from due batches until explicit re-enable. |
+
+Accepted limits remain explicit in `REVIEW.md`: outbound Telegram is
+at-least-once across a crash, and multi-replica delivery needs a distributed
+row claim. The production topology remains a single active Swarm MCP replica.
+
+Verification: **116 lib + 5 bin tests**; `fmt` ✅; `clippy -D warnings` ✅;
+release build ✅; line coverage **93.67%** (CI gate 90%) ✅; RustSec audit of
+272 locked dependencies (**0 vulnerabilities**) ✅.

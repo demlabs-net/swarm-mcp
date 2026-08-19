@@ -10,7 +10,7 @@ swarm-mcp is an authenticated, role-aware MCP control plane for an agent swarm. 
 ## 1. Security invariants
 
 - **Token isolation**: each role has one `mcp_token` (config.rs `agents` map). A token must only ever expose that role's catalog. `http.rs::role_auth` gates every MCP path; `http.rs::activity_auth` maps the token back to exactly one role via `AuthenticatedRole`. Never loosen this.
-- **ACL enforcement**: `order` is allowed only for targets in `order_acl[sender]` (`dispatch.rs::order`); `order_all` only for `global_authorities`; `report` only to roles in `supervisors(sender)`; peer messages only to other executors. The MCP JSON-Schema enumerates the same sets (`mcp.rs::tools`) — runtime checks must stay the source of truth (defense in depth, do not rely on the schema alone).
+- **ACL enforcement**: `order` is allowed only for targets in `order_acl[sender]` (`dispatch.rs::order`); `order_all` only for `global_authorities`; `report` only to roles in `supervisors(sender)`; peer messages only to other executors; messaging controls only to the configured manager. The MCP JSON-Schema/catalog enumerates the same sets (`mcp.rs::tools`) — runtime checks in `Dispatcher` must stay the source of truth (defense in depth, do not rely on catalog visibility alone).
 - **Secrets**: `Secret` redacts `Debug`. Bot tokens are embedded in Telegram request URLs — reqwest errors are mapped with `map_err(|_| ...)` and must never propagate the original error or URL (see `dispatch.rs::send_telegram`, `telegram.rs`). Keep it that way.
 - **Host/Origin guard**: `validate_host_and_origin` middleware is global. Note `host_allowed` semantics: a configured host without a port matches ANY port (tested in `http.rs`). Origins are compared as scheme+host+port tuples; `"null"` is allowed only if explicitly configured.
 - **Body limits**: `DefaultBodyLimit` plus per-request streaming caps (`start_run`, `validate_telegram_response`, `telegram_payload`). Never read unbounded bodies.
@@ -20,14 +20,15 @@ swarm-mcp is an authenticated, role-aware MCP control plane for an agent swarm. 
 
 States: `pending` → `accepted | partial | failed | indeterminate` (recovery path `pending` → `indeterminate`).
 
-- Every tool flow: validate → `reserve_or_replay` → `start_run` → `finish`/`fail_*`. `finish` persists result + optional Telegram audit atomically (`store.rs::finish_dispatch`).
-- Idempotency: same `(sender, kind, idempotency_key)` + fingerprint → replay `Existing`; different fingerprint → `Conflict`; unfinished → `Pending`. **Known semantic**: a failed dispatch with a reused key replays the old failure instead of re-executing — a retry needs a NEW key. Do not change this silently; it is a documented trade-off (see REVIEW-PLAN.md).
+- Every tool flow that starts downstream work: validate → `reserve_or_replay` → `start_run` → `finish`/`fail_*`. `finish` persists result + optional Telegram audit atomically (`store.rs::finish_dispatch`). Manager messaging controls do not start downstream work; their state change and queue cancellation must remain one SQLite transaction under the write gate.
+- Idempotency: same `(sender, kind, idempotency_key)` + fingerprint → replay `Existing`; different fingerprint → `Conflict`; unfinished → `Pending`. A definitively `failed` dispatch releases its key and a retry re-executes; `accepted`, `partial`, and `indeterminate` remain replayable because downstream side effects may exist. Do not change this silently (see REVIEW-PLAN.md).
 - `indeterminate` means "downstream may have accepted" — recovery must never turn it back into `pending`.
 - Broadcasts (`order_all`, `msg_all`, `telegram_inbound`) aggregate per-target results into `accepted/partial/failed/indeterminate`; `partial` results must be durable and replayable.
 
 ## 3. Store & migrations
 
-- `store.rs::migrate` is transactional, uses `PRAGMA user_version` (`SCHEMA_VERSION = 3`), refuses newer schemas, and migrates legacy Python tables (`*_python_legacy`) by rename+import. Any schema change: bump `SCHEMA_VERSION`, add a statement to `SCHEMA` or an idempotent `ALTER`/`has_column` guard, and keep it idempotent for fresh and existing DBs.
+- `store.rs::migrate` is transactional, uses `PRAGMA user_version` (`SCHEMA_VERSION = 4`), refuses newer schemas, and migrates legacy Python tables (`*_python_legacy`) by rename+import. Any schema change: bump `SCHEMA_VERSION`, add a statement to `SCHEMA` or an idempotent `ALTER`/`has_column` guard, and keep it idempotent for fresh and existing DBs.
+- `role_messaging` is fail-open only for an absent row (the normal pre-control default). Store read errors fail closed in dispatch. Disable/clear must cancel undelivered audits involving the role in either direction; enabling must never revive `cancelled` rows. With `clear_queue=false`, preserved rows must be excluded from due batches while either endpoint is disabled and become eligible only after re-enable.
 - Activity ordering: `activity_state` updates only if `excluded.occurred_ms >` current (or equal with higher `event_rank`) — preserves deterministic turn order.
 - `reservation_lock` (global mutex) serializes `reserve_dispatch` for rate-limit + idempotency atomicity — do not remove without replacing the atomicity argument.
 
@@ -35,20 +36,21 @@ States: `pending` → `accepted | partial | failed | indeterminate` (recovery pa
 
 - Outbox is at-least-once: chunk checkpoints (`next_chunk`) mean a crash can duplicate the last chunk. Documented behavior — do not "fix" it into exactly-once without a delivery-ack protocol.
 - `mark_outbox_failed` applies `Retry-After` or exponential backoff `2^attempts` (capped), terminal at `max_attempts` → `dead`.
+- A retryable delivery failure stops the current due-item snapshot and defers all pending rows sharing the affected bot transport. Permanent configuration/cursor/HTTP errors must not be retried. Every snapshotted row must be revalidated under the messaging read gate before network I/O so a completed manager disable cannot leak a stale delivery.
 - Inbound (`telegram.rs`): offset is advanced only AFTER a successful `process_update`; errors must not advance the offset (at-least-once). `allowed_users`/`group_id` checks happen before any dispatch. `parse_command` maps underscores to hyphens and strips `@bot` suffixes.
 
 ## 5. MCP catalog consistency
 
 - `mcp.rs::tools()`/`resources()` must stay in sync with `probe.rs::expected_tools()`/`expected_resources()` — `probe` fails the pipeline check if they diverge.
 - Tool schemas enumerate allowed values (`enum` from ACL/peers) and `additionalProperties: false`; `parse_arguments` uses `deny_unknown_fields`.
-- `swarm://hierarchy`, `swarm://operations`, `swarm://outbox` are visible to every role; `swarm://activity` only to ordering authorities; `swarm://executors` only to the manager. Visibility is enforced at the store query level (`recent_operations`, `recent_outbox`, `activity_snapshot` filter by caller) — keep enforcement in the store, not only in the handler.
+- `swarm://hierarchy`, `swarm://operations`, `swarm://outbox` are visible to every role; `swarm://activity` only to ordering authorities; `swarm://executors` and `swarm://messaging` only to the manager. Visibility is enforced at the store query level (`recent_operations`, `recent_outbox`, `activity_snapshot` filter by caller) — keep enforcement in the store, not only in the handler.
 
 ## 6. Concurrency, lifecycle & observability
 
 - In-flight dispatches bounded by `Semaphore` (`max_inflight_dispatches`); acquiring the permit has a timeout.
 - Shutdown: `CancellationToken` shared by MCP services, outbox worker, Telegram inbound worker, and cleanup task; `serve()` awaits all workers after cancel.
 - Logging is structured JSON (`tracing_subscriber`); use `error!`/`warn!`/`info!` with fields, never `println!`/`eprintln!` in the server.
-- Dead code watchlist: `Config::role_for_path` is currently unused; `AppState::pool()` is used only by tests.
+- Dead code watchlist: `AppState::pool()` is used only by tests.
 
 ## 7. Docs
 

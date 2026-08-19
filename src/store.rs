@@ -769,21 +769,35 @@ impl Store {
             .into_iter()
             .map(|row| (row.get::<String, _>("role"), row))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let queue_rows = sqlx::query(
-            r#"SELECT sender, status, COUNT(*) AS item_count
-               FROM telegram_outbox
-               WHERE status IN ('pending', 'dead')
-               GROUP BY sender, status"#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
         let mut queue =
             std::collections::BTreeMap::<String, std::collections::BTreeMap<String, i64>>::new();
-        for row in queue_rows {
-            queue
-                .entry(row.get("sender"))
-                .or_default()
-                .insert(row.get("status"), row.get("item_count"));
+        for role in roles {
+            // `recipients` is an internal comma-separated list of validated role
+            // names. Surrounding both sides with commas makes this an exact token
+            // match, so `developer` cannot match `lead-developer`.
+            let rows = sqlx::query(
+                r#"SELECT status, COUNT(*) AS item_count
+                   FROM telegram_outbox
+                   WHERE status IN ('pending', 'dead')
+                     AND (
+                       sender = ?
+                       OR instr(
+                         ',' || replace(recipients, ' ', '') || ',',
+                         ',' || ? || ','
+                       ) > 0
+                     )
+                   GROUP BY status"#,
+            )
+            .bind(role)
+            .bind(role)
+            .fetch_all(&self.pool)
+            .await?;
+            for row in rows {
+                queue
+                    .entry(role.clone())
+                    .or_default()
+                    .insert(row.get("status"), row.get("item_count"));
+            }
         }
         let items = roles
             .iter()
@@ -804,10 +818,22 @@ impl Store {
 
     pub async fn due_outbox(&self, limit: i64) -> anyhow::Result<Vec<OutboxItem>> {
         let rows = sqlx::query(
-            r#"SELECT id, sender, event, recipients, text, attempts, next_chunk
-               FROM telegram_outbox
-               WHERE status = 'pending' AND next_attempt_ms <= ?
-               ORDER BY created_ms LIMIT ?"#,
+            r#"SELECT o.id, o.sender, o.event, o.recipients, o.text,
+                      o.attempts, o.next_chunk
+               FROM telegram_outbox o
+               WHERE o.status = 'pending' AND o.next_attempt_ms <= ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM role_messaging r
+                   WHERE r.enabled = 0
+                     AND (
+                       r.role = o.sender
+                       OR instr(
+                         ',' || replace(o.recipients, ' ', '') || ',',
+                         ',' || r.role || ','
+                       ) > 0
+                     )
+                 )
+               ORDER BY o.created_ms LIMIT ?"#,
         )
         .bind(Utc::now().timestamp_millis())
         .bind(limit)
@@ -825,6 +851,30 @@ impl Store {
                 next_chunk: row.get("next_chunk"),
             })
             .collect())
+    }
+
+    pub async fn outbox_delivery_eligible(&self, id: &str) -> anyhow::Result<bool> {
+        let eligible = sqlx::query_scalar::<_, i64>(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM telegram_outbox o
+                 WHERE o.id = ? AND o.status = 'pending'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM role_messaging r
+                     WHERE r.enabled = 0
+                       AND (
+                         r.role = o.sender
+                         OR instr(
+                           ',' || replace(o.recipients, ' ', '') || ',',
+                           ',' || r.role || ','
+                         ) > 0
+                       )
+                   )
+               )"#,
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(eligible != 0)
     }
 
     pub async fn mark_outbox_chunk_sent(&self, id: &str, next_chunk: i64) -> anyhow::Result<()> {
@@ -861,7 +911,7 @@ impl Store {
         max_attempts: i64,
         error: &str,
         retry_after_seconds: Option<i64>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i64> {
         let terminal = attempts >= max_attempts;
         let delay_seconds = retry_after_seconds
             .unwrap_or_else(|| 2_i64.saturating_pow(u32::try_from(attempts.min(8)).unwrap_or(8)));
@@ -882,7 +932,35 @@ impl Store {
         .await?
         .rows_affected();
         ensure!(updated == 1, "outbox item is not pending");
-        Ok(())
+        Ok(next)
+    }
+
+    pub async fn defer_pending_outbox_until(
+        &self,
+        sender: Option<&str>,
+        not_before_ms: i64,
+    ) -> anyhow::Result<u64> {
+        let updated = if let Some(sender) = sender {
+            sqlx::query(
+                r#"UPDATE telegram_outbox
+                   SET next_attempt_ms = MAX(next_attempt_ms, ?)
+                   WHERE status='pending' AND sender=?"#,
+            )
+            .bind(not_before_ms)
+            .bind(sender)
+            .execute(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"UPDATE telegram_outbox
+                   SET next_attempt_ms = MAX(next_attempt_ms, ?)
+                   WHERE status='pending'"#,
+            )
+            .bind(not_before_ms)
+            .execute(&self.pool)
+            .await?
+        };
+        Ok(updated.rows_affected())
     }
 
     pub async fn cleanup(
@@ -1037,10 +1115,12 @@ async fn cancel_role_outbox(
     let reason = format!("cancelled by {changed_by} at {}", millis_to_rfc3339(now));
     let statement = format!(
         "UPDATE telegram_outbox SET status='cancelled', last_error=? \
-         WHERE sender=? AND {statuses}"
+         WHERE (sender=? OR instr(',' || replace(recipients, ' ', '') || ',', \
+                ',' || ? || ',') > 0) AND {statuses}"
     );
     Ok(sqlx::query(&statement)
         .bind(reason)
+        .bind(role)
         .bind(role)
         .execute(&mut **tx)
         .await?
@@ -1383,6 +1463,22 @@ mod tests {
             .execute(store.pool())
             .await?;
         }
+        sqlx::query(
+            r#"INSERT INTO telegram_outbox
+               (id,sender,event,recipients,text,status,attempts,next_chunk,
+                next_attempt_ms,created_ms,delivered_ms)
+               VALUES
+                 ('audit_to_developer_pending','manager','ORDER_ALL',
+                  'developer, tester','test','pending',0,0,0,0,NULL),
+                 ('audit_to_developer_dead','manager','ORDER',
+                  'developer','test','dead',0,0,0,0,NULL),
+                 ('audit_to_developer_delivered','manager','ORDER',
+                  'developer','test','delivered',0,0,0,0,1),
+                 ('audit_to_lead_pending','manager','ORDER',
+                  'lead-developer','test','pending',0,0,0,0,NULL)"#,
+        )
+        .execute(store.pool())
+        .await?;
 
         let disabled = store
             .set_role_messaging(
@@ -1393,7 +1489,11 @@ mod tests {
                 true,
             )
             .await?;
-        assert_eq!(disabled["cancelled_outbox_items"], json!(2));
+        assert_eq!(
+            disabled["cancelled_outbox_items"],
+            json!(4),
+            "both outbound and inbound undelivered audits are cancelled"
+        );
         assert!(!store.role_messaging_enabled("developer").await?);
         let statuses = sqlx::query_as::<_, (String, String)>(
             "SELECT id,status FROM telegram_outbox ORDER BY id",
@@ -1405,12 +1505,21 @@ mod tests {
         assert_eq!(statuses["audit_pending"], "cancelled");
         assert_eq!(statuses["audit_dead"], "cancelled");
         assert_eq!(statuses["audit_delivered"], "delivered");
+        assert_eq!(statuses["audit_to_developer_pending"], "cancelled");
+        assert_eq!(statuses["audit_to_developer_dead"], "cancelled");
+        assert_eq!(statuses["audit_to_developer_delivered"], "delivered");
+        assert_eq!(
+            statuses["audit_to_lead_pending"], "pending",
+            "exact recipient matching must not confuse developer with lead-developer"
+        );
 
         let snapshot = store
-            .messaging_snapshot(&["developer".to_string(), "tester".to_string()])
+            .messaging_snapshot(&["developer".to_string(), "lead-developer".to_string()])
             .await?;
         assert_eq!(snapshot["roles"][0]["messaging_enabled"], json!(false));
         assert_eq!(snapshot["roles"][1]["messaging_enabled"], json!(true));
+        assert_eq!(snapshot["roles"][0]["outbox"], json!({}));
+        assert_eq!(snapshot["roles"][1]["outbox"]["pending"], json!(1));
 
         store
             .set_role_messaging("developer", true, "manager", "resume", false)
@@ -1421,9 +1530,69 @@ mod tests {
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(
-            cancelled, 2,
+            cancelled, 4,
             "re-enabling must never replay cancelled items"
         );
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_role_holds_preserved_outbox_without_starving_other_roles()
+    -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-messaging-hold-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        sqlx::query(
+            r#"INSERT INTO telegram_outbox
+               (id,sender,event,recipients,text,status,attempts,next_chunk,
+                next_attempt_ms,created_ms,delivered_ms)
+               VALUES
+                 ('audit_from_developer','developer','REPORT','manager',
+                  'outbound','pending',0,0,0,1,NULL),
+                 ('audit_to_developer','manager','ORDER','developer',
+                  'inbound','pending',0,0,0,2,NULL),
+                 ('audit_to_lead','manager','ORDER','lead-developer',
+                  'unrelated','pending',0,0,0,3,NULL)"#,
+        )
+        .execute(store.pool())
+        .await?;
+        assert_eq!(store.due_outbox(10).await?.len(), 3);
+
+        let disabled = store
+            .set_role_messaging(
+                "developer",
+                false,
+                "manager",
+                "hold without deleting",
+                false,
+            )
+            .await?;
+        assert_eq!(disabled["cancelled_outbox_items"], json!(0));
+        assert!(
+            !store
+                .outbox_delivery_eligible("audit_from_developer")
+                .await?
+        );
+        assert!(!store.outbox_delivery_eligible("audit_to_developer").await?);
+        assert!(store.outbox_delivery_eligible("audit_to_lead").await?);
+        let due_while_disabled = store.due_outbox(10).await?;
+        assert_eq!(due_while_disabled.len(), 1);
+        assert_eq!(due_while_disabled[0].id, "audit_to_lead");
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox WHERE status='pending'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(pending, 3, "clear_queue=false must preserve held items");
+
+        store
+            .set_role_messaging("developer", true, "manager", "resume", false)
+            .await?;
+        assert_eq!(store.due_outbox(10).await?.len(), 3);
 
         store.pool.close().await;
         remove_sqlite_files(&path).await;

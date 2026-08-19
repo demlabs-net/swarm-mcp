@@ -85,7 +85,7 @@ impl RoleMcp {
             let agents = config.agent_roles.clone();
             tools.push(control_tool(
                 "messaging_disable",
-                "Immediately block an executor from sending or receiving Swarm MCP dispatches and optionally cancel its undelivered Telegram audit queue.",
+                "Immediately block an executor from sending or receiving Swarm MCP dispatches and optionally cancel undelivered Telegram audits involving it.",
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": agents},
@@ -97,7 +97,7 @@ impl RoleMcp {
                         "clear_queue": {
                             "type": "boolean",
                             "default": true,
-                            "description": "Cancel pending and dead Telegram audit items from this role."
+                            "description": "Cancel pending and dead Telegram audit items sent by or addressed to this role."
                         }
                     }),
                     &["agent"],
@@ -117,7 +117,7 @@ impl RoleMcp {
             ));
             tools.push(control_tool(
                 "messaging_clear_queue",
-                "Cancel undelivered Telegram audit items produced by one executor without deleting delivered audit history.",
+                "Cancel undelivered Telegram audit items sent by or addressed to one executor without deleting delivered audit history.",
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": config.agent_roles},
@@ -234,7 +234,7 @@ impl RoleMcp {
                 Resource::new("swarm://messaging", "messaging")
                     .with_title("Executor messaging circuit breakers")
                     .with_description(
-                        "Persistent per-executor messaging state and undelivered Telegram queue counts.",
+                        "Persistent per-executor messaging state and counts of undelivered Telegram audits involving each role.",
                     )
                     .with_mime_type("application/json"),
             );
@@ -338,7 +338,7 @@ impl RoleMcp {
         );
         if self.role == config.manager_role {
             pieces.push(
-                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels that executor's undelivered Telegram audit queue. Inspect swarm://messaging before re-enabling. messaging_enable never replays cancelled items.".to_string(),
+                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered Telegram audits sent by or addressed to that executor. Inspect swarm://messaging before re-enabling. messaging_enable never replays cancelled items.".to_string(),
             );
         }
         pieces.join("\n\n")
