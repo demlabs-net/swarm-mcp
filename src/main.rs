@@ -103,6 +103,7 @@ fn init_tracing(filter: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn loopback_url_uses_loopback() {
@@ -232,6 +233,80 @@ mod tests {
         env.insert("SWARM_PEER_RUN_INSTRUCTIONS".into(), "read".into());
         env.insert("SWARM_LOG_LEVEL".into(), "info".into());
         env
+    }
+
+    /// Child-process body of the Serve command: boots the real server with the
+    /// inherited swarm environment and exits cleanly on SIGTERM. Only meaningful
+    /// when spawned by `serve_command_serves_and_shuts_down_on_sigterm`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_command_child() -> anyhow::Result<()> {
+        if std::env::var("SWARM_MCP_CHILD_TEST").is_err() {
+            return Ok(());
+        }
+        let cli = Cli::parse_from(["swarm-mcp", "serve"]);
+        run(cli).await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_command_serves_and_shuts_down_on_sigterm() -> anyhow::Result<()> {
+        let mut env = valid_env();
+        env.insert("SWARM_MCP_ALLOWED_HOSTS".into(), "127.0.0.1".into());
+        // Reserve a free port, then hand it to the child.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+        env.insert("SWARM_MCP_PORT".into(), port.to_string());
+        let db = std::env::temp_dir().join(format!(
+            "swarm-main-serve-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        env.insert("SWARM_STATE_DB_PATH".into(), db.display().to_string());
+
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("tests::serve_command_child")
+            .arg("--nocapture")
+            .env("SWARM_MCP_CHILD_TEST", "1")
+            .envs(&env)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        // Wait until the child actually serves /health: the Serve arm is live.
+        let client = reqwest::Client::builder().build()?;
+        let health = format!("http://127.0.0.1:{port}/health");
+        let mut up = false;
+        for _ in 0..100 {
+            if client
+                .get(&health)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(up, "the child must serve /health on port {port}");
+
+        std::process::Command::new("kill")
+            .args(["-TERM", &child.id().expect("child id").to_string()])
+            .status()?;
+        let status = tokio::time::timeout(Duration::from_secs(15), child.wait()).await??;
+        assert!(
+            status.success(),
+            "graceful shutdown must exit cleanly: {status}"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = tokio::fs::remove_file(format!("{}{suffix}", db.display())).await;
+        }
+        Ok(())
     }
 
     #[tokio::test]

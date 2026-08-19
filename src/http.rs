@@ -509,6 +509,7 @@ async fn shutdown_signal_with(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use std::io::Write;
 
     #[test]
     fn bearer_scheme_is_case_insensitive_but_value_is_strict() {
@@ -848,6 +849,97 @@ mod tests {
         assert_eq!(response, StatusCode::ACCEPTED);
         drop(state);
         testutil::remove_db_files(&db_path).await;
+    }
+
+    #[cfg(unix)]
+    async fn run_signal_child(child_test: &str, signal: &str) -> anyhow::Result<()> {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg(child_test)
+            // libtest captures test stdout by default; the readiness marker must flow.
+            .arg("--nocapture")
+            .env("SWARM_MCP_CHILD_TEST", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        // Wait for the child to report that its signal handlers are installed,
+        // so the signal can never race the handler registration.
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(line) = lines.next_line().await? {
+                if line.contains("SWARM_CHILD_READY") {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+            anyhow::bail!("child exited before reporting readiness");
+        })
+        .await??;
+
+        std::process::Command::new("kill")
+            .args([signal, &child.id().expect("child id").to_string()])
+            .status()?;
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait()).await??;
+        assert!(
+            status.success(),
+            "child must exit cleanly after {signal}: {status}"
+        );
+        Ok(())
+    }
+
+    /// Body of the SIGTERM child: waits for the real signal, then reports ready
+    /// (only meaningful when spawned by `shutdown_signal_responds_to_sigterm`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signal_child_sigterm() -> anyhow::Result<()> {
+        if std::env::var("SWARM_MCP_CHILD_TEST").is_err() {
+            return Ok(());
+        }
+        let signal = shutdown_signal();
+        tokio::pin!(signal);
+        // Poll once so the handlers are installed, then report readiness.
+        tokio::select! {
+            () = &mut signal => return Ok(()),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        println!("SWARM_CHILD_READY");
+        std::io::stdout().flush()?;
+        signal.await;
+        Ok(())
+    }
+
+    /// Body of the SIGINT child: exercises the Ctrl-C branch of the shutdown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signal_child_sigint() -> anyhow::Result<()> {
+        if std::env::var("SWARM_MCP_CHILD_TEST").is_err() {
+            return Ok(());
+        }
+        let signal = shutdown_signal();
+        tokio::pin!(signal);
+        tokio::select! {
+            () = &mut signal => return Ok(()),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        println!("SWARM_CHILD_READY");
+        std::io::stdout().flush()?;
+        signal.await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signal_responds_to_sigterm() -> anyhow::Result<()> {
+        run_signal_child("http::tests::shutdown_signal_child_sigterm", "-TERM").await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signal_responds_to_sigint() -> anyhow::Result<()> {
+        run_signal_child("http::tests::shutdown_signal_child_sigint", "-INT").await
     }
 
     #[tokio::test]

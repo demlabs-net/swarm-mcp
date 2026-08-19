@@ -396,3 +396,37 @@ http 93.1 · lib 92.9 · config 91.7 · probe 91.6 · store 89.9 · mcp 89.7 · 
 
 All runtime modules ≥ 86%; the only remaining gaps are the CLI-only `shutdown_signal` signal
 installation and the Serve arm of the bin entry — both consciously untested in-process.
+
+---
+
+# Iteration 10 (2026-08-14) — no consciously uncovered code: signal + Serve-arm child tests
+
+Suite: **108 lib + 5 bin tests**. `fmt` ✅ · `clippy -D warnings` ✅ (verified on **both** 1.89 and 1.97) ·
+`test --locked --all-targets` ✅ · line coverage **91.9%** (was 91.3%). CI threshold 90.
+
+Previously "consciously untested" spots are now covered with child-process tests
+(the only safe way to exercise process-global signals and the CLI Serve arm):
+
+- **http.rs 93.1% → 95.7%** — `shutdown_signal` real signal paths: the test re-executes the test
+  binary (`--exact <child> --nocapture`) with a `SWARM_MCP_CHILD_TEST` flag; the child reports
+  readiness **after** the handlers are installed (polled once via `select!` + marker line), the
+  parent sends `kill -TERM` / `kill -INT`, and asserts a clean exit. Deterministic — the signal
+  can never race handler installation.
+- **main.rs 86.1% → 91.9%** — the Serve arm: the child inherits the full valid env map
+  (`Command::envs`), boots the real server on a pre-reserved port, the parent probes `/health`
+  until it responds, sends SIGTERM, and asserts a clean graceful shutdown (server → workers →
+  exit 0). This covers `Config::from_env` → `init_tracing` → `AppState::initialize` → `http::serve`
+  → signal shutdown end-to-end.
+- tokio features `process` + `io-util` added for the child harness.
+
+## Coverage snapshot (line %)
+
+http 95.7 · lib 92.9 · config 91.7 · probe 91.6 · **main 91.9** · store 89.9 · mcp 89.7 · telegram 89.4 · dispatch 86.3.
+Every module ≥ 86%; no intentionally skipped code paths remain.
+
+## Warnings
+
+Exhaustive search on both toolchains (fresh builds, all targets): `fmt` ✅, `clippy -D warnings` ✅,
+`test` ✅, `build debug+release` ✅, `check` ✅, `doc` ✅, `audit` (0 vulnerabilities, exit 0) ✅,
+`llvm-cov` ✅ — **no warnings reproducible anywhere**. If a warning was seen in a specific place
+(GitLab pipeline log, IDE), it would need that context to reproduce.
