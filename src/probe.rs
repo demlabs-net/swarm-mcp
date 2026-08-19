@@ -267,6 +267,16 @@ fn expected_tools(config: &Config, role: &str) -> BTreeSet<String> {
     if config.global_authorities.contains(role) {
         tools.insert("order_all".to_string());
     }
+    if role == config.manager_role {
+        tools.extend(
+            [
+                "messaging_clear_queue",
+                "messaging_disable",
+                "messaging_enable",
+            ]
+            .map(str::to_string),
+        );
+    }
     if config.agent_roles.iter().any(|candidate| candidate == role) {
         tools.extend(["msg_all", "msg_to", "report"].map(str::to_string));
     }
@@ -281,6 +291,7 @@ fn expected_resources(config: &Config, role: &str) -> BTreeSet<String> {
     ]);
     if role == config.manager_role {
         resources.insert("swarm://executors".to_string());
+        resources.insert("swarm://messaging".to_string());
     }
     if config
         .order_acl
@@ -321,7 +332,13 @@ mod tests {
         // manager: global authority
         assert_eq!(
             expected_tools(&config, "manager"),
-            BTreeSet::from(["order".to_string(), "order_all".to_string()])
+            BTreeSet::from([
+                "messaging_clear_queue".to_string(),
+                "messaging_disable".to_string(),
+                "messaging_enable".to_string(),
+                "order".to_string(),
+                "order_all".to_string()
+            ])
         );
         let mut manager_resources = BTreeSet::from([
             "swarm://hierarchy".to_string(),
@@ -329,6 +346,7 @@ mod tests {
             "swarm://outbox".to_string(),
             "swarm://executors".to_string(),
             "swarm://activity".to_string(),
+            "swarm://messaging".to_string(),
         ]);
         assert_eq!(expected_resources(&config, "manager"), manager_resources);
         // lead-developer: authority with single-target order
@@ -342,6 +360,7 @@ mod tests {
             ])
         );
         manager_resources.remove("swarm://executors");
+        manager_resources.remove("swarm://messaging");
         assert_eq!(
             expected_resources(&config, "lead-developer"),
             manager_resources

@@ -18,18 +18,18 @@ limits, and capability roadmap is in [REVIEW.md](REVIEW.md).
 The hierarchy is data-driven:
 
 ```dotenv
-SWARM_AGENT_ROLES=developer,junior,designer,lead-developer,tester,devops
+SWARM_AGENT_ROLES=developer,designer,lead-developer,tester,devops
 SWARM_MANAGER_ROLE=manager
-SWARM_ORDER_ACL={"manager":["*"],"lead-developer":["developer","junior"]}
+SWARM_ORDER_ACL={"manager":["*"],"lead-developer":["developer"]}
 ```
 
 With this configuration the catalogs are:
 
 | Caller | Tools |
 |---|---|
-| `manager` | `order`, `order_all` |
+| `manager` | `order`, `order_all`, `messaging_disable`, `messaging_enable`, `messaging_clear_queue` |
 | `lead-developer` | `order`, `report`, `msg_to`, `msg_all` |
-| `developer`, `junior`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
+| `developer`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
 
 `"*"` grants swarm-wide `order` and `order_all`. An explicit list grants only
 single-target `order`; the generated JSON Schema enumerates exactly the targets
@@ -54,6 +54,7 @@ for unrelated work; their records expire with `SWARM_OPERATION_RETENTION_DAYS`.
 | `swarm://operations` | every role | Recent durable operations sent or received by that role |
 | `swarm://activity` | ordering authorities | Current and recent passive subordinate lifecycle state |
 | `swarm://outbox` | every role | Telegram delivery state; manager also sees the inbound offset and last successful poll |
+| `swarm://messaging` | manager | Persistent executor circuit-breaker state and undelivered queue counts |
 
 The activity endpoint records only lifecycle state. It never starts an agent,
 changes cron configuration, or sends Telegram messages. Timestamps make
@@ -76,11 +77,25 @@ The store provides:
 - a durable Telegram outbox with bounded retries, `Retry-After` support, and
   per-chunk checkpoints.
 
+The manager can atomically disable an executor's Swarm MCP send/receive path
+and cancel its pending/dead Telegram audit items. Disabled state survives a
+restart. A disabled executor cannot send reports or peer messages and cannot
+receive orders, peer messages, broadcasts, or Telegram-inbound dispatches.
+`messaging_enable` never revives cancelled outbox records. Delivered audit
+history remains intact.
+
 Telegram delivery is asynchronous. A successful tool response reports an
 `outbox_id`; temporary Telegram failure does not turn a successfully accepted
 agent run into a failed command. Telegram delivery is at-least-once, so a crash
 between Telegram accepting a message and the local acknowledgement can produce
-a duplicate.
+a duplicate. Non-retryable Telegram 4xx responses are dead-lettered on the
+first attempt instead of being replayed repeatedly.
+
+Peer-delivery prompts are deliberately one-way by default: ACK, closure,
+stand-by, and unchanged-evidence messages must not trigger another `msg_to`.
+This prevents conversational acknowledgement loops from turning into new
+Hermes runs. The persistent manager circuit breaker remains the hard stop for
+unexpected model behavior.
 
 ## Shared Telegram gateway
 
@@ -115,6 +130,10 @@ commands are:
 /roles
 /help
 ```
+
+Role commands are generated from the configured live roster. Disabled Compose
+profiles are not included in `SWARM_AGENT_ROLES`, cannot receive orders, and do
+not appear in `/roles` or the MCP hierarchy resource.
 
 `SWARM_TELEGRAM_INBOUND_TARGETS` limits which configured roles these commands
 may address; `*` enables all roles. Each accepted Telegram update is reserved

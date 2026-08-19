@@ -16,8 +16,9 @@ use crate::{
     AppState,
     config::TelegramBotMode,
     dispatch::{
-        BroadcastArgs, MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, ToolOutcome,
-        parse_arguments, render_template,
+        BroadcastArgs, ClearMessageQueueArgs, DisableMessagingArgs, EnableMessagingArgs,
+        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, ToolOutcome, parse_arguments,
+        render_template,
     },
 };
 
@@ -78,6 +79,57 @@ impl RoleMcp {
                     }),
                     &["command"],
                 ),
+            ));
+        }
+        if self.role == config.manager_role {
+            let agents = config.agent_roles.clone();
+            tools.push(control_tool(
+                "messaging_disable",
+                "Immediately block an executor from sending or receiving Swarm MCP dispatches and optionally cancel its undelivered Telegram audit queue.",
+                object_schema(
+                    &json!({
+                        "agent": {"type": "string", "enum": agents},
+                        "reason": {
+                            "type": "string",
+                            "maxLength": 500,
+                            "default": ""
+                        },
+                        "clear_queue": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Cancel pending and dead Telegram audit items from this role."
+                        }
+                    }),
+                    &["agent"],
+                ),
+                true,
+            ));
+            tools.push(control_tool(
+                "messaging_enable",
+                "Re-enable Swarm MCP message exchange for one executor. Cancelled queue items are never replayed.",
+                object_schema(
+                    &json!({
+                        "agent": {"type": "string", "enum": config.agent_roles}
+                    }),
+                    &["agent"],
+                ),
+                false,
+            ));
+            tools.push(control_tool(
+                "messaging_clear_queue",
+                "Cancel undelivered Telegram audit items produced by one executor without deleting delivered audit history.",
+                object_schema(
+                    &json!({
+                        "agent": {"type": "string", "enum": config.agent_roles},
+                        "include_dead": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Also mark exhausted dead-letter items as cancelled."
+                        }
+                    }),
+                    &["agent"],
+                ),
+                true,
             ));
         }
         if config.agent_roles.contains(&self.role) {
@@ -178,6 +230,14 @@ impl RoleMcp {
                     .with_description("Compatibility alias for swarm://hierarchy.")
                     .with_mime_type("application/json"),
             );
+            resources.push(
+                Resource::new("swarm://messaging", "messaging")
+                    .with_title("Executor messaging circuit breakers")
+                    .with_description(
+                        "Persistent per-executor messaging state and undelivered Telegram queue counts.",
+                    )
+                    .with_mime_type("application/json"),
+            );
         }
         if self
             .state
@@ -276,6 +336,11 @@ impl RoleMcp {
                 config.operation_retention_days
             )
         );
+        if self.role == config.manager_role {
+            pieces.push(
+                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels that executor's undelivered Telegram audit queue. Inspect swarm://messaging before re-enabling. messaging_enable never replays cancelled items.".to_string(),
+            );
+        }
         pieces.join("\n\n")
     }
 }
@@ -340,6 +405,36 @@ impl ServerHandler for RoleMcp {
                 Ok(args) => self.state.dispatcher.message_all(&self.role, args).await,
                 Err(outcome) => outcome,
             },
+            "messaging_disable" => match parse_arguments::<DisableMessagingArgs>(request.arguments)
+            {
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .disable_messaging(&self.role, args)
+                        .await
+                }
+                Err(outcome) => outcome,
+            },
+            "messaging_enable" => match parse_arguments::<EnableMessagingArgs>(request.arguments) {
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .enable_messaging(&self.role, args)
+                        .await
+                }
+                Err(outcome) => outcome,
+            },
+            "messaging_clear_queue" => {
+                match parse_arguments::<ClearMessageQueueArgs>(request.arguments) {
+                    Ok(args) => {
+                        self.state
+                            .dispatcher
+                            .clear_message_queue(&self.role, args)
+                            .await
+                    }
+                    Err(outcome) => outcome,
+                }
+            }
             _ => unreachable!("tool availability was checked above"),
         };
         Ok(tool_result(outcome).into())
@@ -409,6 +504,12 @@ impl ServerHandler for RoleMcp {
                 )
                 .await
                 .map_err(internal_error)?,
+            "swarm://messaging" => self
+                .state
+                .store
+                .messaging_snapshot(&self.state.config.agent_roles)
+                .await
+                .map_err(internal_error)?,
             _ => unreachable!("resource availability was checked above"),
         };
         let text = serde_json::to_string_pretty(&value).map_err(internal_error)?;
@@ -427,6 +528,23 @@ fn tool(name: &'static str, description: &'static str, schema: Arc<JsonObject>) 
             .destructive(false)
             .idempotent(false)
             .open_world(true),
+    );
+    value
+}
+
+fn control_tool(
+    name: &'static str,
+    description: &'static str,
+    schema: Arc<JsonObject>,
+    destructive: bool,
+) -> Tool {
+    let mut value = Tool::new(name, description, schema);
+    value.annotations = Some(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(destructive)
+            .idempotent(true)
+            .open_world(false),
     );
     value
 }
@@ -509,10 +627,20 @@ mod tests {
     #[tokio::test]
     async fn manager_catalog_is_global_authority() -> anyhow::Result<()> {
         let (mcp, path) = role_mcp("manager").await?;
-        assert_eq!(tool_names(&mcp), vec!["order", "order_all"]);
+        assert_eq!(
+            tool_names(&mcp),
+            vec![
+                "messaging_clear_queue",
+                "messaging_disable",
+                "messaging_enable",
+                "order",
+                "order_all"
+            ]
+        );
         let resources = resource_uris(&mcp);
         assert!(resources.contains(&"swarm://executors".to_string()));
         assert!(resources.contains(&"swarm://activity".to_string()));
+        assert!(resources.contains(&"swarm://messaging".to_string()));
         // the order tool schema enumerates exactly the ACL targets
         let order = mcp
             .tools()
@@ -686,7 +814,16 @@ mod tests {
             .await?;
         let value: Value = serde_json::from_str(resource_text(&hierarchy))?;
         assert_eq!(value["caller"], json!("manager"));
-        assert_eq!(value["tools"], json!(["order", "order_all"]));
+        assert_eq!(
+            value["tools"],
+            json!([
+                "messaging_clear_queue",
+                "messaging_disable",
+                "messaging_enable",
+                "order",
+                "order_all"
+            ])
+        );
 
         let operations = client
             .read_resource(ReadResourceRequestParams::new("swarm://operations"))

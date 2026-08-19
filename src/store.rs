@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const TELEGRAM_OFFSET_KEY: &str = "telegram_update_offset";
 const TELEGRAM_POLL_SUCCESS_KEY: &str = "telegram_poll_success";
 
@@ -678,6 +678,130 @@ impl Store {
         Ok(response)
     }
 
+    pub async fn role_messaging_enabled(&self, role: &str) -> anyhow::Result<bool> {
+        let enabled =
+            sqlx::query_scalar::<_, i64>("SELECT enabled FROM role_messaging WHERE role = ?")
+                .bind(role)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(enabled.unwrap_or(1) != 0)
+    }
+
+    pub async fn disabled_roles(&self, roles: &[String]) -> anyhow::Result<Vec<String>> {
+        let mut disabled = Vec::new();
+        for role in roles {
+            if !self.role_messaging_enabled(role).await? {
+                disabled.push(role.clone());
+            }
+        }
+        Ok(disabled)
+    }
+
+    pub async fn set_role_messaging(
+        &self,
+        role: &str,
+        enabled: bool,
+        changed_by: &str,
+        reason: &str,
+        clear_queue: bool,
+    ) -> anyhow::Result<Value> {
+        let now = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT INTO role_messaging(role, enabled, changed_by, reason, changed_ms)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(role) DO UPDATE SET
+                 enabled=excluded.enabled,
+                 changed_by=excluded.changed_by,
+                 reason=excluded.reason,
+                 changed_ms=excluded.changed_ms"#,
+        )
+        .bind(role)
+        .bind(i64::from(enabled))
+        .bind(changed_by)
+        .bind(reason)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let cancelled = if !enabled && clear_queue {
+            cancel_role_outbox(&mut tx, role, true, changed_by, now).await?
+        } else {
+            0
+        };
+        tx.commit().await?;
+        Ok(json!({
+            "ok": true,
+            "agent": role,
+            "messaging_enabled": enabled,
+            "changed_by": changed_by,
+            "reason": reason,
+            "changed_at": millis_to_rfc3339(now),
+            "cancelled_outbox_items": cancelled,
+        }))
+    }
+
+    pub async fn clear_role_outbox(
+        &self,
+        role: &str,
+        include_dead: bool,
+        changed_by: &str,
+    ) -> anyhow::Result<Value> {
+        let now = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        let cancelled = cancel_role_outbox(&mut tx, role, include_dead, changed_by, now).await?;
+        tx.commit().await?;
+        Ok(json!({
+            "ok": true,
+            "agent": role,
+            "cancelled_outbox_items": cancelled,
+            "included_dead_items": include_dead,
+            "changed_by": changed_by,
+            "changed_at": millis_to_rfc3339(now),
+        }))
+    }
+
+    pub async fn messaging_snapshot(&self, roles: &[String]) -> anyhow::Result<Value> {
+        let state_rows =
+            sqlx::query("SELECT role, enabled, changed_by, reason, changed_ms FROM role_messaging")
+                .fetch_all(&self.pool)
+                .await?;
+        let states = state_rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("role"), row))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let queue_rows = sqlx::query(
+            r#"SELECT sender, status, COUNT(*) AS item_count
+               FROM telegram_outbox
+               WHERE status IN ('pending', 'dead')
+               GROUP BY sender, status"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut queue =
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<String, i64>>::new();
+        for row in queue_rows {
+            queue
+                .entry(row.get("sender"))
+                .or_default()
+                .insert(row.get("status"), row.get("item_count"));
+        }
+        let items = roles
+            .iter()
+            .map(|role| {
+                let state = states.get(role);
+                json!({
+                    "agent": role,
+                    "messaging_enabled": state.is_none_or(|row| row.get::<i64, _>("enabled") != 0),
+                    "changed_by": state.map(|row| row.get::<String, _>("changed_by")),
+                    "reason": state.map(|row| row.get::<String, _>("reason")),
+                    "changed_at": state.map(|row| millis_to_rfc3339(row.get("changed_ms"))),
+                    "outbox": queue.get(role).cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"roles": items}))
+    }
+
     pub async fn due_outbox(&self, limit: i64) -> anyhow::Result<Vec<OutboxItem>> {
         let rows = sqlx::query(
             r#"SELECT id, sender, event, recipients, text, attempts, next_chunk
@@ -785,7 +909,7 @@ impl Store {
             .execute(&self.pool)
             .await?;
         sqlx::query(
-            "DELETE FROM telegram_outbox WHERE status IN ('delivered','dead') AND created_ms < ?",
+            "DELETE FROM telegram_outbox WHERE status IN ('delivered','dead','cancelled') AND created_ms < ?",
         )
         .bind(now.saturating_sub(outbox_retention_days.saturating_mul(86_400_000)))
         .execute(&self.pool)
@@ -898,6 +1022,31 @@ async fn insert_outbox(
     Ok(())
 }
 
+async fn cancel_role_outbox(
+    tx: &mut Transaction<'_, Sqlite>,
+    role: &str,
+    include_dead: bool,
+    changed_by: &str,
+    now: i64,
+) -> anyhow::Result<u64> {
+    let statuses = if include_dead {
+        "status IN ('pending', 'dead')"
+    } else {
+        "status = 'pending'"
+    };
+    let reason = format!("cancelled by {changed_by} at {}", millis_to_rfc3339(now));
+    let statement = format!(
+        "UPDATE telegram_outbox SET status='cancelled', last_error=? \
+         WHERE sender=? AND {statuses}"
+    );
+    Ok(sqlx::query(&statement)
+        .bind(reason)
+        .bind(role)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected())
+}
+
 const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS activity_events (
          id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -969,6 +1118,13 @@ const SCHEMA: &[&str] = &[
          delivered_ms INTEGER
        )"#,
     "CREATE INDEX IF NOT EXISTS telegram_outbox_due_idx ON telegram_outbox(status, next_attempt_ms)",
+    r#"CREATE TABLE IF NOT EXISTS role_messaging (
+         role TEXT PRIMARY KEY,
+         enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+         changed_by TEXT NOT NULL,
+         reason TEXT NOT NULL,
+         changed_ms INTEGER NOT NULL
+       )"#,
     r#"CREATE TABLE IF NOT EXISTS service_state (
          key TEXT PRIMARY KEY,
          value_int INTEGER NOT NULL,
@@ -1194,6 +1350,80 @@ mod tests {
         let executor_outbox = store.recent_outbox("developer", "manager", 10).await?;
         assert!(executor_outbox.get("inbound_update_offset").is_none());
         assert!(executor_outbox.get("inbound_last_poll_at").is_none());
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn messaging_circuit_breaker_is_persistent_and_cancels_queue() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-messaging-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        assert!(store.role_messaging_enabled("developer").await?);
+
+        for (id, status) in [
+            ("audit_pending", "pending"),
+            ("audit_dead", "dead"),
+            ("audit_delivered", "delivered"),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO telegram_outbox
+                   (id,sender,event,recipients,text,status,attempts,next_chunk,
+                    next_attempt_ms,created_ms,delivered_ms)
+                   VALUES (?,'developer','REPORT','manager','test',?,0,0,0,0,
+                           CASE WHEN ?='delivered' THEN 1 ELSE NULL END)"#,
+            )
+            .bind(id)
+            .bind(status)
+            .bind(status)
+            .execute(store.pool())
+            .await?;
+        }
+
+        let disabled = store
+            .set_role_messaging(
+                "developer",
+                false,
+                "manager",
+                "operator emergency stop",
+                true,
+            )
+            .await?;
+        assert_eq!(disabled["cancelled_outbox_items"], json!(2));
+        assert!(!store.role_messaging_enabled("developer").await?);
+        let statuses = sqlx::query_as::<_, (String, String)>(
+            "SELECT id,status FROM telegram_outbox ORDER BY id",
+        )
+        .fetch_all(store.pool())
+        .await?
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(statuses["audit_pending"], "cancelled");
+        assert_eq!(statuses["audit_dead"], "cancelled");
+        assert_eq!(statuses["audit_delivered"], "delivered");
+
+        let snapshot = store
+            .messaging_snapshot(&["developer".to_string(), "tester".to_string()])
+            .await?;
+        assert_eq!(snapshot["roles"][0]["messaging_enabled"], json!(false));
+        assert_eq!(snapshot["roles"][1]["messaging_enabled"], json!(true));
+
+        store
+            .set_role_messaging("developer", true, "manager", "resume", false)
+            .await?;
+        assert!(store.role_messaging_enabled("developer").await?);
+        let cancelled: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox WHERE status='cancelled'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(
+            cancelled, 2,
+            "re-enabling must never replay cancelled items"
+        );
 
         store.pool.close().await;
         remove_sqlite_files(&path).await;

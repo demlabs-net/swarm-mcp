@@ -48,6 +48,7 @@ transport requirements and the official Rust SDK.
 | F-20 | Medium | No graceful shutdown coordination for sessions/background work | In-flight state could be abandoned without an explicit boundary | Cancellation token shared by MCP services and workers; pending operations become `indeterminate` after restart |
 | F-21 | Low | Logs lacked a structured, consistent format | Harder correlation and machine processing | Structured JSON tracing and stable operation IDs |
 | F-22 | Low | No automated unit tests; probes depended on a live deployment | Regressions in parsing/chunking/security were easy | Unit tests, compiled catalog/activity probes, and GitLab CI with Clippy/RustSec |
+| F-23 | High | No live role-level messaging kill switch and peer prompts encouraged replies | Reciprocal ACK/closure messages could create a slow, unbounded cascade of new Hermes runs and Telegram audits | Persistent manager-only disable/enable/queue-clear controls, bidirectional dispatch enforcement, one-way peer instructions, and first-attempt dead-lettering for permanent Telegram 4xx errors |
 
 ## New architecture
 
@@ -107,9 +108,11 @@ server will not blindly redeliver a side effect whose outcome is unknown.
    constant time and isolated by endpoint, but rotation currently requires a
    coordinated environment update and restart.
 
-5. **There is no downstream circuit breaker.** Timeouts, rate limits, and
-   concurrency bounds prevent unbounded pressure, but repeated failures still
-   consume the configured allowance.
+5. **The role messaging circuit breaker is manual.** The manager can now block
+   either direction for an executor and cancel its audit queue, but transport
+   failure thresholds do not automatically trip that state. Timeouts, rate
+   limits, permanent-4xx classification, and concurrency bounds prevent
+   unbounded pressure; automatic half-open recovery remains future work.
 
 6. **Legacy MCP sessions are process-local.** Request admission bounds creation
    rate, but legacy clients that never send session deletion can retain session
@@ -141,6 +144,8 @@ server will not blindly redeliver a side effect whose outcome is unknown.
 
 ### Phase 2 — operator controls
 
+- Completed: persistent manager-only per-role messaging disable/enable, queue
+  cancellation, `swarm://messaging`, and negative-path catalog/auth probes.
 - Add non-mutating `get_operation(id)` and filtered/paginated operation
   resources.
 - Add privileged `cancel_operation(id)` only after Hermes supports cancellation.
@@ -188,6 +193,9 @@ server will not blindly redeliver a side effect whose outcome is unknown.
 - The configured rate limit rejects excess operations without agent calls.
 - A Telegram outage leaves pending/dead outbox evidence without losing the
   accepted agent result.
+- Manager-only role controls block both sender and recipient paths, persist
+  across restart, cancel undelivered audit items, and never replay cancelled
+  items when re-enabled.
 - Activity reads and probes never start an agent or send Telegram.
 - `/ready` fails when SQLite is unavailable.
 - The service runs as non-root with a read-only root filesystem.

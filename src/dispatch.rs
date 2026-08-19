@@ -6,7 +6,10 @@ use reqwest::{Client, Proxy};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{sync::Semaphore, task::JoinHandle};
+use tokio::{
+    sync::{RwLock, Semaphore},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -23,6 +26,7 @@ pub struct Dispatcher {
     hermes_client: Client,
     telegram_client: Client,
     inflight: Arc<Semaphore>,
+    messaging_gate: Arc<RwLock<()>>,
 }
 
 #[derive(Debug)]
@@ -71,6 +75,7 @@ impl std::fmt::Display for RunFailure {
 struct TelegramFailure {
     message: String,
     retry_after_seconds: Option<i64>,
+    permanent: bool,
 }
 
 impl TelegramFailure {
@@ -78,6 +83,15 @@ impl TelegramFailure {
         Self {
             message: message.into(),
             retry_after_seconds,
+            permanent: false,
+        }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_after_seconds: None,
+            permanent: true,
         }
     }
 }
@@ -185,6 +199,30 @@ pub struct MessageAllArgs {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisableMessagingArgs {
+    pub agent: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default = "default_true")]
+    pub clear_queue: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnableMessagingArgs {
+    pub agent: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearMessageQueueArgs {
+    pub agent: String,
+    #[serde(default = "default_true")]
+    pub include_dead: bool,
+}
+
 #[derive(Debug)]
 pub struct TelegramInboundArgs {
     pub update_id: i64,
@@ -197,6 +235,10 @@ pub struct TelegramInboundArgs {
 
 fn completed_status() -> String {
     "completed".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Dispatcher {
@@ -214,6 +256,7 @@ impl Dispatcher {
         let telegram_client = telegram_builder.build()?;
         Ok(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight_dispatches)),
+            messaging_gate: Arc::new(RwLock::new(())),
             config,
             store,
             hermes_client,
@@ -222,6 +265,7 @@ impl Dispatcher {
     }
 
     pub async fn order(&self, sender: &str, args: OrderArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
         let target = args.agent.trim().to_lowercase();
         let allowed = self
             .config
@@ -235,6 +279,12 @@ impl Dispatcher {
                 "error": format!("{sender} is not authorized to order '{target}'"),
                 "allowed": allowed,
             }));
+        }
+        if let Some(outcome) = self
+            .messaging_block(sender, std::slice::from_ref(&target))
+            .await
+        {
+            return outcome;
         }
         let command = match self.clean_text(&args.command, "command") {
             Ok(value) => value,
@@ -304,6 +354,7 @@ impl Dispatcher {
     }
 
     pub async fn order_all(&self, sender: &str, args: BroadcastArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
         if !self.config.global_authorities.contains(sender) {
             return tool_error(json!({
                 "ok": false,
@@ -325,6 +376,9 @@ impl Dispatcher {
             .get(sender)
             .cloned()
             .unwrap_or_default();
+        if let Some(outcome) = self.messaging_block(sender, &targets).await {
+            return outcome;
+        }
         let fingerprint = fingerprint(&json!({"targets": targets, "command": command}));
         if let Some(outcome) = self
             .reserve_or_replay(
@@ -378,6 +432,7 @@ impl Dispatcher {
     }
 
     pub async fn report(&self, sender: &str, args: ReportArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
         let supervisors = self.config.supervisors(sender);
         let recipient = args
             .recipient
@@ -391,6 +446,12 @@ impl Dispatcher {
                 "error": format!("{recipient} is not a supervisor of {sender}"),
                 "allowed": supervisors,
             }));
+        }
+        if let Some(outcome) = self
+            .messaging_block(sender, std::slice::from_ref(&recipient))
+            .await
+        {
+            return outcome;
         }
         let summary = match self.clean_text(&args.summary, "summary") {
             Ok(value) => value,
@@ -503,6 +564,7 @@ impl Dispatcher {
     }
 
     pub async fn message(&self, sender: &str, args: MessageArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
         let target = args.agent.trim().to_lowercase();
         let allowed = self
             .config
@@ -517,6 +579,12 @@ impl Dispatcher {
                 "error": "target must be another executor",
                 "allowed": allowed,
             }));
+        }
+        if let Some(outcome) = self
+            .messaging_block(sender, std::slice::from_ref(&target))
+            .await
+        {
+            return outcome;
         }
         let message = match self.clean_text(&args.message, "message") {
             Ok(value) => value,
@@ -587,6 +655,7 @@ impl Dispatcher {
     }
 
     pub async fn message_all(&self, sender: &str, args: MessageAllArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
         let message = match self.clean_text(&args.message, "message") {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -608,6 +677,9 @@ impl Dispatcher {
                 "ok": false,
                 "error": "no peer executors to message",
             }));
+        }
+        if let Some(outcome) = self.messaging_block(sender, &targets).await {
+            return outcome;
         }
         let fingerprint = fingerprint(&json!({"targets": targets, "message": message}));
         if let Some(outcome) = self
@@ -664,6 +736,7 @@ impl Dispatcher {
     }
 
     pub async fn telegram_inbound(&self, args: TelegramInboundArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
         if !self.config.telegram_inbound_enabled {
             return tool_error(json!({
                 "ok": false,
@@ -699,6 +772,12 @@ impl Dispatcher {
                 "ok": false,
                 "error": "Telegram command has no targets",
             }));
+        }
+        if let Some(outcome) = self
+            .messaging_block(&self.config.manager_role, &targets)
+            .await
+        {
+            return outcome;
         }
 
         let dispatch_id = format!("telegram_{}", args.update_id);
@@ -805,13 +884,24 @@ impl Dispatcher {
             return Ok(());
         }
         for item in self.store.due_outbox(self.config.outbox_batch_size).await? {
+            let _messaging_guard = self.messaging_gate.read().await;
+            if !self.store.role_messaging_enabled(&item.sender).await? {
+                self.store
+                    .clear_role_outbox(&item.sender, false, "messaging-circuit-breaker")
+                    .await?;
+                continue;
+            }
             match self.send_telegram(&item).await {
                 Ok(()) => {
                     self.store.mark_outbox_delivered(&item.id).await?;
                     info!(outbox_id = %item.id, "Telegram audit delivered");
                 }
                 Err(error) => {
-                    let attempts = item.attempts + 1;
+                    let attempts = if error.permanent {
+                        self.config.outbox_max_attempts
+                    } else {
+                        item.attempts + 1
+                    };
                     warn!(outbox_id = %item.id, attempts, error = %error, "Telegram audit delivery failed");
                     self.store
                         .mark_outbox_failed(
@@ -961,6 +1051,142 @@ impl Dispatcher {
             .ok_or_else(|| {
                 RunFailure::indeterminate(anyhow!("{role} API returned an invalid run identifier"))
             })
+    }
+
+    pub async fn disable_messaging(&self, sender: &str, args: DisableMessagingArgs) -> ToolOutcome {
+        let target = match self.control_target(&args.agent) {
+            Ok(target) => target,
+            Err(outcome) => return outcome,
+        };
+        let reason = if args.reason.trim().is_empty() {
+            "disabled by swarm manager".to_string()
+        } else {
+            match Self::clean_control_reason(&args.reason) {
+                Ok(reason) => reason,
+                Err(error) => return tool_error_message(error),
+            }
+        };
+        let _messaging_guard = self.messaging_gate.write().await;
+        match self
+            .store
+            .set_role_messaging(&target, false, sender, &reason, args.clear_queue)
+            .await
+        {
+            Ok(value) => ToolOutcome {
+                value,
+                is_error: false,
+            },
+            Err(error) => {
+                error!(%sender, %target, error = %error, "disable role messaging failed");
+                tool_error(json!({"ok": false, "error": "persistent messaging control failed"}))
+            }
+        }
+    }
+
+    pub async fn enable_messaging(&self, sender: &str, args: EnableMessagingArgs) -> ToolOutcome {
+        let target = match self.control_target(&args.agent) {
+            Ok(target) => target,
+            Err(outcome) => return outcome,
+        };
+        let _messaging_guard = self.messaging_gate.write().await;
+        match self
+            .store
+            .set_role_messaging(&target, true, sender, "enabled by swarm manager", false)
+            .await
+        {
+            Ok(value) => ToolOutcome {
+                value,
+                is_error: false,
+            },
+            Err(error) => {
+                error!(%sender, %target, error = %error, "enable role messaging failed");
+                tool_error(json!({"ok": false, "error": "persistent messaging control failed"}))
+            }
+        }
+    }
+
+    pub async fn clear_message_queue(
+        &self,
+        sender: &str,
+        args: ClearMessageQueueArgs,
+    ) -> ToolOutcome {
+        let target = match self.control_target(&args.agent) {
+            Ok(target) => target,
+            Err(outcome) => return outcome,
+        };
+        let _messaging_guard = self.messaging_gate.write().await;
+        match self
+            .store
+            .clear_role_outbox(&target, args.include_dead, sender)
+            .await
+        {
+            Ok(value) => ToolOutcome {
+                value,
+                is_error: false,
+            },
+            Err(error) => {
+                error!(%sender, %target, error = %error, "clear role message queue failed");
+                tool_error(json!({"ok": false, "error": "persistent queue control failed"}))
+            }
+        }
+    }
+
+    async fn messaging_block(&self, sender: &str, targets: &[String]) -> Option<ToolOutcome> {
+        match self.store.role_messaging_enabled(sender).await {
+            Ok(false) => {
+                return Some(tool_error(json!({
+                    "ok": false,
+                    "error": "messaging is disabled for the sending role",
+                    "agent": sender,
+                    "messaging_enabled": false,
+                })));
+            }
+            Ok(true) => {}
+            Err(error) => {
+                error!(%sender, error = %error, "read sender messaging state failed");
+                return Some(tool_error(json!({
+                    "ok": false,
+                    "error": "persistent messaging state is unavailable",
+                })));
+            }
+        }
+        match self.store.disabled_roles(targets).await {
+            Ok(disabled) if disabled.is_empty() => None,
+            Ok(disabled) => Some(tool_error(json!({
+                "ok": false,
+                "error": "messaging is disabled for one or more target roles",
+                "disabled_agents": disabled,
+            }))),
+            Err(error) => {
+                error!(%sender, error = %error, "read target messaging state failed");
+                Some(tool_error(json!({
+                    "ok": false,
+                    "error": "persistent messaging state is unavailable",
+                })))
+            }
+        }
+    }
+
+    fn control_target(&self, value: &str) -> Result<String, ToolOutcome> {
+        let target = value.trim().to_lowercase();
+        if !self.config.agent_roles.contains(&target) {
+            return Err(tool_error(json!({
+                "ok": false,
+                "error": "messaging controls apply only to configured executor roles",
+                "allowed": self.config.agent_roles,
+            })));
+        }
+        Ok(target)
+    }
+
+    fn clean_control_reason(value: &str) -> anyhow::Result<String> {
+        let value = value.trim();
+        ensure!(!value.is_empty(), "reason must not be empty");
+        ensure!(
+            value.chars().count() <= 500,
+            "reason exceeds 500 characters"
+        );
+        Ok(value.to_string())
     }
 
     async fn reserve_or_replay(
@@ -1168,15 +1394,18 @@ async fn validate_telegram_response(response: reqwest::Response) -> Result<(), T
         .or(header_retry_after)
         .map(|seconds| seconds.clamp(1, 86_400));
     if !status.is_success() {
-        return Err(TelegramFailure::new(
-            format!("Telegram API returned HTTP {status}"),
-            retry_after_seconds,
-        ));
+        let message = format!("Telegram API returned HTTP {status}");
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status.is_server_error()
+        {
+            return Err(TelegramFailure::new(message, retry_after_seconds));
+        }
+        return Err(TelegramFailure::permanent(message));
     }
     if payload.as_ref().and_then(|value| value.get("ok")) != Some(&Value::Bool(true)) {
-        return Err(TelegramFailure::new(
+        return Err(TelegramFailure::permanent(
             "Telegram API returned an invalid success response",
-            retry_after_seconds,
         ));
     }
     Ok(())
