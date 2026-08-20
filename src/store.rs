@@ -760,6 +760,14 @@ impl Store {
         Ok(enabled.unwrap_or(1) != 0)
     }
 
+    pub async fn role_messaging_state(&self, role: &str) -> anyhow::Result<Option<(bool, i64)>> {
+        let state = sqlx::query("SELECT enabled, changed_ms FROM role_messaging WHERE role = ?")
+            .bind(role)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(state.map(|row| (row.get::<i64, _>("enabled") != 0, row.get("changed_ms"))))
+    }
+
     pub async fn disabled_roles(&self, roles: &[String]) -> anyhow::Result<Vec<String>> {
         let mut disabled = Vec::new();
         for role in roles {

@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{anyhow, ensure};
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, future::join_all};
 use reqwest::{Client, Proxy};
 use serde::Deserialize;
@@ -214,6 +215,8 @@ pub struct DisableMessagingArgs {
 #[serde(deny_unknown_fields)]
 pub struct EnableMessagingArgs {
     pub agent: String,
+    pub reason: String,
+    pub expected_disabled_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1158,10 +1161,61 @@ impl Dispatcher {
             Ok(target) => target,
             Err(outcome) => return outcome,
         };
+        let reason = match Self::clean_control_reason(&args.reason) {
+            Ok(reason) => reason,
+            Err(error) => return tool_error_message(error),
+        };
+        let expected_disabled_ms = match DateTime::parse_from_rfc3339(&args.expected_disabled_at) {
+            Ok(value) => value.timestamp_millis(),
+            Err(_) => {
+                return tool_error(json!({
+                    "ok": false,
+                    "error": "expected_disabled_at must be the exact RFC 3339 changed_at value from swarm://messaging",
+                }));
+            }
+        };
         let _messaging_guard = self.messaging_gate.write().await;
+        let state = match self.store.role_messaging_state(&target).await {
+            Ok(state) => state,
+            Err(error) => {
+                error!(%sender, %target, error = %error, "read role messaging state failed");
+                return tool_error(
+                    json!({"ok": false, "error": "persistent messaging control failed"}),
+                );
+            }
+        };
+        let Some((enabled, changed_ms)) = state else {
+            return tool_error(json!({
+                "ok": false,
+                "error": "role has no disabled messaging state; inspect swarm://messaging",
+            }));
+        };
+        if enabled {
+            return tool_error(json!({
+                "ok": false,
+                "error": "messaging is already enabled; no action was taken",
+            }));
+        }
+        if changed_ms != expected_disabled_ms {
+            return tool_error(json!({
+                "ok": false,
+                "error": "messaging state changed after it was inspected; read swarm://messaging again",
+            }));
+        }
+        let now = Utc::now().timestamp_millis();
+        let cooldown_ms =
+            i64::try_from(self.config.messaging_reenable_cooldown.as_millis()).unwrap_or(i64::MAX);
+        let remaining_ms = cooldown_ms.saturating_sub(now.saturating_sub(changed_ms));
+        if remaining_ms > 0 {
+            return tool_error(json!({
+                "ok": false,
+                "error": "messaging re-enable cooldown is active; stop the current run and wait for an explicit human resume request",
+                "retry_after_seconds": (remaining_ms.saturating_add(999)) / 1000,
+            }));
+        }
         match self
             .store
-            .set_role_messaging(&target, true, sender, "enabled by swarm manager", false)
+            .set_role_messaging(&target, true, sender, &reason, false)
             .await
         {
             Ok(value) => ToolOutcome {
@@ -1212,6 +1266,7 @@ impl Dispatcher {
                     "error": "messaging is disabled for the sending role",
                     "agent": sender,
                     "messaging_enabled": false,
+                    "action_required": "stop_current_run_and_escalate_to_human",
                 })));
             }
             Ok(true) => {}
@@ -1229,6 +1284,7 @@ impl Dispatcher {
                 "ok": false,
                 "error": "messaging is disabled for one or more target roles",
                 "disabled_agents": disabled,
+                "action_required": "stop_current_run_and_escalate_to_human",
             }))),
             Err(error) => {
                 error!(%sender, error = %error, "read target messaging state failed");
@@ -1869,12 +1925,18 @@ mod tests {
             .await;
         assert!(!disabled.is_error, "unexpected: {disabled:?}");
         assert!(!store.role_messaging_enabled("developer").await?);
+        let disabled_at = disabled.value["changed_at"]
+            .as_str()
+            .expect("disable timestamp")
+            .to_string();
 
         let unauthorized_enable = dispatcher
             .enable_messaging(
                 "developer",
                 EnableMessagingArgs {
                     agent: "developer".to_string(),
+                    reason: "unauthorized attempt".to_string(),
+                    expected_disabled_at: disabled_at.clone(),
                 },
             )
             .await;
@@ -1903,6 +1965,10 @@ mod tests {
             )
             .await;
         assert_eq!(blocked_order.value["disabled_agents"], json!(["developer"]));
+        assert_eq!(
+            blocked_order.value["action_required"],
+            json!("stop_current_run_and_escalate_to_human")
+        );
 
         let blocked_report = dispatcher
             .report(
@@ -1944,6 +2010,8 @@ mod tests {
                 "manager",
                 EnableMessagingArgs {
                     agent: "developer".to_string(),
+                    reason: "feedback trigger removed and queue checked".to_string(),
+                    expected_disabled_at: disabled_at,
                 },
             )
             .await;
@@ -1960,6 +2028,100 @@ mod tests {
             .await;
         assert!(!accepted.is_error, "unexpected: {accepted:?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn messaging_enable_requires_fresh_state_and_cooldown() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("messaging-cooldown");
+        let mut config = testutil::fixture_config(&path);
+        config.messaging_reenable_cooldown = std::time::Duration::from_secs(600);
+        let mock = testutil::spawn_mock_hermes(Arc::new(|_, _| {
+            (202, json!({"run_id": "run-after-cooldown"}))
+        }))
+        .await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = mock.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config, store.clone())?;
+
+        let disabled = dispatcher
+            .disable_messaging(
+                "manager",
+                DisableMessagingArgs {
+                    agent: "developer".to_string(),
+                    reason: "loop detected".to_string(),
+                    clear_queue: true,
+                },
+            )
+            .await;
+        let original_disabled_at = disabled.value["changed_at"]
+            .as_str()
+            .expect("disable timestamp")
+            .to_string();
+        let cooldown = dispatcher
+            .enable_messaging(
+                "manager",
+                EnableMessagingArgs {
+                    agent: "developer".to_string(),
+                    reason: "too early".to_string(),
+                    expected_disabled_at: original_disabled_at.clone(),
+                },
+            )
+            .await;
+        assert!(cooldown.is_error);
+        assert!(
+            cooldown.value["retry_after_seconds"]
+                .as_i64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(!store.role_messaging_enabled("developer").await?);
+
+        sqlx::query("UPDATE role_messaging SET changed_ms = changed_ms - 601000 WHERE role = ?")
+            .bind("developer")
+            .execute(store.pool())
+            .await?;
+        let stale = dispatcher
+            .enable_messaging(
+                "manager",
+                EnableMessagingArgs {
+                    agent: "developer".to_string(),
+                    reason: "stale observation".to_string(),
+                    expected_disabled_at: original_disabled_at,
+                },
+            )
+            .await;
+        assert!(stale.is_error);
+        assert!(
+            stale.value["error"]
+                .as_str()
+                .is_some_and(|value| value.contains("changed after"))
+        );
+
+        let (_, changed_ms) = store
+            .role_messaging_state("developer")
+            .await?
+            .expect("messaging state");
+        let refreshed = DateTime::<Utc>::from_timestamp_millis(changed_ms)
+            .expect("valid timestamp")
+            .to_rfc3339();
+        let enabled = dispatcher
+            .enable_messaging(
+                "manager",
+                EnableMessagingArgs {
+                    agent: "developer".to_string(),
+                    reason: "human requested resume after trigger removal".to_string(),
+                    expected_disabled_at: refreshed,
+                },
+            )
+            .await;
+        assert!(!enabled.is_error, "unexpected: {enabled:?}");
+        assert!(store.role_messaging_enabled("developer").await?);
 
         testutil::remove_db_files(&path).await;
         Ok(())
@@ -2675,6 +2837,10 @@ mod tests {
             )
             .await;
         assert!(!disabled.is_error);
+        let disabled_at = disabled.value["changed_at"]
+            .as_str()
+            .expect("disable timestamp")
+            .to_string();
 
         dispatcher.flush_outbox().await?;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -2689,6 +2855,8 @@ mod tests {
                 "manager",
                 EnableMessagingArgs {
                     agent: "developer".to_string(),
+                    reason: "queue hold reviewed by operator".to_string(),
+                    expected_disabled_at: disabled_at,
                 },
             )
             .await;

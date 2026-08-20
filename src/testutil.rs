@@ -103,6 +103,7 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         rate_limit: 100,
         rate_window: Duration::from_secs(60),
         duplicate_window: Duration::from_secs(600),
+        messaging_reenable_cooldown: Duration::ZERO,
         max_inflight_dispatches: 16,
         pending_stale_after: Duration::from_secs(300),
         cleanup_interval: Duration::from_secs(300),

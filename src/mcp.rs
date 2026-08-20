@@ -106,12 +106,23 @@ impl RoleMcp {
             ));
             tools.push(control_tool(
                 "messaging_enable",
-                "Re-enable Swarm MCP message exchange for one executor. Cancelled queue items are never replayed.",
+                "Re-enable one executor only after an explicit human resume request, root-cause verification, and the configured cooldown. Read swarm://messaging immediately first; cancelled queue items are never replayed.",
                 object_schema(
                     &json!({
-                        "agent": {"type": "string", "enum": config.agent_roles}
+                        "agent": {"type": "string", "enum": config.agent_roles},
+                        "reason": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500,
+                            "description": "Concrete root-cause remediation verified after an explicit human resume request."
+                        },
+                        "expected_disabled_at": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": "Exact changed_at value read from swarm://messaging immediately before this call."
+                        }
                     }),
-                    &["agent"],
+                    &["agent", "reason", "expected_disabled_at"],
                 ),
                 false,
             ));
@@ -299,6 +310,7 @@ impl RoleMcp {
                 "rate_limit": config.rate_limit,
                 "rate_window_seconds": config.rate_window.as_secs(),
                 "duplicate_window_seconds": config.duplicate_window.as_secs(),
+                "messaging_reenable_cooldown_seconds": config.messaging_reenable_cooldown.as_secs(),
                 "report_wake_statuses": config.report_wake_statuses,
                 "max_inflight_dispatches": config.max_inflight_dispatches,
                 "telegram_outbox": config.telegram_enabled,
@@ -351,9 +363,10 @@ impl RoleMcp {
                 .join(", ")
         ));
         if self.role == config.manager_role {
-            pieces.push(
-                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered Telegram audits sent by or addressed to that executor. Inspect swarm://messaging before re-enabling. messaging_enable never replays cancelled items.".to_string(),
-            );
+            pieces.push(format!(
+                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered Telegram audits sent by or addressed to that executor. A dispatch rejected by this breaker is a terminal stop condition for the current run: do not call messaging_enable to make an order succeed. Re-enable only in a later turn after an explicit human resume request, verified remediation, a fresh swarm://messaging read, and the {}-second cooldown. messaging_enable never replays cancelled items.",
+                config.messaging_reenable_cooldown.as_secs()
+            ));
         }
         pieces.join("\n\n")
     }
@@ -674,6 +687,16 @@ mod tests {
         assert_eq!(
             schema["properties"]["agent"]["enum"],
             json!(["developer", "lead-developer"])
+        );
+        let enable = mcp
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name == "messaging_enable")
+            .unwrap();
+        let enable_schema = serde_json::to_value(&enable.input_schema).unwrap();
+        assert_eq!(
+            enable_schema["required"],
+            json!(["agent", "reason", "expected_disabled_at"])
         );
         testutil::remove_db_files(&path).await;
         Ok(())

@@ -54,6 +54,7 @@ transport requirements and the official Rust SDK.
 | F-26 | High | The surrounding Hermes profiles allowed 500 outer turns, 250 delegated turns, repeated continuation nudges, and warning-only tool-loop detection | A single bad strategy could consume a large context and repeatedly call tools even though Swarm MCP itself was rate-limited | Swarm deployment now applies per-role turn/output/delegation budgets, one corrective continuation, unattended hard stops, and role-specific tool visibility |
 | F-27 | Medium | Every Hermes model call reloaded all SLC manuals and persisted up to 6000 characters of repeated transcript | Useful task context was displaced by repeated policy text and episodic noise | Lifecycle hooks now load compact active context, save a 1200-character evidence snapshot, and rely on just-in-time document retrieval |
 | F-28 | High | Every `in_progress` report started a new supervisor run | Routine progress could recursively consume manager turns and produce further orders or Telegram traffic | Reports remain durable and audited, but only configurable terminal/material statuses wake a supervisor |
+| F-29 | Critical | A restarted manager resumed an old run and called `messaging_enable` immediately after its order was rejected by the persistent breaker | The agent entrusted with containment could undo containment as a tool-recovery step and restart the same flood | Re-enable now requires a fresh state timestamp, a remediation reason, and a configurable cooldown; breaker errors explicitly require stop-and-human-escalation, and the tool is no longer pinned in the manager's ordinary working set |
 
 ## New architecture
 
@@ -114,10 +115,12 @@ server will not blindly redeliver a side effect whose outcome is unknown.
    coordinated environment update and restart.
 
 5. **The role messaging circuit breaker is manual.** The manager can now block
-   either direction for an executor and cancel its audit queue, but transport
-   failure thresholds do not automatically trip that state. Timeouts, rate
-   limits, permanent-4xx classification, and concurrency bounds prevent
-   unbounded pressure; automatic half-open recovery remains future work.
+   either direction for an executor and cancel its audit queue. Re-enable is
+   stale-state-checked and cooldown-gated, but the server cannot prove that an
+   MCP call was caused by a human sentence; the manager profile therefore treats
+   breaker rejection as terminal and discovers the re-enable tool only for an
+   explicit later resume turn. Transport failure thresholds do not automatically
+   trip the breaker; automatic half-open recovery remains future work.
 
 6. **Legacy MCP sessions are process-local.** Request admission bounds creation
    rate, but legacy clients that never send session deletion can retain session

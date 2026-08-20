@@ -104,6 +104,14 @@ records. With `clear_queue=false`, pending audits involving the disabled role
 are held without occupying the delivery batch and resume only after the role is
 explicitly enabled. Delivered audit history remains intact.
 
+Starting with 0.4.0, re-enable is guarded against an agent bypassing a breaker
+merely to make its rejected order succeed. `messaging_enable` requires a
+non-empty remediation reason and the exact `changed_at` value from a fresh
+`swarm://messaging` read. It is rejected until
+`SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS` expires, and a stale observation is
+rejected atomically. A breaker rejection is a stop-and-escalate condition for
+the current agent run; resume belongs to a later, explicit human request.
+
 Telegram delivery is asynchronous. A successful tool response reports an
 `outbox_id`; temporary Telegram failure does not turn a successfully accepted
 agent run into a failed command. Telegram delivery is at-least-once, so a crash
@@ -209,7 +217,7 @@ Important groups:
 | Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
 | Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_ORDER_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
 | Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY` |
-| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS`, `SWARM_REPORT_WAKE_STATUSES` |
+| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS`, `SWARM_REPORT_WAKE_STATUSES` |
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
 | Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |

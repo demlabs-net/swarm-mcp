@@ -86,6 +86,7 @@ pub struct Config {
     pub rate_limit: i64,
     pub rate_window: Duration,
     pub duplicate_window: Duration,
+    pub messaging_reenable_cooldown: Duration,
     pub max_inflight_dispatches: usize,
     pub pending_stale_after: Duration,
     pub cleanup_interval: Duration,
@@ -579,6 +580,7 @@ impl Config {
             rate_limit: positive(env, "SWARM_DISPATCH_RATE_LIMIT")?,
             rate_window: seconds(env, "SWARM_DISPATCH_RATE_WINDOW_SECONDS")?,
             duplicate_window: seconds(env, "SWARM_DUPLICATE_WINDOW_SECONDS")?,
+            messaging_reenable_cooldown: seconds(env, "SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS")?,
             max_inflight_dispatches: positive(env, "SWARM_MAX_INFLIGHT_DISPATCHES")?,
             pending_stale_after: seconds(env, "SWARM_PENDING_STALE_SECONDS")?,
             cleanup_interval: seconds(env, "SWARM_CLEANUP_INTERVAL_SECONDS")?,
@@ -678,6 +680,10 @@ impl Config {
         ensure!(
             config.duplicate_window <= Duration::from_secs(86_400),
             "SWARM_DUPLICATE_WINDOW_SECONDS must not exceed 86400"
+        );
+        ensure!(
+            config.messaging_reenable_cooldown <= Duration::from_secs(86_400),
+            "SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS must not exceed 86400"
         );
         ensure!(
             config.recent_operations_limit <= 1_000,
@@ -1127,6 +1133,10 @@ mod tests {
         env.insert("SWARM_DISPATCH_RATE_LIMIT".into(), "100".into());
         env.insert("SWARM_DISPATCH_RATE_WINDOW_SECONDS".into(), "60".into());
         env.insert("SWARM_DUPLICATE_WINDOW_SECONDS".into(), "600".into());
+        env.insert(
+            "SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS".into(),
+            "600".into(),
+        );
         env.insert("SWARM_MAX_INFLIGHT_DISPATCHES".into(), "16".into());
         env.insert("SWARM_PENDING_STALE_SECONDS".into(), "300".into());
         env.insert("SWARM_CLEANUP_INTERVAL_SECONDS".into(), "300".into());
@@ -1348,6 +1358,7 @@ mod tests {
             ("SWARM_TELEGRAM_MESSAGE_LIMIT", "100"),
             ("SWARM_API_TIMEOUT_SECONDS", "600"),
             ("SWARM_PENDING_STALE_SECONDS", "10"),
+            ("SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS", "90000"),
         ];
         for (name, value) in cases {
             let mut env = valid_env();

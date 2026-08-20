@@ -210,6 +210,10 @@ mod tests {
         env.insert("SWARM_DISPATCH_RATE_LIMIT".into(), "100".into());
         env.insert("SWARM_DISPATCH_RATE_WINDOW_SECONDS".into(), "60".into());
         env.insert("SWARM_DUPLICATE_WINDOW_SECONDS".into(), "600".into());
+        env.insert(
+            "SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS".into(),
+            "600".into(),
+        );
         env.insert("SWARM_MAX_INFLIGHT_DISPATCHES".into(), "16".into());
         env.insert("SWARM_PENDING_STALE_SECONDS".into(), "300".into());
         env.insert("SWARM_CLEANUP_INTERVAL_SECONDS".into(), "300".into());
