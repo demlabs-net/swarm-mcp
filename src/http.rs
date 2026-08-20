@@ -10,14 +10,17 @@ use axum::{
     Extension, Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    response::sse::{Event as SseEvent, KeepAlive, Sse},
     routing::{get, post},
 };
 use chrono::DateTime;
+use futures::stream::{StreamExt, once};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService,
+    session::local::LocalSessionManager,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -157,6 +160,32 @@ async fn serve_with_shutdown(
     Ok(())
 }
 
+/// Плейсхолдер SSE для session-less GET: клиенты (go-sdk / Yandex AI
+/// Studio) открывают event stream до initialize. Сессию создаёт сам rmcp при
+/// первом POST initialize (без Mcp-Session-Id); после initialize клиент
+/// открывает настоящий стрим сессии GET-ом уже с session id. Здесь просто
+/// держим соединение живым (ответы на запросы приходят в теле POST).
+async fn sse_bootstrap(
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_get = request.method() == Method::GET;
+    let accept_sse = request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+    let has_session = request.headers().contains_key("mcp-session-id");
+    if is_get && accept_sse && !has_session {
+        return Sse::new(futures::stream::empty::<
+            Result<SseEvent, std::convert::Infallible>,
+        >())
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response();
+    }
+    next.run(request).await
+}
+
 pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToken) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
@@ -188,6 +217,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToke
         let protected =
             Router::new()
                 .nest_service(path, service)
+                .layer(middleware::from_fn(sse_bootstrap))
                 .layer(middleware::from_fn_with_state(
                     RoleAuth {
                         role: role.clone(),
