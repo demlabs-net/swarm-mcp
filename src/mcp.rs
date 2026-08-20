@@ -142,7 +142,7 @@ impl RoleMcp {
                 .collect::<Vec<_>>();
             tools.push(tool(
                 "report",
-                "Report progress, completion, failure, or a blocker to an authorized supervisor.",
+                "Persist and audit progress, completion, failure, or a blocker for an authorized supervisor. Progress does not start a supervisor run; configured terminal statuses do.",
                 object_schema(
                     &json!({
                         "summary": {
@@ -152,8 +152,9 @@ impl RoleMcp {
                         },
                         "task_id": {
                             "type": "string",
+                            "minLength": 1,
                             "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
-                            "default": ""
+                            "description": "Task identifier from the order being reported."
                         },
                         "status": {
                             "type": "string",
@@ -167,7 +168,7 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["summary"],
+                    &["summary", "task_id"],
                 ),
             ));
             tools.push(tool(
@@ -176,6 +177,7 @@ impl RoleMcp {
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": peers},
+                        "task_id": task_id_schema(),
                         "message": {
                             "type": "string",
                             "minLength": 1,
@@ -183,7 +185,7 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["agent", "message"],
+                    &["agent", "task_id", "message"],
                 ),
             ));
             tools.push(tool(
@@ -191,6 +193,7 @@ impl RoleMcp {
                 "Send the same coordination message to every other executor.",
                 object_schema(
                     &json!({
+                        "task_id": task_id_schema(),
                         "message": {
                             "type": "string",
                             "minLength": 1,
@@ -198,7 +201,7 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["message"],
+                    &["task_id", "message"],
                 ),
             ));
         }
@@ -295,6 +298,8 @@ impl RoleMcp {
                 "idempotency_keys": true,
                 "rate_limit": config.rate_limit,
                 "rate_window_seconds": config.rate_window.as_secs(),
+                "duplicate_window_seconds": config.duplicate_window.as_secs(),
+                "report_wake_statuses": config.report_wake_statuses,
                 "max_inflight_dispatches": config.max_inflight_dispatches,
                 "telegram_outbox": config.telegram_enabled,
                 "telegram_bot_mode": match config.telegram_bot_mode {
@@ -332,10 +337,19 @@ impl RoleMcp {
         }
         pieces.push(
             format!(
-                "Use a unique, stable idempotency_key when retrying any order, report, or message; never recycle it for another logical operation. A dispatch that definitively failed releases its key, so retrying with the same key re-executes; accepted, partial, and indeterminate results replay. Idempotency records are retained for {} days. Read swarm://operations to inspect accepted, partial, and indeterminate dispatches before retrying.",
-                config.operation_retention_days
+                "Use a unique, stable idempotency_key when retrying any order, report, or message; never recycle it for another logical operation. A dispatch that definitively failed releases its key, so retrying with the same key re-executes; accepted, partial, and indeterminate results replay. The server also suppresses content-identical dispatches for {} seconds even when the caller changes or omits the key. Idempotency records are retained for {} days. Read swarm://operations before retrying.",
+                config.duplicate_window.as_secs(), config.operation_retention_days
             )
         );
+        pieces.push(format!(
+            "Progress reports are persisted and audited without starting a supervisor run. Only these terminal/material statuses wake the supervisor: {}.",
+            config
+                .report_wake_statuses
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
         if self.role == config.manager_role {
             pieces.push(
                 "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered Telegram audits sent by or addressed to that executor. Inspect swarm://messaging before re-enabling. messaging_enable never replays cancelled items.".to_string(),
@@ -570,6 +584,15 @@ fn idempotency_schema() -> Value {
         "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
         "pattern": "^[A-Za-z0-9_.:-]+$",
         "description": "Stable key for safe retries. Reusing it with different arguments is rejected."
+    })
+}
+
+fn task_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
+        "description": "Task identifier from the active order; peer coordination without task lineage is rejected."
     })
 }
 
@@ -846,6 +869,35 @@ mod tests {
     #[tokio::test]
     async fn executor_client_gets_its_own_resources() -> anyhow::Result<()> {
         let (base, config, path) = spawn_live_router().await?;
+        let manager = rmcp::model::ClientInfo::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("mcp-e2e-manager", env!("CARGO_PKG_VERSION")),
+        )
+        .serve(rmcp::transport::StreamableHttpClientTransport::with_client(
+            reqwest::Client::builder().build()?,
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                format!("{base}/mcp/manager"),
+            )
+            .auth_header(config.agents["manager"].mcp_token.expose()),
+        ))
+        .await?;
+        let assignment =
+            manager
+                .call_tool(CallToolRequestParams::new("order").with_arguments(
+                    serde_json::from_value(json!({
+                        "agent": "lead-developer",
+                        "command": "Review the assigned task"
+                    }))?,
+                ))
+                .await?;
+        let task_id = assignment
+            .structured_content
+            .as_ref()
+            .and_then(|value| value["task_id"].as_str())
+            .expect("assigned task id")
+            .to_string();
+        manager.cancel().await?;
+
         let client = rmcp::model::ClientInfo::new(
             rmcp::model::ClientCapabilities::default(),
             rmcp::model::Implementation::new("mcp-e2e", env!("CARGO_PKG_VERSION")),
@@ -870,19 +922,23 @@ mod tests {
         let report =
             client
                 .call_tool(CallToolRequestParams::new("report").with_arguments(
-                    serde_json::from_str(r#"{"summary":"done","task_id":"t1"}"#)?,
+                    serde_json::from_value(json!({
+                        "summary": "done",
+                        "task_id": task_id,
+                    }))?,
                 ))
                 .await?;
         let report_value = report.structured_content.expect("structured result");
         assert_eq!(report_value["ok"], json!(true));
         assert_eq!(report_value["recipient"], json!("manager"));
 
-        let msg =
-            client
-                .call_tool(CallToolRequestParams::new("msg_to").with_arguments(
-                    serde_json::from_str(r#"{"agent":"developer","message":"ping"}"#)?,
-                ))
-                .await?;
+        let msg = client
+            .call_tool(
+                CallToolRequestParams::new("msg_to").with_arguments(serde_json::from_str(
+                    &format!(r#"{{"agent":"developer","task_id":"{task_id}","message":"ping"}}"#),
+                )?),
+            )
+            .await?;
         let msg_value = msg.structured_content.expect("structured result");
         assert_eq!(msg_value["ok"], json!(true));
         assert_eq!(msg_value["agent"], json!("developer"));

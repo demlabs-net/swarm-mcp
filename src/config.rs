@@ -85,12 +85,14 @@ pub struct Config {
     pub operation_retention_days: i64,
     pub rate_limit: i64,
     pub rate_window: Duration,
+    pub duplicate_window: Duration,
     pub max_inflight_dispatches: usize,
     pub pending_stale_after: Duration,
     pub cleanup_interval: Duration,
     pub mcp_request_rate_limit: usize,
     pub mcp_request_rate_window: Duration,
     pub report_statuses: Vec<String>,
+    pub report_wake_statuses: BTreeSet<String>,
     pub telegram_enabled: bool,
     pub telegram_bot_mode: TelegramBotMode,
     pub telegram_bot_token: Option<Secret>,
@@ -376,6 +378,20 @@ impl Config {
             report_statuses.iter().any(|status| status == "completed"),
             "SWARM_REPORT_STATUSES must contain completed because it is the report default"
         );
+        let report_wake_statuses = csv_required(env, "SWARM_REPORT_WAKE_STATUSES")?
+            .into_iter()
+            .map(|status| status.to_lowercase())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            report_wake_statuses.contains("completed"),
+            "SWARM_REPORT_WAKE_STATUSES must contain completed"
+        );
+        ensure!(
+            report_wake_statuses
+                .iter()
+                .all(|status| report_statuses.contains(status)),
+            "SWARM_REPORT_WAKE_STATUSES must be a subset of SWARM_REPORT_STATUSES"
+        );
 
         let telegram_enabled = bool_env(env, "SWARM_TELEGRAM_ENABLED", false)?;
         let telegram_bot_mode = match optional(env, "SWARM_TELEGRAM_BOT_MODE")
@@ -499,8 +515,8 @@ impl Config {
         validate_template(
             "SWARM_PEER_PROMPT_TEMPLATE",
             &peer_template,
-            &["message_id", "sender", "recipient", "message"],
-            &["message_id", "sender", "message"],
+            &["message_id", "sender", "recipient", "task_id", "message"],
+            &["message_id", "sender", "task_id", "message"],
         )?;
         let telegram_inbound_template = required(env, "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE")?;
         validate_template(
@@ -562,12 +578,14 @@ impl Config {
             operation_retention_days: positive(env, "SWARM_OPERATION_RETENTION_DAYS")?,
             rate_limit: positive(env, "SWARM_DISPATCH_RATE_LIMIT")?,
             rate_window: seconds(env, "SWARM_DISPATCH_RATE_WINDOW_SECONDS")?,
+            duplicate_window: seconds(env, "SWARM_DUPLICATE_WINDOW_SECONDS")?,
             max_inflight_dispatches: positive(env, "SWARM_MAX_INFLIGHT_DISPATCHES")?,
             pending_stale_after: seconds(env, "SWARM_PENDING_STALE_SECONDS")?,
             cleanup_interval: seconds(env, "SWARM_CLEANUP_INTERVAL_SECONDS")?,
             mcp_request_rate_limit: positive(env, "SWARM_MCP_REQUEST_RATE_LIMIT")?,
             mcp_request_rate_window: seconds(env, "SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS")?,
             report_statuses,
+            report_wake_statuses,
             telegram_enabled,
             telegram_bot_mode,
             telegram_bot_token,
@@ -656,6 +674,10 @@ impl Config {
         ensure!(
             config.rate_window <= Duration::from_secs(3_600),
             "SWARM_DISPATCH_RATE_WINDOW_SECONDS must not exceed 3600"
+        );
+        ensure!(
+            config.duplicate_window <= Duration::from_secs(86_400),
+            "SWARM_DUPLICATE_WINDOW_SECONDS must not exceed 86400"
         );
         ensure!(
             config.recent_operations_limit <= 1_000,
@@ -1064,6 +1086,10 @@ mod tests {
             "completed,failed,in_progress".into(),
         );
         env.insert(
+            "SWARM_REPORT_WAKE_STATUSES".into(),
+            "completed,failed".into(),
+        );
+        env.insert(
             "SWARM_AUTHORITY_MCP_INSTRUCTIONS".into(),
             "you order {role} {targets}".into(),
         );
@@ -1077,7 +1103,7 @@ mod tests {
         );
         env.insert(
             "SWARM_PEER_PROMPT_TEMPLATE".into(),
-            "{message_id}|{sender}|{recipient}|{message}".into(),
+            "{message_id}|{sender}|{recipient}|{task_id}|{message}".into(),
         );
         env.insert(
             "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE".into(),
@@ -1100,6 +1126,7 @@ mod tests {
         env.insert("SWARM_OPERATION_RETENTION_DAYS".into(), "30".into());
         env.insert("SWARM_DISPATCH_RATE_LIMIT".into(), "100".into());
         env.insert("SWARM_DISPATCH_RATE_WINDOW_SECONDS".into(), "60".into());
+        env.insert("SWARM_DUPLICATE_WINDOW_SECONDS".into(), "600".into());
         env.insert("SWARM_MAX_INFLIGHT_DISPATCHES".into(), "16".into());
         env.insert("SWARM_PENDING_STALE_SECONDS".into(), "300".into());
         env.insert("SWARM_CLEANUP_INTERVAL_SECONDS".into(), "300".into());
@@ -1341,6 +1368,20 @@ mod tests {
         let mut env = valid_env();
         env.insert("SWARM_REPORT_STATUSES".into(), "failed,in_progress".into());
         assert!(load(&env).is_err(), "completed is the report default");
+
+        // wake statuses must be valid report statuses and include completion.
+        let mut env = valid_env();
+        env.insert("SWARM_REPORT_WAKE_STATUSES".into(), "failed".into());
+        assert!(
+            load(&env).is_err(),
+            "completed reports must wake a supervisor"
+        );
+        let mut env = valid_env();
+        env.insert(
+            "SWARM_REPORT_WAKE_STATUSES".into(),
+            "completed,unknown".into(),
+        );
+        assert!(load(&env).is_err(), "wake statuses must be a report subset");
 
         // the DB path must be absolute.
         let mut env = valid_env();

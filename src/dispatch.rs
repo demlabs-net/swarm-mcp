@@ -176,7 +176,6 @@ pub struct BroadcastArgs {
 #[serde(deny_unknown_fields)]
 pub struct ReportArgs {
     pub summary: String,
-    #[serde(default)]
     pub task_id: String,
     #[serde(default = "completed_status")]
     pub status: String,
@@ -188,6 +187,7 @@ pub struct ReportArgs {
 #[serde(deny_unknown_fields)]
 pub struct MessageArgs {
     pub agent: String,
+    pub task_id: String,
     pub message: String,
     pub idempotency_key: Option<String>,
 }
@@ -195,6 +195,7 @@ pub struct MessageArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageAllArgs {
+    pub task_id: String,
     pub message: String,
     pub idempotency_key: Option<String>,
 }
@@ -296,7 +297,10 @@ impl Dispatcher {
         };
         let task_id = format!("task_{}", Uuid::new_v4().simple());
         let targets = vec![target.clone()];
-        let fingerprint = fingerprint(&json!({"target": target, "command": command}));
+        let fingerprint = fingerprint(&json!({
+            "target": target,
+            "command": normalize_dispatch_text(&command),
+        }));
         if let Some(outcome) = self
             .reserve_or_replay(
                 &task_id,
@@ -379,7 +383,10 @@ impl Dispatcher {
         if let Some(outcome) = self.messaging_block(sender, &targets).await {
             return outcome;
         }
-        let fingerprint = fingerprint(&json!({"targets": targets, "command": command}));
+        let fingerprint = fingerprint(&json!({
+            "targets": targets,
+            "command": normalize_dispatch_text(&command),
+        }));
         if let Some(outcome) = self
             .reserve_or_replay(
                 &task_id,
@@ -457,13 +464,9 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        let task_id = if args.task_id.trim().is_empty() {
-            "untracked".to_string()
-        } else {
-            match validate_identifier(&args.task_id, "task_id") {
-                Ok(value) => value,
-                Err(error) => return tool_error_message(error),
-            }
+        let task_id = match validate_identifier(&args.task_id, "task_id") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
         };
         let status = args.status.trim().to_lowercase();
         if !self.config.report_statuses.contains(&status) {
@@ -472,6 +475,9 @@ impl Dispatcher {
                 "error": "unsupported report status",
                 "allowed": self.config.report_statuses,
             }));
+        }
+        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
+            return outcome;
         }
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
@@ -483,7 +489,7 @@ impl Dispatcher {
             "recipient": recipient,
             "task_id": task_id,
             "status": status,
-            "summary": summary,
+            "summary": normalize_dispatch_text(&summary),
         }));
         if let Some(outcome) = self
             .reserve_or_replay(
@@ -497,6 +503,26 @@ impl Dispatcher {
             .await
         {
             return outcome;
+        }
+        if !self.config.report_wake_statuses.contains(&status) {
+            let mut result = json!({
+                "ok": true,
+                "report_id": dispatch_id,
+                "recipient": recipient,
+                "task_id": task_id,
+                "status": status,
+                "supervisor_woken": false,
+            });
+            let audit = self.audit(
+                sender,
+                "REPORT",
+                &recipient,
+                &format!("{task_id} [{status}]\n{summary}"),
+                &mut result,
+            );
+            return self
+                .finish(&dispatch_id, "accepted", &result, audit, false)
+                .await;
         }
         let message = match render_template(
             &self.config.report_template,
@@ -538,6 +564,7 @@ impl Dispatcher {
                     "recipient_run_id": run_id,
                     "task_id": task_id,
                     "status": status,
+                    "supervisor_woken": true,
                 });
                 let audit = self.audit(
                     sender,
@@ -590,13 +617,24 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
+        let task_id = match validate_identifier(&args.task_id, "task_id") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
+            return outcome;
+        }
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let targets = vec![target.clone()];
-        let fingerprint = fingerprint(&json!({"target": target, "message": message}));
+        let fingerprint = fingerprint(&json!({
+            "target": target,
+            "task_id": task_id,
+            "message": normalize_dispatch_text(&message),
+        }));
         if let Some(outcome) = self
             .reserve_or_replay(
                 &message_id,
@@ -616,6 +654,7 @@ impl Dispatcher {
                 ("message_id", message_id.as_str()),
                 ("sender", sender),
                 ("recipient", target.as_str()),
+                ("task_id", task_id.as_str()),
                 ("message", message.as_str()),
             ]),
         ) {
@@ -634,6 +673,7 @@ impl Dispatcher {
                 let mut result = json!({
                     "ok": true,
                     "message_id": message_id,
+                    "task_id": task_id,
                     "agent": target,
                     "run_id": run_id,
                 });
@@ -660,6 +700,10 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
+        let task_id = match validate_identifier(&args.task_id, "task_id") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -681,7 +725,14 @@ impl Dispatcher {
         if let Some(outcome) = self.messaging_block(sender, &targets).await {
             return outcome;
         }
-        let fingerprint = fingerprint(&json!({"targets": targets, "message": message}));
+        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
+            return outcome;
+        }
+        let fingerprint = fingerprint(&json!({
+            "targets": targets,
+            "task_id": task_id,
+            "message": normalize_dispatch_text(&message),
+        }));
         if let Some(outcome) = self
             .reserve_or_replay(
                 &message_id,
@@ -702,6 +753,7 @@ impl Dispatcher {
                     ("message_id", message_id.as_str()),
                     ("sender", sender),
                     ("recipient", target.as_str()),
+                    ("task_id", task_id.as_str()),
                     ("message", message.as_str()),
                 ]),
             );
@@ -723,6 +775,7 @@ impl Dispatcher {
         let mut result = json!({
             "ok": ok,
             "message_id": message_id,
+            "task_id": task_id,
             "results": summary.results,
         });
         let audit = self.audit(
@@ -1197,6 +1250,25 @@ impl Dispatcher {
         Ok(())
     }
 
+    async fn task_lineage_block(&self, sender: &str, task_id: &str) -> Option<ToolOutcome> {
+        match self.store.task_assigned_to(task_id, sender).await {
+            Ok(true) => None,
+            Ok(false) => Some(tool_error(json!({
+                "ok": false,
+                "error": "task_id is not an accepted Swarm order assigned to the sending role",
+                "task_id": task_id,
+                "sender": sender,
+            }))),
+            Err(error) => {
+                error!(%sender, %task_id, error = %error, "task lineage lookup failed");
+                Some(tool_error(json!({
+                    "ok": false,
+                    "error": "task lineage is temporarily unavailable",
+                })))
+            }
+        }
+    }
+
     fn control_target(&self, value: &str) -> Result<String, ToolOutcome> {
         let target = value.trim().to_lowercase();
         if !self.config.agent_roles.contains(&target) {
@@ -1230,7 +1302,7 @@ impl Dispatcher {
     ) -> Option<ToolOutcome> {
         match self
             .store
-            .reserve_dispatch(
+            .reserve_dispatch_guarded(
                 id,
                 sender,
                 kind,
@@ -1239,6 +1311,7 @@ impl Dispatcher {
                 fingerprint,
                 self.config.rate_limit,
                 self.config.rate_window,
+                self.config.duplicate_window,
             )
             .await
         {
@@ -1487,6 +1560,10 @@ fn fingerprint(value: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.to_string());
     format!("{:x}", hasher.finalize())
+}
+
+fn normalize_dispatch_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub(crate) fn render_template(
@@ -1849,6 +1926,7 @@ mod tests {
                 "lead-developer",
                 MessageArgs {
                     agent: "developer".to_string(),
+                    task_id: "task-blocked".to_string(),
                     message: "must not arrive".to_string(),
                     idempotency_key: None,
                 },
@@ -1959,13 +2037,48 @@ mod tests {
                 .contains("not a supervisor")
         );
 
+        let unassigned = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "invented lineage".to_string(),
+                    task_id: "task-not-assigned".to_string(),
+                    status: "completed".to_string(),
+                    recipient: Some("lead-developer".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(unassigned.is_error);
+        assert!(
+            unassigned.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("not an accepted Swarm order")
+        );
+
+        let assignment = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "Implement the assigned work".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let task_id = assignment.value["task_id"]
+            .as_str()
+            .expect("assigned task id")
+            .to_string();
+
         // lead-developer supervises developer (reverse ACL lookup).
         let outcome = dispatcher
             .report(
                 "developer",
                 ReportArgs {
                     summary: "done".to_string(),
-                    task_id: "t1".to_string(),
+                    task_id,
                     status: "completed".to_string(),
                     recipient: Some("lead-developer".to_string()),
                     idempotency_key: None,
@@ -1989,6 +2102,62 @@ mod tests {
             )
             .await;
         assert!(outcome.is_error);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn progress_report_is_persisted_without_waking_supervisor() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (202, json!({"run_id": "unexpected"}))
+        }))
+        .await?;
+
+        let assignment = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "Reach one tested checkpoint".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let task_id = assignment.value["task_id"]
+            .as_str()
+            .expect("assigned task id")
+            .to_string();
+
+        let outcome = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "Implementation reached the tested checkpoint".to_string(),
+                    task_id,
+                    status: "in_progress".to_string(),
+                    recipient: Some("lead-developer".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+
+        assert!(!outcome.is_error, "unexpected: {outcome:?}");
+        assert_eq!(outcome.value["supervisor_woken"], json!(false));
+        assert!(outcome.value.get("recipient_run_id").is_none());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the assignment starts one run; progress must not start another"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(outcome.value["report_id"].as_str().expect("report id"))
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "accepted");
+
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -2023,6 +2192,7 @@ mod tests {
             .message_all(
                 "developer",
                 MessageAllArgs {
+                    task_id: "task-no-peers".to_string(),
                     message: "hi".to_string(),
                     idempotency_key: None,
                 },
@@ -2099,6 +2269,47 @@ mod tests {
             .await;
         assert_eq!(third.value["deduplicated"], json!(true));
         assert_eq!(third.value["task_id"], json!(second_id));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_content_duplicate_is_suppressed_without_caller_key() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let behavior: testutil::MockHermes = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (202, json!({"run_id": "run-once"}))
+        });
+        let (dispatcher, _store, path) = dispatcher_with_mock(behavior).await?;
+
+        let first = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "Implement the bounded task".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let replay = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "  Implement   the bounded task\n".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+
+        assert!(!first.is_error, "unexpected: {first:?}");
+        assert!(!replay.is_error, "unexpected: {replay:?}");
+        assert_eq!(replay.value["deduplicated"], json!(true));
+        assert_eq!(replay.value["task_id"], first.value["task_id"]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -2185,11 +2396,27 @@ mod tests {
         let (dispatcher, store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-msg"})))).await?;
 
+        let assignment = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "Coordinate one implementation detail".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let task_id = assignment.value["task_id"]
+            .as_str()
+            .expect("assigned task id")
+            .to_string();
+
         let outcome = dispatcher
             .message(
                 "developer",
                 MessageArgs {
                     agent: "lead-developer".to_string(),
+                    task_id,
                     message: " ping ".to_string(),
                     idempotency_key: None,
                 },
@@ -2217,6 +2444,7 @@ mod tests {
                 "developer",
                 MessageArgs {
                     agent: "developer".to_string(),
+                    task_id: "task-self".to_string(),
                     message: "self".to_string(),
                     idempotency_key: None,
                 },
@@ -2228,6 +2456,7 @@ mod tests {
                 "developer",
                 MessageArgs {
                     agent: "manager".to_string(),
+                    task_id: "task-not-peer".to_string(),
                     message: "not a peer".to_string(),
                     idempotency_key: None,
                 },
@@ -2239,7 +2468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_all_aggregates_partial_results() -> anyhow::Result<()> {
+    async fn message_all_records_indeterminate_peer_delivery() -> anyhow::Result<()> {
         let behavior: testutil::MockHermes = Arc::new(|bearer, _| {
             if bearer.ends_with("api-key-developer") {
                 (202, json!({"run_id": "run-dev"}))
@@ -2249,11 +2478,28 @@ mod tests {
         });
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
-        // manager's peers are every executor; lead-developer fails with a server error.
+        let assignment = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "Coordinate the assigned task".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let task_id = assignment.value["task_id"]
+            .as_str()
+            .expect("assigned task id")
+            .to_string();
+
+        // The developer's only peer is lead-developer, whose server error is
+        // indeterminate because the downstream may still have accepted it.
         let outcome = dispatcher
             .message_all(
-                "manager",
+                "developer",
                 MessageAllArgs {
+                    task_id,
                     message: "sync".to_string(),
                     idempotency_key: None,
                 },
@@ -2261,10 +2507,6 @@ mod tests {
             .await;
         assert!(outcome.is_error);
         assert_eq!(outcome.value["ok"], json!(false));
-        assert_eq!(
-            outcome.value["results"]["developer"]["run_id"],
-            json!("run-dev")
-        );
         assert_eq!(
             outcome.value["results"]["lead-developer"]["status"],
             json!("indeterminate")
@@ -2274,7 +2516,7 @@ mod tests {
             .bind(message_id)
             .fetch_one(store.pool())
             .await?;
-        assert_eq!(status, "partial");
+        assert_eq!(status, "indeterminate");
         testutil::remove_db_files(&path).await;
         Ok(())
     }

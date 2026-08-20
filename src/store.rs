@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const TELEGRAM_OFFSET_KEY: &str = "telegram_update_offset";
 const TELEGRAM_POLL_SUCCESS_KEY: &str = "telegram_poll_success";
 
@@ -394,6 +394,25 @@ impl Store {
         }))
     }
 
+    pub async fn task_assigned_to(&self, task_id: &str, role: &str) -> anyhow::Result<bool> {
+        let assigned: i64 = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                 SELECT 1
+                 FROM dispatches d
+                 JOIN dispatch_targets t ON t.dispatch_id = d.id
+                 WHERE d.id = ?
+                   AND d.kind IN ('order', 'order_all')
+                   AND d.status IN ('accepted', 'partial', 'indeterminate')
+                   AND t.target = ?
+               )"#,
+        )
+        .bind(task_id)
+        .bind(role)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(assigned != 0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn reserve_dispatch(
         &self,
@@ -405,6 +424,33 @@ impl Store {
         fingerprint: &str,
         rate_limit: i64,
         rate_window: Duration,
+    ) -> anyhow::Result<Reservation> {
+        self.reserve_dispatch_guarded(
+            id,
+            sender,
+            kind,
+            targets,
+            idempotency_key,
+            fingerprint,
+            rate_limit,
+            rate_window,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_dispatch_guarded(
+        &self,
+        id: &str,
+        sender: &str,
+        kind: &str,
+        targets: &[String],
+        idempotency_key: Option<&str>,
+        fingerprint: &str,
+        rate_limit: i64,
+        rate_window: Duration,
+        duplicate_window: Duration,
     ) -> anyhow::Result<Reservation> {
         let _guard = self.reservation_lock.lock().await;
         let mut tx = self.pool.begin().await?;
@@ -448,6 +494,33 @@ impl Store {
         }
 
         let now = Utc::now().timestamp_millis();
+        if !duplicate_window.is_zero() {
+            let duplicate_window_ms =
+                i64::try_from(duplicate_window.as_millis()).unwrap_or(i64::MAX);
+            let duplicate_cutoff = now.saturating_sub(duplicate_window_ms);
+            if let Some(row) = sqlx::query(
+                r#"SELECT id, result_json FROM dispatches
+                   WHERE sender = ? AND kind = ? AND fingerprint = ?
+                     AND status != 'failed' AND created_ms >= ?
+                   ORDER BY created_ms DESC LIMIT 1"#,
+            )
+            .bind(sender)
+            .bind(kind)
+            .bind(fingerprint)
+            .bind(duplicate_cutoff)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                let existing_id = row.get::<String, _>("id");
+                let result = row.try_get::<Option<String>, _>("result_json")?;
+                return Ok(match result {
+                    Some(value) => Reservation::Existing(serde_json::from_str(&value)?),
+                    None => Reservation::Pending {
+                        dispatch_id: existing_id,
+                    },
+                });
+            }
+        }
         let window_ms = i64::try_from(rate_window.as_millis()).unwrap_or(i64::MAX);
         let cutoff = now.saturating_sub(window_ms);
         sqlx::query("DELETE FROM rate_events WHERE created_ms < ?")
@@ -1165,6 +1238,7 @@ const SCHEMA: &[&str] = &[
        )"#,
     "CREATE UNIQUE INDEX IF NOT EXISTS dispatches_idempotency_idx ON dispatches(sender, kind, idempotency_key) WHERE idempotency_key IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS dispatches_sender_idx ON dispatches(sender, created_ms DESC)",
+    "CREATE INDEX IF NOT EXISTS dispatches_fingerprint_idx ON dispatches(sender, kind, fingerprint, created_ms DESC)",
     r#"CREATE TABLE IF NOT EXISTS dispatch_targets (
          dispatch_id TEXT NOT NULL REFERENCES dispatches(id) ON DELETE CASCADE,
          target TEXT NOT NULL,

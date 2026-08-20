@@ -36,7 +36,7 @@ single-target `order`; the generated JSON Schema enumerates exactly the targets
 allowed to that caller. Reverse ACL lookup determines the valid `report`
 recipients. Executors may coordinate only with other executors.
 
-Every mutating tool accepts an optional `idempotency_key`. Callers should reuse
+Every dispatch tool accepts an optional `idempotency_key`. Callers should reuse
 the same key when retrying the same logical action. Reusing a key with different
 arguments is rejected. A dispatch that **definitively failed** (the agent API
 rejected it, nothing was started) releases its key: retrying with the same key
@@ -44,6 +44,23 @@ re-executes. `accepted`, `partial`, and `indeterminate` results replay — an
 `indeterminate` result means the downstream may have accepted the operation, so
 do not re-run it; inspect `swarm://operations` first. Keys must not be recycled
 for unrelated work; their records expire with `SWARM_OPERATION_RETENTION_DAYS`.
+Independently of caller keys, the server suppresses a content-identical
+sender/kind/target dispatch inside `SWARM_DUPLICATE_WINDOW_SECONDS`. Whitespace
+differences do not bypass this circuit breaker. A genuinely new correction must
+contain new evidence or a changed action.
+
+Starting with 0.3.0, `report`, `msg_to`, and `msg_all` require the originating
+`task_id`. This keeps
+progress, handoffs, and peer coordination attached to one work item; untracked
+chat cannot wake another Hermes run. The server verifies that the ID belongs to
+an accepted `order`/`order_all` which actually targeted the sending role, so a
+model cannot invent a fresh ID to evade duplicate suppression.
+
+Progress reports are durable and Telegram-audited but do not automatically
+start another supervisor run. Only statuses listed in
+`SWARM_REPORT_WAKE_STATUSES` wake the supervisor; the production default is
+`completed,blocked,failed`. This separates observation from orchestration and
+prevents a stream of routine updates from recursively consuming manager turns.
 
 ## Resources
 
@@ -69,6 +86,7 @@ The store provides:
 - WAL mode and an asynchronous connection pool;
 - a role-scoped operation ledger;
 - idempotency conflict and replay handling;
+- automatic recent-content duplicate suppression;
 - per-role persistent rate limits and a global in-flight dispatch bound;
 - explicit `accepted`, `partial`, `failed`, and `indeterminate` states;
 - automatic import of the old Python activity tables;
@@ -96,7 +114,7 @@ failure stops the current batch and defers every pending item sharing that bot
 transport, so `Retry-After` cannot be bypassed by later rows from the same
 already-selected batch.
 
-Peer-delivery prompts are deliberately one-way by default: ACK, closure,
+Peer-delivery prompts are task-scoped and deliberately one-way by default: ACK, closure,
 stand-by, and unchanged-evidence messages must not trigger another `msg_to`.
 This prevents conversational acknowledgement loops from turning into new
 Hermes runs. The persistent manager circuit breaker remains the hard stop for
@@ -191,7 +209,7 @@ Important groups:
 | Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
 | Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_ORDER_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
 | Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY` |
-| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS` |
+| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS`, `SWARM_REPORT_WAKE_STATUSES` |
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
 | Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |

@@ -166,6 +166,10 @@ mod tests {
             "completed,failed,in_progress".into(),
         );
         env.insert(
+            "SWARM_REPORT_WAKE_STATUSES".into(),
+            "completed,failed".into(),
+        );
+        env.insert(
             "SWARM_AUTHORITY_MCP_INSTRUCTIONS".into(),
             "you order {role} {targets}".into(),
         );
@@ -179,7 +183,7 @@ mod tests {
         );
         env.insert(
             "SWARM_PEER_PROMPT_TEMPLATE".into(),
-            "{message_id}|{sender}|{recipient}|{message}".into(),
+            "{message_id}|{sender}|{recipient}|{task_id}|{message}".into(),
         );
         env.insert(
             "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE".into(),
@@ -205,6 +209,7 @@ mod tests {
         env.insert("SWARM_OPERATION_RETENTION_DAYS".into(), "30".into());
         env.insert("SWARM_DISPATCH_RATE_LIMIT".into(), "100".into());
         env.insert("SWARM_DISPATCH_RATE_WINDOW_SECONDS".into(), "60".into());
+        env.insert("SWARM_DUPLICATE_WINDOW_SECONDS".into(), "600".into());
         env.insert("SWARM_MAX_INFLIGHT_DISPATCHES".into(), "16".into());
         env.insert("SWARM_PENDING_STALE_SECONDS".into(), "300".into());
         env.insert("SWARM_CLEANUP_INTERVAL_SECONDS".into(), "300".into());
