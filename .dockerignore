@@ -2,9 +2,13 @@
 .gitignore
 .gitlab-ci.yml
 /target
-/src/old_python
 *.db
 *.db-shm
 *.db-wal
 README.md
 REVIEW.md
+REVIEW-PLAN.md
+.agents
+
+.env
+/data

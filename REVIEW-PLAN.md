@@ -194,3 +194,264 @@ deeper checks of `http.rs` routing and edge cases. Baseline unchanged: fmt ✅ c
 6. V-1: comment the `with_state::<()>` construction; B-06: decide + test `message_all` empty-peers edge.
 
 Phases 1–4 unchanged from Part 3.
+
+---
+
+# Iteration 3 (2026-08-14) — Phase 0/1/2 execution
+
+Executed per the plan; suite grew **17 → 46 tests**, all green:
+`fmt` ✅ · `clippy -D warnings` ✅ (1.97) · `test --locked --all-targets` ✅ (46) · `build --locked --release` ✅.
+
+## Resolved (pushed in this batch)
+
+| ID | Disposition |
+|---|---|
+| B-01 | **Fixed** — `reserve_dispatch` now deletes `status='failed'` rows for a reused key (inside the reservation tx, under the global lock): a definitively failed dispatch releases its key, a retry with the same key re-executes; `accepted/partial/indeterminate` still replay; fingerprint conflicts still apply to non-failed rows. README + MCP instructions updated. Tests: `idempotency_key_is_released_after_failed_dispatch` (store), `idempotency_replays_accepted_and_reexecutes_failed` (dispatcher, mock Hermes). |
+| B-02 | **Fixed** — `finish_dispatch` guarded with `AND status='pending'`; second finish / finish-after-recovery now errors. Dead `updated > 1` branch removed from `mark_dispatch_indeterminate`. Test: `finish_dispatch_rejects_already_finalized_rows`. |
+| B-04 | **Fixed** — `validate_identifier` unified in `dispatch.rs` (`pub(crate)`), http.rs duplicate deleted; error messages now name the field. |
+| B-06 | **Fixed** — `message_all` with no peer executors returns an error instead of `ok: true`. Test: `message_all_without_peers_is_rejected`. |
+| D-02 | **Fixed** — dead `Config::role_for_path` removed. |
+| D-04 | **Fixed** — `BroadcastSummary` helper replaces 3 copy-pasted aggregation blocks (order_all/msg_all/telegram_inbound); behavior locked by tests. |
+| D-01 | **Fixed** — README.md / REVIEW.md no longer reference removed `src/old_python/`. |
+| DEP-1/2 | **Fixed** — compose `environment:` block dropped (was overriding `env_file` with empty `${}` interpolation); `env_file: ../swarm/.env` is now the single source. |
+| DEP-3 | **Fixed** — stale `/src/old_python` removed from `.dockerignore`; added `REVIEW-PLAN.md`/`.agents`. |
+| V-1 | **Fixed** — `with_state::<()>` state-baking construction commented; router construction extracted into `build_router()` and covered by http tests. |
+
+## What the plan forgot (now tracked)
+
+| ID | Sev | Item | Disposition |
+|---|---|---|---|
+| G-01 | Med | **Non-goal: DB engine.** The plan's SQLite-scaling notes (P-01/P-04) could invite a Postgres port. Decision (product owner): **SQLite-first; Postgres stays out of scope.** The store SQL is deliberately sqlite-specific (`INSERT OR IGNORE`, `PRAGMA`, `unixepoch`) — any future engine must be an optional, feature-gated port, not a refactor. | Documented in AGENTS.md + this plan. |
+| G-02 | Low | **AGENTS.md** missing — skills existed but nothing pointed agents at them or at project invariants. | **Added** root `AGENTS.md` (verify commands, skills index, non-negotiables, ops notes). |
+| G-03 | Low | `license = "MIT"` in Cargo.toml but **no LICENSE file** in the repo. | Open — add a LICENSE file with the correct copyright holder (needs owner input). |
+| G-04 | Low | `telegram.rs::spawn_inbound_worker` — if `TelegramGateway::new` fails (token/group config), the worker **logs and exits forever**; unreachable today because `from_env` validates, but a retry loop would be more robust. | Open — add retry-with-backoff or `expect` with a comment; test the init failure path. |
+| G-05 | Low | Test gaps found during Phase 2: no test asserting `Secret` Debug redaction; no `fingerprint()` determinism test; no parallel `reserve_dispatch` concurrency test (two reservations, one wins the rate slot). | Open — quick unit tests. |
+
+## Test coverage now (46 tests)
+
+| Module | Before | After | Added |
+|---|---|---|---|
+| config.rs | 1 | 4 | path/URL/target validation |
+| dispatch.rs | 6 | 12 | mock-Hermes flows: order accept/deny, order_all partial, report ACL, message_all no-peers, idempotency re-execute |
+| http.rs | 4 | 8 | router-level: token isolation, activity validation, host/origin guard, rate limit (tower::oneshot) |
+| mcp.rs | 0 | 4 | per-role catalogs, schema enums, hierarchy JSON, instructions |
+| probe.rs | 0 | 2 | expected catalogs, activity-probe skip |
+| store.rs | 3 | 10 | key release after failed, finish guard, snapshot visibility, outbox backoff/dead, cleanup, due-outbox, sender view |
+| telegram.rs | 3 | 6 | help fallback, @-suffix, offset overflow |
+| testutil | — | — | shared fixtures: `fixture_config`, temp DBs, mock Hermes server |
+
+## Remaining (next iterations)
+
+- Phase 2 tail: config `from_env` refactor (`from_env_with`) + validation matrix; telegram `poll_once` tests with mocked getUpdates; Secret-redaction/fingerprint/concurrency tests (G-05).
+- Phase 3: P-01/P-02 indexes + snapshot query pushdown (schema v4); B-03 text-policy helper; B-05 `break` in poll loop.
+- Phase 4: C-02 coverage job; G-03 LICENSE; G-04 worker init retry.
+- P-03/P-04: documented trade-offs (comments added where relevant).
+
+---
+
+# Iteration 4 (2026-08-14) — Phase 2 tail + Phase 3 + coverage
+
+Suite: **59 tests** (was 46). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ (59) ·
+`build --locked --release` ✅ · line coverage **77.6%** (was ~20% at iteration 1).
+
+## Resolved in this batch
+
+| ID | Disposition |
+|---|---|
+| P-01 | **Fixed** — pruning indexes added to SCHEMA (idempotent `CREATE INDEX IF NOT EXISTS`, no version bump): `rate_events_created_idx(created_ms)`, `activity_events_received_idx(received_ms)`, `dispatches_updated_idx(updated_ms)`. The window deletes no longer scan. |
+| P-02 | **Fixed** — `activity_snapshot` pushes `sender IN (...)` into both queries; redundant in-memory filters and re-`take()` removed. Caller visibility is enforced in SQL. |
+| B-05 | **Fixed** — `poll_once` breaks on the first below-offset update (sorted). |
+| B-03 | **Fixed (light)** — `MAX_IDENTIFIER_BYTES` const shared by runtime validation and both MCP schemas (`idempotency_schema`, report `task_id`); units documented at the definitions. |
+| G-04 | **Fixed** — inbound worker now retries `TelegramGateway::new` with capped exponential backoff instead of exiting forever; cancellation-aware. |
+| G-05 | **Fixed** — tests: `Secret` Debug redaction, `fingerprint` determinism (incl. key-order independence and whitespace sensitivity), parallel `reserve_dispatch` sharing one rate slot (global lock ⇒ exactly one `Reserved`). |
+| Config testability | **Fixed** — `Config::from_env` delegates to `from_env_with(&dyn Fn(&str) -> Option<String>)`; all helpers thread the source. Full validation matrix added: missing vars, duplicate executors, manager-as-executor, case normalization, ACL/route errors, short/duplicate credentials, template contract, path collisions, origin/host formats, Telegram mode contracts (12 config tests, parallel-safe, no env mutation). |
+| B-07 (new) | **Fixed** — config now rejects hosts with a non-numeric port (`http::uri::Authority` silently parses `localhost:bad-port` as "no port", which would turn a typo into a host-only rule matching ANY port). IPv6-aware check. Found by the validation matrix. |
+| Telegram inbound | **Covered** — `poll_once` tested against a mock Bot API (getUpdates/sendMessage): Discard-mode fast-forward (offset advances, nothing dispatched), Process-mode dispatch (update → `telegram_5` accepted via mock Hermes, offset advances), unlisted user ignored (offset still advances). |
+| C-02 | **Fixed** — `coverage` job added (stage `audit`): `cargo-llvm-cov` (binary cached in `.cargo/bin`) with `--fail-under-lines 70`; current 77.6%. |
+
+## Coverage snapshot (line %)
+
+config 90.5 · store 89.5 · http 82.3 · telegram 75.3 · mcp 72.4 · dispatch 67.8 · probe 31.9 (network-bound paths) · main/lib 0 (bin entry). Threshold 70% leaves headroom; raise to 75–80 once probe/main get e2e coverage.
+
+## Remaining (open)
+
+- G-03: LICENSE file (needs copyright holder).
+- P-03/P-04: documented trade-offs only (N+1 in `recent_operations`; global reservation lock) — acceptable at current scale.
+- Optional: `rust-toolchain.toml` pin (CI 1.89 vs local 1.97 — clippy now passes on both).
+- Probe e2e (T-8) would lift probe.rs coverage and enable a higher threshold.
+
+---
+
+# Iteration 5 (2026-08-14) — LICENSE + probe e2e (T-8)
+
+Suite: **61 tests** (was 59). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **81.66%** (was 77.6%).
+
+| ID | Disposition |
+|---|---|
+| G-03 | **Fixed** — `LICENSE` added (MIT, "Copyright (c) 2026 Demlabs"), matching `license = "MIT"` in Cargo.toml. |
+| T-8 | **Fixed** — two e2e tests boot the real router (`http::build_router`, now `pub(crate)`) on an ephemeral port and run `catalog_probe` + `activity_probe` against it in-process — the same check the deployment runs (rmcp client → HTTP → per-role auth → MCP catalogs/resources → activity signal + non-target isolation). Note: the Host guard rejected `127.0.0.1` first — the e2e fixture must set `allowed_hosts` to the loopback address. |
+| Coverage | CI threshold raised **70 → 75** (probe.rs 31.9% → 89.5%, http.rs 83.2%, total 81.7%). |
+
+## Coverage snapshot (line %)
+
+config 90.5 · store 89.5 · probe 89.5 · http 83.2 · telegram 75.3 · mcp 72.4 · dispatch 67.8 · main/lib 0 (bin entry).
+
+## Remaining (open)
+
+- dispatch.rs 67.8% is the lowest runtime module — next candidates: `telegram_inbound` dispatcher path (partly covered via poll_once), `message`/`msg_all` flows, outbox flush worker, `finish`/`fail_run` persistence-error paths.
+- Optional: `rust-toolchain.toml` pin (clippy passes on both toolchains already).
+- Optional: bump the coverage threshold toward 80 once dispatch.rs is covered further.
+
+---
+
+# Iteration 6 (2026-08-14) — dispatch.rs coverage push
+
+Suite: **67 tests** (was 61). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **85.43%** (was 81.7%). CI threshold raised **75 → 80**.
+
+Covered in this batch (dispatch.rs 67.8% → 84.7%):
+- `message`/`msg_all` flows (accept + persist, non-peer rejection, partial aggregation through `BroadcastSummary`).
+- `order_all` all-server-failure → `indeterminate` (nothing accepted, all may have happened).
+- `telegram_inbound` dedupe by update_id (replay → `deduplicated: true`), invalid identifier rejection, audit outbox row queued.
+- `flush_outbox` end-to-end: accepted order queues a pending audit → flush delivers it through a mock Bot API (`sendMessage` → `{"ok": true}`).
+
+## Coverage snapshot (line %)
+
+config 90.5 · store 89.5 · probe 89.5 · http 83.2 · **dispatch 84.7** · telegram 75.3 · mcp 72.4 · main/lib 0 (bin entry).
+
+## Remaining (open)
+
+- telegram.rs (75.3) / mcp.rs (72.4): `send_telegram` failure branches, `process_update` help/notice paths, `call_tool`/`read_resource` via the live-router e2e.
+- Optional: `rust-toolchain.toml` pin.
+- Optional: coverage threshold → 85.
+
+---
+
+# Iteration 7 (2026-08-14) — coverage 90% reached
+
+Suite: **97 tests** (was 67). `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **90.17%** (was 85.4%). CI threshold raised **80 → 90**.
+
+What closed the gap (per-module line targets from the missing-lines report):
+- **http.rs** — `serve_with_shutdown()` split (testable server lifecycle: bind → serve → graceful shutdown → worker cancellation); activity 413 (detail too long) / 422 (bad occurred_at) / disabled-mode branches; per-credential activity rate limit.
+- **store.rs** — `ready()` write-lock check; event dedup + `activity_state` upsert (replayed hook); empty-visibility snapshot; `mark_dispatch_indeterminate`; outbox transitions on non-pending items.
+- **config.rs** — `from_env()` wrapper (ambient-env tolerant), numeric-range matrix, cross-field constraints (body vs message size, report defaults, absolute DB path, bool parsing), `null` origin, socks5 proxy, IPv6 host with (mal)formed port.
+- **dispatch.rs** — invalid idempotency keys, empty/oversized commands, broken-template `failed` persistence, `order_all` authority check, `Retry-After` from the response body.
+- **mcp.rs** — `call_tool` arms (`order_all`, `report`, `msg_to`) and extra `read_resource` checks over the live router.
+- **telegram.rs** — bot/textless updates ignored, Bot API decode failure surfaces, best-effort `sendMessage` failures tolerated.
+- **main.rs/lib.rs** — `run()` extraction; healthcheck connection failure, `loopback_url`, `AppState::initialize`.
+
+## Final coverage snapshot (line %)
+
+config 91.7 · store 89.9 · probe 91.5 · http 86.4 · mcp 89.7 · dispatch 86.3 · telegram 80.5 · lib 92.9 · main 25.0 (bin entry: env-dependent Serve arm + probe wrappers remain untested by design).
+
+## Remaining (open, all optional)
+
+- main.rs bin entry (25%) — would require either a full valid env map duplicated in bin tests or subprocess/CLI harness tests.
+- http.rs `serve()` CLI-only signal wiring (covered via `serve_with_shutdown`).
+- `rust-toolchain.toml` — explicitly declined (runner will be upgraded; clippy passes on 1.89 and 1.97).
+
+---
+
+# Iteration 8 (2026-08-14) — main.rs bin entry coverage
+
+Suite: **98 lib + 3 bin tests**. `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **90.70%** (was 90.17%).
+
+- **main.rs 25% → 86.1%** — `run_probe`/`run_activity_probe` wrappers covered without a live server:
+  catalog probe against a dead endpoint surfaces the error; activity probe with empty routes
+  short-circuits to `Ok`. The valid env map is rebuilt in the bin tests via `Config::from_env_with`
+  (no env mutation; the lib's `testutil` is invisible to the bin crate).
+- **probe.rs 91.6%** — `activity_probe` disabled-activity branch against a live router.
+
+## Coverage snapshot (line %)
+
+config 91.7 · lib 92.9 · probe 91.6 · store 89.9 · mcp 89.7 · **main 86.1** · http 86.4 · dispatch 86.3 · telegram 80.5.
+
+## Remaining (open)
+
+- telegram.rs 80.5% — the last sub-85 module: `spawn_inbound_worker`/`run()` backoff loop and
+  `send_text` paths are the residual gaps (config-validated init makes several branches near-unreachable).
+- http.rs `shutdown_signal()` — process-global signal handlers, intentionally not tested in-process.
+
+---
+
+# Iteration 9 (2026-08-14) — cosmetics: shutdown select + telegram worker/backoff
+
+Suite: **104 lib + 3 bin tests**. `fmt` ✅ · `clippy -D warnings` ✅ · `test --locked --all-targets` ✅ ·
+line coverage **91.31%** (was 90.7%).
+
+- **http.rs 86.4% → 93.1%** — `shutdown_signal_with(ctrl_c, terminate)` split: the select over both
+  shutdown sources is now driven by injectable futures (ready/pending), covering both arms without
+  installing process-global signal handlers (the real `shutdown_signal` wiring stays CLI-only).
+- **telegram.rs 80.5% → 89.4%** — `spawn_inbound_worker` covered in all three modes (absent when
+  disabled, runs-and-stops on cancellation, retries gateway init with backoff when the fixture
+  bypasses token validation); `run()` backoff loop (first poll fails → 1s backoff → retry succeeds →
+  backoff reset); transport-error mapping for a dead Bot API endpoint.
+
+## Coverage snapshot (line %)
+
+http 93.1 · lib 92.9 · config 91.7 · probe 91.6 · store 89.9 · mcp 89.7 · **telegram 89.4** · main 86.1 · dispatch 86.3.
+
+All runtime modules ≥ 86%; the only remaining gaps are the CLI-only `shutdown_signal` signal
+installation and the Serve arm of the bin entry — both consciously untested in-process.
+
+---
+
+# Iteration 10 (2026-08-14) — no consciously uncovered code: signal + Serve-arm child tests
+
+Suite: **108 lib + 5 bin tests**. `fmt` ✅ · `clippy -D warnings` ✅ (verified on **both** 1.89 and 1.97) ·
+`test --locked --all-targets` ✅ · line coverage **91.9%** (was 91.3%). CI threshold 90.
+
+Previously "consciously untested" spots are now covered with child-process tests
+(the only safe way to exercise process-global signals and the CLI Serve arm):
+
+- **http.rs 93.1% → 95.7%** — `shutdown_signal` real signal paths: the test re-executes the test
+  binary (`--exact <child> --nocapture`) with a `SWARM_MCP_CHILD_TEST` flag; the child reports
+  readiness **after** the handlers are installed (polled once via `select!` + marker line), the
+  parent sends `kill -TERM` / `kill -INT`, and asserts a clean exit. Deterministic — the signal
+  can never race handler installation.
+- **main.rs 86.1% → 91.9%** — the Serve arm: the child inherits the full valid env map
+  (`Command::envs`), boots the real server on a pre-reserved port, the parent probes `/health`
+  until it responds, sends SIGTERM, and asserts a clean graceful shutdown (server → workers →
+  exit 0). This covers `Config::from_env` → `init_tracing` → `AppState::initialize` → `http::serve`
+  → signal shutdown end-to-end.
+- tokio features `process` + `io-util` added for the child harness.
+
+## Coverage snapshot (line %)
+
+http 95.7 · lib 92.9 · config 91.7 · probe 91.6 · **main 91.9** · store 89.9 · mcp 89.7 · telegram 89.4 · dispatch 86.3.
+Every module ≥ 86%; no intentionally skipped code paths remain.
+
+## Warnings
+
+Exhaustive search on both toolchains (fresh builds, all targets): `fmt` ✅, `clippy -D warnings` ✅,
+`test` ✅, `build debug+release` ✅, `check` ✅, `doc` ✅, `audit` (0 vulnerabilities, exit 0) ✅,
+`llvm-cov` ✅ — **no warnings reproducible anywhere**. If a warning was seen in a specific place
+(GitLab pipeline log, IDE), it would need that context to reproduce.
+
+---
+
+# Iteration 11 (2026-08-20) — Telegram feedback-loop containment review
+
+Scope: every dispatch, polling, retry/backoff, outbox, role-control, broadcast,
+and authorization path after the production ACK/closure feedback-loop incident.
+
+| ID | Sev | Finding | Disposition |
+|---|---:|---|---|
+| L-01 | High | Manager-only messaging controls relied on MCP catalog visibility; the dispatcher methods themselves did not verify the caller role. | Runtime manager authorization added to all three controls, with direct-dispatcher negative tests. |
+| L-02 | High | Disabling a role cancelled audits whose `sender` was that role but left pending manager/peer audits addressed to it deliverable. | Queue cancellation and `swarm://messaging` counts now match exact role tokens in both sender and recipient directions; delivered history remains untouched. |
+| L-03 | High | A retryable Telegram error delayed one row but the worker continued through its previously selected batch, bypassing transport `Retry-After`. | The first transient failure stops the batch and persistently defers all pending rows sharing the affected bot transport. |
+| L-04 | Medium | Missing Telegram configuration and a corrupt chunk cursor were retried even though another attempt could not repair them. | Permanent local failures and non-retryable HTTP responses dead-letter on the first attempt. |
+| L-05 | Medium | The inbound poller sorted updates and then `break`ed on a stale ID, starving newer updates later in the same response forever. | Stale updates now `continue`; regression coverage asserts the fresh update is dispatched and the offset advances. |
+| L-06 | Low | The review/verify skills still described schema v3, terminal failed idempotency keys, and a 75% coverage threshold. | Operator guidance updated to schema v4, current retry semantics, manager controls, and the actual 90% CI gate. |
+| L-07 | High | A due-row snapshot could race a role disable and leak one audit after the control returned; the worker also cancelled rows even when `clear_queue=false`. | Delivery eligibility is revalidated under the messaging gate. Preserved disabled-role rows stay pending but are excluded from due batches until explicit re-enable. |
+
+Accepted limits remain explicit in `REVIEW.md`: outbound Telegram is
+at-least-once across a crash, and multi-replica delivery needs a distributed
+row claim. The production topology remains a single active Swarm MCP replica.
+
+Verification: **116 lib + 5 bin tests**; `fmt` ✅; `clippy -D warnings` ✅;
+release build ✅; line coverage **93.67%** (CI gate 90%) ✅; RustSec audit of
+272 locked dependencies (**0 vulnerabilities**) ✅.

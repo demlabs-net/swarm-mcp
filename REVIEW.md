@@ -13,8 +13,8 @@ message storms possible.
 
 The Rust rewrite replaces the runtime in the same repository. It uses the
 official `rmcp` Streamable HTTP server, Axum, Tokio, SQLx/SQLite, typed startup
-configuration, and shared Reqwest clients. `src/old_python/` remains only as an
-audit snapshot.
+configuration, and shared Reqwest clients. The Python sources were removed from
+the tree; they remain in git history as the audit snapshot.
 
 The review covered the old server, probes, activity hook, Docker image,
 standalone and swarm Compose definitions, deployment script, authentication,
@@ -48,6 +48,13 @@ transport requirements and the official Rust SDK.
 | F-20 | Medium | No graceful shutdown coordination for sessions/background work | In-flight state could be abandoned without an explicit boundary | Cancellation token shared by MCP services and workers; pending operations become `indeterminate` after restart |
 | F-21 | Low | Logs lacked a structured, consistent format | Harder correlation and machine processing | Structured JSON tracing and stable operation IDs |
 | F-22 | Low | No automated unit tests; probes depended on a live deployment | Regressions in parsing/chunking/security were easy | Unit tests, compiled catalog/activity probes, and GitLab CI with Clippy/RustSec |
+| F-23 | High | No live role-level messaging kill switch and peer prompts encouraged replies | Reciprocal ACK/closure messages could create a slow, unbounded cascade of new Hermes runs and Telegram audits | Persistent manager-only disable/enable/queue-clear controls, bidirectional dispatch enforcement, one-way peer instructions, and first-attempt dead-lettering for permanent Telegram 4xx errors |
+| F-24 | High | Idempotency depended on the model reusing a caller-supplied key | A drifting model could omit or rotate keys and start the same downstream run repeatedly | Configurable server-side recent-content suppression keyed by sender, operation kind, targets, and whitespace-normalized payload |
+| F-25 | High | Peer messages had no task lineage and reports allowed an empty or invented task ID | Free-form coordination could become an untraceable conversational loop or rotate IDs to bypass suppression | `task_id` is required for `report`, `msg_to`, and `msg_all`, verified against an accepted order assigned to the sender, and included in prompts, results, and duplicate fingerprints |
+| F-26 | High | The surrounding Hermes profiles allowed 500 outer turns, 250 delegated turns, repeated continuation nudges, and warning-only tool-loop detection | A single bad strategy could consume a large context and repeatedly call tools even though Swarm MCP itself was rate-limited | Swarm deployment now applies per-role turn/output/delegation budgets, one corrective continuation, unattended hard stops, and role-specific tool visibility |
+| F-27 | Medium | Every Hermes model call reloaded all SLC manuals and persisted up to 6000 characters of repeated transcript | Useful task context was displaced by repeated policy text and episodic noise | Lifecycle hooks now load compact active context, save a 1200-character evidence snapshot, and rely on just-in-time document retrieval |
+| F-28 | High | Every `in_progress` report started a new supervisor run | Routine progress could recursively consume manager turns and produce further orders or Telegram traffic | Reports remain durable and audited, but only configurable terminal/material statuses wake a supervisor |
+| F-29 | Critical | A restarted manager resumed an old run and called `messaging_enable` immediately after its order was rejected by the persistent breaker | The agent entrusted with containment could undo containment as a tool-recovery step and restart the same flood | Re-enable now requires a fresh state timestamp, a remediation reason, and a configurable cooldown; breaker errors explicitly require stop-and-human-escalation, and the tool is no longer pinned in the manager's ordinary working set |
 
 ## New architecture
 
@@ -107,14 +114,41 @@ server will not blindly redeliver a side effect whose outcome is unknown.
    constant time and isolated by endpoint, but rotation currently requires a
    coordinated environment update and restart.
 
-5. **There is no downstream circuit breaker.** Timeouts, rate limits, and
-   concurrency bounds prevent unbounded pressure, but repeated failures still
-   consume the configured allowance.
+5. **The role messaging circuit breaker is manual.** The manager can now block
+   either direction for an executor and cancel its audit queue. Re-enable is
+   stale-state-checked and cooldown-gated, but the server cannot prove that an
+   MCP call was caused by a human sentence; the manager profile therefore treats
+   breaker rejection as terminal and discovers the re-enable tool only for an
+   explicit later resume turn. Transport failure thresholds do not automatically
+   trip the breaker; automatic half-open recovery remains future work.
 
 6. **Legacy MCP sessions are process-local.** Request admission bounds creation
    rate, but legacy clients that never send session deletion can retain session
    state until restart. Switching fully to stateless MCP requires confirming
    every deployed Hermes client negotiates the newer protocol first.
+
+## Feedback-loop follow-up review (2026-08-20)
+
+The post-incident review covered every retry, polling, broadcast, authorization,
+and outbox path in the Rust server. It found and corrected six related gaps:
+
+- messaging controls now enforce manager authority inside `Dispatcher`, not
+  only through MCP catalog visibility;
+- disabling or clearing a role cancels undelivered audits both from and to that
+  role, including manager orders already waiting for Telegram;
+- permanent local delivery failures and non-retryable Telegram responses are
+  dead-lettered immediately;
+- a transient Telegram failure stops the selected batch and persists transport
+  backoff for the remaining affected rows;
+- delivery revalidates each snapshotted outbox row under the messaging gate;
+  preserved rows involving a disabled role are held outside the due batch and
+  cannot leak through a disable race or starve unrelated delivery;
+- a stale Telegram update is skipped without starving newer updates returned in
+  the same batch.
+
+The documented single-replica/at-least-once limits still apply: an outbound
+Telegram acceptance followed by a process crash can duplicate the last chunk,
+and multiple active server replicas require a distributed outbox claim.
 
 ## Remediation and capability plan
 
@@ -141,6 +175,8 @@ server will not blindly redeliver a side effect whose outcome is unknown.
 
 ### Phase 2 — operator controls
 
+- Completed: persistent manager-only per-role messaging disable/enable, queue
+  cancellation, `swarm://messaging`, and negative-path catalog/auth probes.
 - Add non-mutating `get_operation(id)` and filtered/paginated operation
   resources.
 - Add privileged `cancel_operation(id)` only after Hermes supports cancellation.
@@ -188,6 +224,9 @@ server will not blindly redeliver a side effect whose outcome is unknown.
 - The configured rate limit rejects excess operations without agent calls.
 - A Telegram outage leaves pending/dead outbox evidence without losing the
   accepted agent result.
+- Manager-only role controls block both sender and recipient paths, persist
+  across restart, cancel undelivered audit items, and never replay cancelled
+  items when re-enabled.
 - Activity reads and probes never start an agent or send Telegram.
 - `/ready` fails when SQLite is unavailable.
 - The service runs as non-root with a read-only root filesystem.
