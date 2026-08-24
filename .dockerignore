@@ -8,3 +8,5 @@
 *.db-wal
 README.md
 REVIEW.md
+.env
+/data
