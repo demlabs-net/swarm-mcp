@@ -255,7 +255,8 @@ impl TelegramGateway {
         let Some(text) = message.text.as_deref().map(str::trim) else {
             return Ok(());
         };
-        let command = parse_command(text, &self.state.config.telegram_inbound_targets)
+        let command = parse_mention(text, &self.state.config.telegram_inbound_targets)
+            .or_else(|| parse_command(text, &self.state.config.telegram_inbound_targets))
             .unwrap_or_else(|| ParsedCommand::Dispatch {
                 targets: vec![self.state.config.manager_role.clone()],
                 message: text.to_string(),
@@ -332,6 +333,32 @@ impl TelegramGateway {
         telegram_payload(response).await?;
         Ok(())
     }
+}
+
+/// Parses an "@role message" mention (e.g. "@writer сделай X", "@all текст").
+/// Returns None when the message is not a mention of an allowed target.
+fn parse_mention(text: &str, allowed_targets: &[String]) -> Option<ParsedCommand> {
+    let text = text.trim();
+    let (raw_mention, rest) = text.split_once(char::is_whitespace).map_or((text, ""), |(m, r)| (m, r.trim()));
+    let mention = raw_mention.strip_prefix('@')?.to_lowercase();
+    let mention = mention.split('@').next().unwrap_or_default();
+    if mention == "all" {
+        return if rest.is_empty() {
+            None
+        } else {
+            Some(ParsedCommand::Dispatch {
+                targets: allowed_targets.to_vec(),
+                message: rest.to_string(),
+            })
+        };
+    }
+    if allowed_targets.iter().any(|target| target == &mention) && !rest.is_empty() {
+        return Some(ParsedCommand::Dispatch {
+            targets: vec![mention.to_string()],
+            message: rest.to_string(),
+        });
+    }
+    None
 }
 
 fn parse_command(text: &str, allowed_targets: &[String]) -> Option<ParsedCommand> {
@@ -449,6 +476,32 @@ mod tests {
         };
         assert_eq!(targets, vec!["lead-developer"]);
         assert_eq!(message, "review this");
+    }
+
+    #[test]
+    fn parses_role_mentions() {
+        let allowed = targets();
+        let ParsedCommand::Dispatch {
+            targets,
+            message,
+        } = parse_mention("@developer implement it", &allowed).unwrap()
+        else {
+            panic!("expected a mention dispatch");
+        };
+        assert_eq!(targets, vec!["developer"]);
+        assert_eq!(message, "implement it");
+
+        let ParsedCommand::Dispatch {
+            targets: all, ..
+        } = parse_mention("@all status check", &allowed).unwrap()
+        else {
+            panic!("expected an @all dispatch");
+        };
+        assert_eq!(all, allowed);
+
+        assert!(parse_mention("plain text", &allowed).is_none());
+        assert!(parse_mention("@unknown do it", &allowed).is_none());
+        assert!(parse_mention("@developer", &allowed).is_none());
     }
 
     #[test]
