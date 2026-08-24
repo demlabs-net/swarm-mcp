@@ -18,9 +18,9 @@ limits, and capability roadmap is in [REVIEW.md](REVIEW.md).
 The hierarchy is data-driven:
 
 ```dotenv
-SWARM_AGENT_ROLES=developer,designer,lead-developer,tester,devops
+SWARM_AGENT_ROLES=developer,junior,designer,lead-developer,tester,devops
 SWARM_MANAGER_ROLE=manager
-SWARM_ORDER_ACL={"manager":["*"],"lead-developer":["developer"]}
+SWARM_ORDER_ACL={"manager":["*"],"lead-developer":["developer","junior"]}
 ```
 
 With this configuration the catalogs are:
@@ -29,7 +29,7 @@ With this configuration the catalogs are:
 |---|---|
 | `manager` | `order`, `order_all`, `messaging_disable`, `messaging_enable`, `messaging_clear_queue` |
 | `lead-developer` | `order`, `report`, `msg_to`, `msg_all` |
-| `developer`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
+| `developer`, `junior`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
 
 `"*"` grants swarm-wide `order` and `order_all`. An explicit list grants only
 single-target `order`; the generated JSON Schema enumerates exactly the targets
