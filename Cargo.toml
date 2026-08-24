@@ -6,6 +6,18 @@ rust-version = "1.89"
 license = "MIT"
 description = "Authenticated, role-aware MCP communication plane for agent swarms"
 
+[package.metadata.deb]
+maintainer = "DemLabs <dev@demlabs.net>"
+copyright = "2026 DemLabs"
+depends = "ca-certificates"
+section = "net"
+priority = "optional"
+extended-description = """Authenticated, role-aware MCP communication plane for agent swarms:
+Telegram router (shared bot), role hierarchy, dispatch, outbox and MCP server."""
+assets = [
+  ["target/release/swarm-mcp", "usr/local/bin/", "755"],
+]
+
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", features = ["http1", "json", "macros", "tokio"] }

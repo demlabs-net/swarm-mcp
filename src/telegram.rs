@@ -17,6 +17,8 @@ const MAX_TELEGRAM_RESPONSE_BYTES: usize = 1024 * 1024;
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
+    #[serde(default)]
+    channel_post: Option<TelegramMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,7 +221,7 @@ impl TelegramGateway {
                 "offset": offset,
                 "timeout": timeout_seconds,
                 "limit": limit,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "channel_post"],
             }))
             .send()
             .await
@@ -236,27 +238,31 @@ impl TelegramGateway {
 
     async fn process_update(&self, update: &TelegramUpdate) -> anyhow::Result<()> {
         ensure!(update.update_id >= 0, "Telegram update ID is negative");
-        let Some(message) = &update.message else {
+        let Some(message) = update.message.as_ref().or(update.channel_post.as_ref()) else {
             return Ok(());
         };
-        if message.chat.id != self.group_id {
-            return Ok(());
-        }
         let Some(user) = &message.from else {
             return Ok(());
         };
+        // Принимаем сообщения из настроенного чата (группа/канал) и личные
+        // сообщения (в личке chat.id совпадает с id отправителя).
+        if message.chat.id != self.group_id && message.chat.id != user.id {
+            return Ok(());
+        }
         if user.is_bot || !self.state.config.telegram_allowed_users.contains(&user.id) {
             return Ok(());
         }
         let Some(text) = message.text.as_deref().map(str::trim) else {
             return Ok(());
         };
-        let Some(command) = parse_command(text, &self.state.config.telegram_inbound_targets) else {
-            return Ok(());
-        };
+        let command = parse_command(text, &self.state.config.telegram_inbound_targets)
+            .unwrap_or_else(|| ParsedCommand::Dispatch {
+                targets: vec![self.state.config.manager_role.clone()],
+                message: text.to_string(),
+            });
         match command {
             ParsedCommand::Reply(text) => {
-                if let Err(error) = self.send_text(&text).await {
+                if let Err(error) = self.send_text(message.chat.id, &text).await {
                     warn!(error = %error, "send Telegram command help failed");
                 }
             }
@@ -279,6 +285,7 @@ impl TelegramGateway {
                         username,
                         message: text,
                         targets,
+                        chat_id: message.chat.id,
                     })
                     .await;
                 if outcome.value.get("error").and_then(Value::as_str)
@@ -301,7 +308,7 @@ impl TelegramGateway {
                         "Swarm command {} was not accepted: {reason}",
                         update.update_id
                     );
-                    if let Err(error) = self.send_text(&notice).await {
+                    if let Err(error) = self.send_text(message.chat.id, &notice).await {
                         warn!(error = %error, "send Telegram dispatch rejection failed");
                     }
                 }
@@ -310,12 +317,12 @@ impl TelegramGateway {
         Ok(())
     }
 
-    async fn send_text(&self, text: &str) -> anyhow::Result<()> {
+    async fn send_text(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
         let response = self
             .client
             .post(format!("{}/sendMessage", self.bot_url))
             .json(&json!({
-                "chat_id": self.group_id,
+                "chat_id": chat_id,
                 "text": text,
                 "disable_web_page_preview": true,
             }))

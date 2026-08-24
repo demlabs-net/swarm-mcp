@@ -17,8 +17,8 @@ use crate::{
     config::TelegramBotMode,
     dispatch::{
         BroadcastArgs, ClearMessageQueueArgs, DisableMessagingArgs, EnableMessagingArgs,
-        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, ToolOutcome, parse_arguments,
-        render_template,
+        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramReplyArgs, ToolOutcome,
+        parse_arguments, render_template,
     },
 };
 
@@ -216,6 +216,20 @@ impl RoleMcp {
                 ),
             ));
         }
+        tools.push(tool(
+            "telegram_reply",
+            "Send the final answer to the operator who started the most recent Telegram dispatch for this role.",
+            object_schema(
+                &json!({
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": config.max_message_chars
+                    }
+                }),
+                &["message"],
+            ),
+        ));
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         tools
     }
@@ -430,6 +444,10 @@ impl ServerHandler for RoleMcp {
             },
             "msg_all" => match parse_arguments::<MessageAllArgs>(request.arguments) {
                 Ok(args) => self.state.dispatcher.message_all(&self.role, args).await,
+                Err(outcome) => outcome,
+            },
+            "telegram_reply" => match parse_arguments::<TelegramReplyArgs>(request.arguments) {
+                Ok(args) => self.state.dispatcher.telegram_reply(&self.role, args.message).await,
                 Err(outcome) => outcome,
             },
             "messaging_disable" => match parse_arguments::<DisableMessagingArgs>(request.arguments)
@@ -670,7 +688,8 @@ mod tests {
                 "messaging_disable",
                 "messaging_enable",
                 "order",
-                "order_all"
+                "order_all",
+                "telegram_reply"
             ]
         );
         let resources = resource_uris(&mcp);
@@ -705,7 +724,10 @@ mod tests {
     #[tokio::test]
     async fn executor_catalog_is_coordination_only() -> anyhow::Result<()> {
         let (mcp, path) = role_mcp("developer").await?;
-        assert_eq!(tool_names(&mcp), vec!["msg_all", "msg_to", "report"]);
+        assert_eq!(
+            tool_names(&mcp),
+            vec!["msg_all", "msg_to", "report", "telegram_reply"]
+        );
         let resources = resource_uris(&mcp);
         assert!(!resources.contains(&"swarm://executors".to_string()));
         assert!(!resources.contains(&"swarm://activity".to_string()));
@@ -718,7 +740,7 @@ mod tests {
         let (mcp, path) = role_mcp("lead-developer").await?;
         assert_eq!(
             tool_names(&mcp),
-            vec!["msg_all", "msg_to", "order", "report"]
+            vec!["msg_all", "msg_to", "order", "report", "telegram_reply"]
         );
         let resources = resource_uris(&mcp);
         assert!(resources.contains(&"swarm://activity".to_string()));
@@ -740,7 +762,7 @@ mod tests {
         );
         assert_eq!(
             hierarchy["tools"],
-            json!(["msg_all", "msg_to", "order", "report"])
+            json!(["msg_all", "msg_to", "order", "report", "telegram_reply"])
         );
         assert!(mcp.instructions().contains("releases its key"));
         testutil::remove_db_files(&path).await;
@@ -867,7 +889,8 @@ mod tests {
                 "messaging_disable",
                 "messaging_enable",
                 "order",
-                "order_all"
+                "order_all",
+                "telegram_reply"
             ])
         );
 

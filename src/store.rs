@@ -37,6 +37,8 @@ pub struct AuditMessage {
     pub event: String,
     pub recipients: String,
     pub text: String,
+    /// Telegram chat to deliver to; None means the configured group.
+    pub chat_id: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +50,8 @@ pub struct OutboxItem {
     pub text: String,
     pub attempts: i64,
     pub next_chunk: i64,
+    /// Telegram chat to deliver to; None means the configured group.
+    pub chat_id: Option<i64>,
 }
 
 pub struct ActivityRecord<'a> {
@@ -123,6 +127,16 @@ impl Store {
             )
             .execute(&mut *tx)
             .await?;
+        }
+        if !Self::has_column(&mut tx, "telegram_outbox", "chat_id").await? {
+            sqlx::query("ALTER TABLE telegram_outbox ADD COLUMN chat_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "dispatches", "telegram_chat_id").await? {
+            sqlx::query("ALTER TABLE dispatches ADD COLUMN telegram_chat_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
         }
         Self::import_python_activity_tables(&mut tx).await?;
         sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -605,6 +619,44 @@ impl Store {
         Ok(())
     }
 
+    pub async fn set_dispatch_telegram_chat(
+        &self,
+        id: &str,
+        chat_id: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE dispatches SET telegram_chat_id = ? WHERE id = ?")
+            .bind(chat_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Source Telegram chat of the most recent Telegram inbound dispatch
+    /// targeting `role` (used to route agent replies back to the operator).
+    pub async fn telegram_chat_for_role(&self, role: &str) -> anyhow::Result<Option<i64>> {
+        let chat_id: Option<i64> = sqlx::query_scalar(
+            r#"SELECT d.telegram_chat_id
+               FROM dispatches d
+               JOIN dispatch_targets t ON t.dispatch_id = d.id
+               WHERE t.target = ? AND d.kind = 'telegram_inbound'
+                 AND d.telegram_chat_id IS NOT NULL
+               ORDER BY d.created_ms DESC LIMIT 1"#,
+        )
+        .bind(role)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(chat_id)
+    }
+
+    pub async fn enqueue_outbox(&self, audit: AuditMessage) -> anyhow::Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        insert_outbox(&mut tx, &audit, now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn mark_dispatch_indeterminate(&self, id: &str, reason: &str) -> anyhow::Result<()> {
         let now = Utc::now().timestamp_millis();
         let result = json!({
@@ -900,7 +952,7 @@ impl Store {
     pub async fn due_outbox(&self, limit: i64) -> anyhow::Result<Vec<OutboxItem>> {
         let rows = sqlx::query(
             r#"SELECT o.id, o.sender, o.event, o.recipients, o.text,
-                      o.attempts, o.next_chunk
+                      o.attempts, o.next_chunk, o.chat_id
                FROM telegram_outbox o
                WHERE o.status = 'pending' AND o.next_attempt_ms <= ?
                  AND NOT EXISTS (
@@ -930,6 +982,7 @@ impl Store {
                 text: row.get("text"),
                 attempts: row.get("attempts"),
                 next_chunk: row.get("next_chunk"),
+                chat_id: row.get("chat_id"),
             })
             .collect())
     }
@@ -1166,8 +1219,8 @@ async fn insert_outbox(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"INSERT INTO telegram_outbox
-           (id, sender, event, recipients, text, status, attempts, next_chunk, next_attempt_ms, created_ms)
-           VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)"#,
+           (id, sender, event, recipients, text, status, attempts, next_chunk, next_attempt_ms, created_ms, chat_id)
+           VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?)"#,
     )
     .bind(&audit.id)
     .bind(&audit.sender)
@@ -1176,6 +1229,7 @@ async fn insert_outbox(
     .bind(&audit.text)
     .bind(now)
     .bind(now)
+    .bind(audit.chat_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1242,7 +1296,8 @@ const SCHEMA: &[&str] = &[
          status TEXT NOT NULL,
          result_json TEXT,
          created_ms INTEGER NOT NULL,
-         updated_ms INTEGER NOT NULL
+         updated_ms INTEGER NOT NULL,
+         telegram_chat_id INTEGER
        )"#,
     "CREATE UNIQUE INDEX IF NOT EXISTS dispatches_idempotency_idx ON dispatches(sender, kind, idempotency_key) WHERE idempotency_key IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS dispatches_sender_idx ON dispatches(sender, created_ms DESC)",
@@ -1277,7 +1332,8 @@ const SCHEMA: &[&str] = &[
          next_attempt_ms INTEGER NOT NULL,
          last_error TEXT,
          created_ms INTEGER NOT NULL,
-         delivered_ms INTEGER
+         delivered_ms INTEGER,
+         chat_id INTEGER
        )"#,
     "CREATE INDEX IF NOT EXISTS telegram_outbox_due_idx ON telegram_outbox(status, next_attempt_ms)",
     r#"CREATE TABLE IF NOT EXISTS role_messaging (
@@ -1964,6 +2020,7 @@ mod tests {
                     event: "ORDER".to_string(),
                     recipients: "developer".to_string(),
                     text: "task".to_string(),
+                    chat_id: None,
                 }),
             )
             .await?;
@@ -2394,6 +2451,7 @@ mod tests {
                     event: "ORDER".to_string(),
                     recipients: "developer".to_string(),
                     text: "task".to_string(),
+                    chat_id: None,
                 }),
             )
             .await?;
