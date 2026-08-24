@@ -16,8 +16,8 @@ use crate::{
     AppState,
     config::TelegramBotMode,
     dispatch::{
-        BroadcastArgs, MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, ToolOutcome,
-        parse_arguments, render_template,
+        BroadcastArgs, MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramReplyArgs,
+        ToolOutcome, parse_arguments, render_template,
     },
 };
 
@@ -150,6 +150,20 @@ impl RoleMcp {
                 ),
             ));
         }
+        tools.push(tool(
+            "telegram_reply",
+            "Send the final answer to the operator who started the most recent Telegram dispatch for this role.",
+            object_schema(
+                &json!({
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": config.max_message_chars
+                    }
+                }),
+                &["message"],
+            ),
+        ));
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         tools
     }
@@ -338,6 +352,10 @@ impl ServerHandler for RoleMcp {
             },
             "msg_all" => match parse_arguments::<MessageAllArgs>(request.arguments) {
                 Ok(args) => self.state.dispatcher.message_all(&self.role, args).await,
+                Err(outcome) => outcome,
+            },
+            "telegram_reply" => match parse_arguments::<TelegramReplyArgs>(request.arguments) {
+                Ok(args) => self.state.dispatcher.telegram_reply(&self.role, args.message).await,
                 Err(outcome) => outcome,
             },
             _ => unreachable!("tool availability was checked above"),

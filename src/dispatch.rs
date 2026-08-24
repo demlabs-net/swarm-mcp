@@ -130,6 +130,12 @@ pub struct MessageAllArgs {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramReplyArgs {
+    pub message: String,
+}
+
 #[derive(Debug)]
 pub struct TelegramInboundArgs {
     pub update_id: i64,
@@ -138,6 +144,8 @@ pub struct TelegramInboundArgs {
     pub username: String,
     pub message: String,
     pub targets: Vec<String>,
+    /// Source Telegram chat: private chat id for DM, group/channel id otherwise.
+    pub chat_id: i64,
 }
 
 fn completed_status() -> String {
@@ -703,6 +711,7 @@ impl Dispatcher {
             "username": args.username,
             "message": message,
             "targets": targets,
+            "chat_id": args.chat_id,
         }));
         let manager = self.config.manager_role.clone();
         if let Some(outcome) = self
@@ -717,6 +726,13 @@ impl Dispatcher {
             .await
         {
             return outcome;
+        }
+        if let Err(error) = self
+            .store
+            .set_dispatch_telegram_chat(&dispatch_id, args.chat_id)
+            .await
+        {
+            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source chat failed");
         }
 
         let update_id = args.update_id.to_string();
@@ -786,7 +802,7 @@ impl Dispatcher {
             "username": args.username,
             "results": results,
         });
-        let audit = self.audit(
+        let audit = self.audit_with_chat(
             &manager,
             "TELEGRAM_INBOUND",
             &targets.join(", "),
@@ -797,9 +813,59 @@ impl Dispatcher {
                 targets.join(", "),
                 Value::Object(results.clone())
             ),
+            Some(args.chat_id),
             &mut result,
         );
         self.finish(&dispatch_id, status, &result, audit, !ok).await
+    }
+
+    /// Delivers the agent's final answer to the operator who started the most
+    /// recent Telegram inbound dispatch targeting `sender` (used by the
+    /// `telegram_reply` MCP tool).
+    pub async fn telegram_reply(&self, sender: &str, message: String) -> ToolOutcome {
+        let message = match self.clean_text(&message, "message") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        if message.is_empty() {
+            return tool_error(json!({
+                "ok": false,
+                "error": "Telegram reply must not be empty",
+            }));
+        }
+        let chat_id = match self.store.telegram_chat_for_role(sender).await {
+            Ok(Some(chat_id)) => chat_id,
+            Ok(None) => {
+                return tool_error(json!({
+                    "ok": false,
+                    "error": "no active Telegram dispatch for this role",
+                }));
+            }
+            Err(error) => {
+                warn!(role = %sender, error = %error, "Telegram reply chat lookup failed");
+                return tool_error_message(error);
+            }
+        };
+        let audit = AuditMessage {
+            id: format!("reply_{}", Uuid::new_v4().simple()),
+            sender: sender.to_string(),
+            event: "TELEGRAM_REPLY".to_string(),
+            recipients: "operator".to_string(),
+            text: message,
+            chat_id: Some(chat_id),
+        };
+        if let Err(error) = self.store.enqueue_outbox(audit).await {
+            warn!(role = %sender, error = %error, "Telegram reply enqueue failed");
+            return tool_error_message(error);
+        }
+        ToolOutcome {
+            value: json!({
+                "ok": true,
+                "queued": true,
+                "chat_id": chat_id,
+            }),
+            is_error: false,
+        }
     }
 
     pub fn spawn_outbox_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
@@ -881,11 +947,15 @@ impl Dispatcher {
             ));
         }
         for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
+            let chat_id = item
+                .chat_id
+                .map(|chat_id| chat_id.to_string())
+                .unwrap_or_else(|| group.clone());
             let response = self
                 .telegram_client
                 .post(&url)
                 .json(&json!({
-                    "chat_id": group,
+                    "chat_id": chat_id,
                     "text": chunk,
                     "disable_web_page_preview": true,
                 }))
@@ -1051,6 +1121,18 @@ impl Dispatcher {
         text: &str,
         result: &mut Value,
     ) -> Option<AuditMessage> {
+        self.audit_with_chat(sender, event, recipients, text, None, result)
+    }
+
+    fn audit_with_chat(
+        &self,
+        sender: &str,
+        event: &str,
+        recipients: &str,
+        text: &str,
+        chat_id: Option<i64>,
+        result: &mut Value,
+    ) -> Option<AuditMessage> {
         if !self.config.telegram_enabled {
             result["telegram"] = json!({"queued": false, "enabled": false});
             return None;
@@ -1063,6 +1145,7 @@ impl Dispatcher {
             event: event.to_string(),
             recipients: recipients.to_string(),
             text: text.to_string(),
+            chat_id,
         })
     }
 

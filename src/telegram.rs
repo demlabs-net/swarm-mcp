@@ -262,6 +262,7 @@ impl TelegramGateway {
                         username,
                         message: text,
                         targets,
+                        chat_id: message.chat.id,
                     })
                     .await;
                 if outcome.value.get("error").and_then(Value::as_str)
