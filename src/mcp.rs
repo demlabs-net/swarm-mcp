@@ -16,7 +16,8 @@ use crate::{
     AppState,
     config::TelegramBotMode,
     dispatch::{
-        BroadcastArgs, MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, ToolOutcome,
+        BroadcastArgs, ClearMessageQueueArgs, DisableMessagingArgs, EnableMessagingArgs,
+        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramReplyArgs, ToolOutcome,
         parse_arguments, render_template,
     },
 };
@@ -80,6 +81,68 @@ impl RoleMcp {
                 ),
             ));
         }
+        if self.role == config.manager_role {
+            let agents = config.agent_roles.clone();
+            tools.push(control_tool(
+                "messaging_disable",
+                "Immediately block an executor from sending or receiving Swarm MCP dispatches and optionally cancel undelivered Telegram audits involving it.",
+                object_schema(
+                    &json!({
+                        "agent": {"type": "string", "enum": agents},
+                        "reason": {
+                            "type": "string",
+                            "maxLength": 500,
+                            "default": ""
+                        },
+                        "clear_queue": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Cancel pending and dead Telegram audit items sent by or addressed to this role."
+                        }
+                    }),
+                    &["agent"],
+                ),
+                true,
+            ));
+            tools.push(control_tool(
+                "messaging_enable",
+                "Re-enable one executor only after an explicit human resume request, root-cause verification, and the configured cooldown. Read swarm://messaging immediately first; cancelled queue items are never replayed.",
+                object_schema(
+                    &json!({
+                        "agent": {"type": "string", "enum": config.agent_roles},
+                        "reason": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500,
+                            "description": "Concrete root-cause remediation verified after an explicit human resume request."
+                        },
+                        "expected_disabled_at": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": "Exact changed_at value read from swarm://messaging immediately before this call."
+                        }
+                    }),
+                    &["agent", "reason", "expected_disabled_at"],
+                ),
+                false,
+            ));
+            tools.push(control_tool(
+                "messaging_clear_queue",
+                "Cancel undelivered Telegram audit items sent by or addressed to one executor without deleting delivered audit history.",
+                object_schema(
+                    &json!({
+                        "agent": {"type": "string", "enum": config.agent_roles},
+                        "include_dead": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Also mark exhausted dead-letter items as cancelled."
+                        }
+                    }),
+                    &["agent"],
+                ),
+                true,
+            ));
+        }
         if config.agent_roles.contains(&self.role) {
             let supervisors = config.supervisors(&self.role);
             let peers = config
@@ -90,7 +153,7 @@ impl RoleMcp {
                 .collect::<Vec<_>>();
             tools.push(tool(
                 "report",
-                "Report progress, completion, failure, or a blocker to an authorized supervisor.",
+                "Persist and audit progress, completion, failure, or a blocker for an authorized supervisor. Progress does not start a supervisor run; configured terminal statuses do.",
                 object_schema(
                     &json!({
                         "summary": {
@@ -100,8 +163,9 @@ impl RoleMcp {
                         },
                         "task_id": {
                             "type": "string",
-                            "maxLength": 160,
-                            "default": ""
+                            "minLength": 1,
+                            "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
+                            "description": "Task identifier from the order being reported."
                         },
                         "status": {
                             "type": "string",
@@ -115,7 +179,7 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["summary"],
+                    &["summary", "task_id"],
                 ),
             ));
             tools.push(tool(
@@ -124,6 +188,7 @@ impl RoleMcp {
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": peers},
+                        "task_id": task_id_schema(),
                         "message": {
                             "type": "string",
                             "minLength": 1,
@@ -131,7 +196,7 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["agent", "message"],
+                    &["agent", "task_id", "message"],
                 ),
             ));
             tools.push(tool(
@@ -139,6 +204,7 @@ impl RoleMcp {
                 "Send the same coordination message to every other executor.",
                 object_schema(
                     &json!({
+                        "task_id": task_id_schema(),
                         "message": {
                             "type": "string",
                             "minLength": 1,
@@ -146,10 +212,24 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["message"],
+                    &["task_id", "message"],
                 ),
             ));
         }
+        tools.push(tool(
+            "telegram_reply",
+            "Send the final answer to the operator who started the most recent Telegram dispatch for this role.",
+            object_schema(
+                &json!({
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": config.max_message_chars
+                    }
+                }),
+                &["message"],
+            ),
+        ));
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         tools
     }
@@ -176,6 +256,14 @@ impl RoleMcp {
                 Resource::new("swarm://executors", "executors")
                     .with_title("Development swarm executors")
                     .with_description("Compatibility alias for swarm://hierarchy.")
+                    .with_mime_type("application/json"),
+            );
+            resources.push(
+                Resource::new("swarm://messaging", "messaging")
+                    .with_title("Executor messaging circuit breakers")
+                    .with_description(
+                        "Persistent per-executor messaging state and counts of undelivered Telegram audits involving each role.",
+                    )
                     .with_mime_type("application/json"),
             );
         }
@@ -235,6 +323,9 @@ impl RoleMcp {
                 "idempotency_keys": true,
                 "rate_limit": config.rate_limit,
                 "rate_window_seconds": config.rate_window.as_secs(),
+                "duplicate_window_seconds": config.duplicate_window.as_secs(),
+                "messaging_reenable_cooldown_seconds": config.messaging_reenable_cooldown.as_secs(),
+                "report_wake_statuses": config.report_wake_statuses,
                 "max_inflight_dispatches": config.max_inflight_dispatches,
                 "telegram_outbox": config.telegram_enabled,
                 "telegram_bot_mode": match config.telegram_bot_mode {
@@ -272,10 +363,25 @@ impl RoleMcp {
         }
         pieces.push(
             format!(
-                "Use a unique, stable idempotency_key when retrying any order, report, or message; never recycle it for another logical operation. Idempotency records are retained for {} days. Read swarm://operations to inspect accepted, partial, and indeterminate dispatches before retrying.",
-                config.operation_retention_days
+                "Use a unique, stable idempotency_key when retrying any order, report, or message; never recycle it for another logical operation. A dispatch that definitively failed releases its key, so retrying with the same key re-executes; accepted, partial, and indeterminate results replay. The server also suppresses content-identical dispatches for {} seconds even when the caller changes or omits the key. Idempotency records are retained for {} days. Read swarm://operations before retrying.",
+                config.duplicate_window.as_secs(), config.operation_retention_days
             )
         );
+        pieces.push(format!(
+            "Progress reports are persisted and audited without starting a supervisor run. Only these terminal/material statuses wake the supervisor: {}.",
+            config
+                .report_wake_statuses
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if self.role == config.manager_role {
+            pieces.push(format!(
+                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered Telegram audits sent by or addressed to that executor. A dispatch rejected by this breaker is a terminal stop condition for the current run: do not call messaging_enable to make an order succeed. Re-enable only in a later turn after an explicit human resume request, verified remediation, a fresh swarm://messaging read, and the {}-second cooldown. messaging_enable never replays cancelled items.",
+                config.messaging_reenable_cooldown.as_secs()
+            ));
+        }
         pieces.join("\n\n")
     }
 }
@@ -340,6 +446,40 @@ impl ServerHandler for RoleMcp {
                 Ok(args) => self.state.dispatcher.message_all(&self.role, args).await,
                 Err(outcome) => outcome,
             },
+            "telegram_reply" => match parse_arguments::<TelegramReplyArgs>(request.arguments) {
+                Ok(args) => self.state.dispatcher.telegram_reply(&self.role, args.message).await,
+                Err(outcome) => outcome,
+            },
+            "messaging_disable" => match parse_arguments::<DisableMessagingArgs>(request.arguments)
+            {
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .disable_messaging(&self.role, args)
+                        .await
+                }
+                Err(outcome) => outcome,
+            },
+            "messaging_enable" => match parse_arguments::<EnableMessagingArgs>(request.arguments) {
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .enable_messaging(&self.role, args)
+                        .await
+                }
+                Err(outcome) => outcome,
+            },
+            "messaging_clear_queue" => {
+                match parse_arguments::<ClearMessageQueueArgs>(request.arguments) {
+                    Ok(args) => {
+                        self.state
+                            .dispatcher
+                            .clear_message_queue(&self.role, args)
+                            .await
+                    }
+                    Err(outcome) => outcome,
+                }
+            }
             _ => unreachable!("tool availability was checked above"),
         };
         Ok(tool_result(outcome).into())
@@ -409,6 +549,12 @@ impl ServerHandler for RoleMcp {
                 )
                 .await
                 .map_err(internal_error)?,
+            "swarm://messaging" => self
+                .state
+                .store
+                .messaging_snapshot(&self.state.config.agent_roles)
+                .await
+                .map_err(internal_error)?,
             _ => unreachable!("resource availability was checked above"),
         };
         let text = serde_json::to_string_pretty(&value).map_err(internal_error)?;
@@ -431,6 +577,23 @@ fn tool(name: &'static str, description: &'static str, schema: Arc<JsonObject>) 
     value
 }
 
+fn control_tool(
+    name: &'static str,
+    description: &'static str,
+    schema: Arc<JsonObject>,
+    destructive: bool,
+) -> Tool {
+    let mut value = Tool::new(name, description, schema);
+    value.annotations = Some(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(destructive)
+            .idempotent(true)
+            .open_world(false),
+    );
+    value
+}
+
 fn object_schema(properties: &Value, required: &[&str]) -> Arc<JsonObject> {
     Arc::new(
         json!({
@@ -449,9 +612,18 @@ fn idempotency_schema() -> Value {
     json!({
         "type": "string",
         "minLength": 1,
-        "maxLength": 160,
+        "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
         "pattern": "^[A-Za-z0-9_.:-]+$",
         "description": "Stable key for safe retries. Reusing it with different arguments is rejected."
+    })
+}
+
+fn task_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
+        "description": "Task identifier from the active order; peer coordination without task lineage is rejected."
     })
 }
 
@@ -470,4 +642,363 @@ fn tool_result(outcome: ToolOutcome) -> CallToolResult {
 fn internal_error(error: impl std::fmt::Display) -> McpError {
     tracing::error!(error = %error, "MCP resource read failed");
     McpError::internal_error("persistent resource read failed", None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppState, testutil};
+    use rmcp::ServiceExt;
+    use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
+
+    async fn role_mcp(role: &str) -> anyhow::Result<(RoleMcp, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("mcp");
+        let config = std::sync::Arc::new(testutil::fixture_config(&path));
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = std::sync::Arc::new(AppState {
+            config,
+            store,
+            dispatcher,
+        });
+        Ok((RoleMcp::new(state, role.to_string()), path))
+    }
+
+    fn tool_names(mcp: &RoleMcp) -> Vec<String> {
+        mcp.tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
+
+    fn resource_uris(mcp: &RoleMcp) -> Vec<String> {
+        mcp.resources()
+            .into_iter()
+            .map(|resource| resource.uri)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn manager_catalog_is_global_authority() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("manager").await?;
+        assert_eq!(
+            tool_names(&mcp),
+            vec![
+                "messaging_clear_queue",
+                "messaging_disable",
+                "messaging_enable",
+                "order",
+                "order_all",
+                "telegram_reply"
+            ]
+        );
+        let resources = resource_uris(&mcp);
+        assert!(resources.contains(&"swarm://executors".to_string()));
+        assert!(resources.contains(&"swarm://activity".to_string()));
+        assert!(resources.contains(&"swarm://messaging".to_string()));
+        // the order tool schema enumerates exactly the ACL targets
+        let order = mcp
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name == "order")
+            .unwrap();
+        let schema = serde_json::to_value(&order.input_schema).unwrap();
+        assert_eq!(
+            schema["properties"]["agent"]["enum"],
+            json!(["developer", "lead-developer"])
+        );
+        let enable = mcp
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name == "messaging_enable")
+            .unwrap();
+        let enable_schema = serde_json::to_value(&enable.input_schema).unwrap();
+        assert_eq!(
+            enable_schema["required"],
+            json!(["agent", "reason", "expected_disabled_at"])
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_catalog_is_coordination_only() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("developer").await?;
+        assert_eq!(
+            tool_names(&mcp),
+            vec!["msg_all", "msg_to", "report", "telegram_reply"]
+        );
+        let resources = resource_uris(&mcp);
+        assert!(!resources.contains(&"swarm://executors".to_string()));
+        assert!(!resources.contains(&"swarm://activity".to_string()));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authority_catalog_exposes_activity() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("lead-developer").await?;
+        assert_eq!(
+            tool_names(&mcp),
+            vec!["msg_all", "msg_to", "order", "report", "telegram_reply"]
+        );
+        let resources = resource_uris(&mcp);
+        assert!(resources.contains(&"swarm://activity".to_string()));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hierarchy_json_reports_effective_acl() -> anyhow::Result<()> {
+        let (mcp, path) = role_mcp("lead-developer").await?;
+        let hierarchy = mcp.hierarchy();
+        assert_eq!(hierarchy["caller"], json!("lead-developer"));
+        assert_eq!(hierarchy["manager"], json!("manager"));
+        assert_eq!(hierarchy["caller_may_order"], json!(["developer"]));
+        assert_eq!(hierarchy["caller_supervisors"], json!(["manager"]));
+        assert_eq!(
+            hierarchy["safeguards"]["telegram_sender_configured"],
+            json!(false)
+        );
+        assert_eq!(
+            hierarchy["tools"],
+            json!(["msg_all", "msg_to", "order", "report", "telegram_reply"])
+        );
+        assert!(mcp.instructions().contains("releases its key"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[test]
+    fn parse_arguments_validates_the_json_contract() {
+        let valid: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"agent":"developer","command":"x"}"#).unwrap(),
+        ));
+        assert!(valid.is_ok());
+        let unknown: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"agent":"developer","command":"x","extra":1}"#).unwrap(),
+        ));
+        assert!(unknown.is_err(), "deny_unknown_fields must reject extras");
+        let missing: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"agent":"developer"}"#).unwrap(),
+        ));
+        assert!(missing.is_err(), "required fields are enforced");
+        let empty: Result<OrderArgs, ToolOutcome> = parse_arguments(None);
+        assert!(empty.is_err(), "no arguments is an error");
+    }
+
+    /// Boot the real router (auth + MCP services) with a mock Hermes and return
+    /// the base URL plus the config needed to connect as any role.
+    async fn spawn_live_router()
+    -> anyhow::Result<(String, Arc<crate::config::Config>, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("mcp-e2e");
+        let hermes =
+            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "run-e2e"})))).await;
+        let mut config = testutil::fixture_config(&path);
+        config.allowed_hosts = vec!["127.0.0.1".to_string()];
+        for agent in config.agents.values_mut() {
+            agent.api_url = hermes.parse()?;
+        }
+        let config = Arc::new(config);
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(AppState {
+            config: config.clone(),
+            store,
+            dispatcher,
+        });
+        let router = crate::http::build_router(state, &tokio_util::sync::CancellationToken::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("live router serves");
+        });
+        Ok((format!("http://127.0.0.1:{port}"), config, path))
+    }
+
+    fn resource_text(response: &rmcp::model::ReadResourceResult) -> &str {
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } =
+            response.contents.first().expect("text content")
+        else {
+            panic!("resource must be text");
+        };
+        text.as_str()
+    }
+
+    #[tokio::test]
+    async fn call_tool_and_read_resource_via_live_router() -> anyhow::Result<()> {
+        let (base, config, path) = spawn_live_router().await?;
+        let client = rmcp::model::ClientInfo::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("mcp-e2e", env!("CARGO_PKG_VERSION")),
+        )
+        .serve(rmcp::transport::StreamableHttpClientTransport::with_client(
+            reqwest::Client::builder().build()?,
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                format!("{base}/mcp/manager"),
+            )
+            .auth_header(config.agents["manager"].mcp_token.expose()),
+        ))
+        .await?;
+
+        // order tool end-to-end: MCP call -> ACL -> mock Hermes -> durable result.
+        let call =
+            client
+                .call_tool(CallToolRequestParams::new("order").with_arguments(
+                    serde_json::from_str(r#"{"agent":"developer","command":"do it"}"#)?,
+                ))
+                .await?;
+        let structured = call.structured_content.expect("structured result");
+        assert_eq!(structured["ok"], json!(true));
+        assert_eq!(structured["run_id"], json!("run-e2e"));
+
+        // order_all goes through the same wire path as a global authority.
+        let call_all = client
+            .call_tool(
+                CallToolRequestParams::new("order_all")
+                    .with_arguments(serde_json::from_str(r#"{"command":"broadcast"}"#)?),
+            )
+            .await?;
+        let structured_all = call_all.structured_content.expect("structured result");
+        assert_eq!(structured_all["ok"], json!(true));
+        assert_eq!(
+            structured_all["results"]["developer"]["run_id"],
+            json!("run-e2e")
+        );
+
+        // Unknown tools are rejected with METHOD_NOT_FOUND, not silently ignored.
+        assert!(
+            client
+                .call_tool(CallToolRequestParams::new("frobnicate"))
+                .await
+                .is_err()
+        );
+
+        // Resources are served from the store through the HTTP transport.
+        let hierarchy = client
+            .read_resource(ReadResourceRequestParams::new("swarm://hierarchy"))
+            .await?;
+        let value: Value = serde_json::from_str(resource_text(&hierarchy))?;
+        assert_eq!(value["caller"], json!("manager"));
+        assert_eq!(
+            value["tools"],
+            json!([
+                "messaging_clear_queue",
+                "messaging_disable",
+                "messaging_enable",
+                "order",
+                "order_all",
+                "telegram_reply"
+            ])
+        );
+
+        let operations = client
+            .read_resource(ReadResourceRequestParams::new("swarm://operations"))
+            .await?;
+        assert_eq!(operations.contents.len(), 1);
+
+        // Unknown resources are rejected, never silently empty.
+        assert!(
+            client
+                .read_resource(ReadResourceRequestParams::new("swarm://nope"))
+                .await
+                .is_err()
+        );
+
+        client.cancel().await?;
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_client_gets_its_own_resources() -> anyhow::Result<()> {
+        let (base, config, path) = spawn_live_router().await?;
+        let manager = rmcp::model::ClientInfo::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("mcp-e2e-manager", env!("CARGO_PKG_VERSION")),
+        )
+        .serve(rmcp::transport::StreamableHttpClientTransport::with_client(
+            reqwest::Client::builder().build()?,
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                format!("{base}/mcp/manager"),
+            )
+            .auth_header(config.agents["manager"].mcp_token.expose()),
+        ))
+        .await?;
+        let assignment =
+            manager
+                .call_tool(CallToolRequestParams::new("order").with_arguments(
+                    serde_json::from_value(json!({
+                        "agent": "lead-developer",
+                        "command": "Review the assigned task"
+                    }))?,
+                ))
+                .await?;
+        let task_id = assignment
+            .structured_content
+            .as_ref()
+            .and_then(|value| value["task_id"].as_str())
+            .expect("assigned task id")
+            .to_string();
+        manager.cancel().await?;
+
+        let client = rmcp::model::ClientInfo::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("mcp-e2e", env!("CARGO_PKG_VERSION")),
+        )
+        .serve(rmcp::transport::StreamableHttpClientTransport::with_client(
+            reqwest::Client::builder().build()?,
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                format!("{base}/mcp/lead-developer"),
+            )
+            .auth_header(config.agents["lead-developer"].mcp_token.expose()),
+        ))
+        .await?;
+        let activity = client
+            .read_resource(ReadResourceRequestParams::new("swarm://activity"))
+            .await?;
+        let value: Value = serde_json::from_str(resource_text(&activity))?;
+        assert_eq!(value["caller"], json!("lead-developer"));
+        assert_eq!(value["enabled"], json!(true));
+        assert_eq!(value["mode"], json!("record-only"));
+
+        // report and msg_to arms of call_tool.
+        let report =
+            client
+                .call_tool(CallToolRequestParams::new("report").with_arguments(
+                    serde_json::from_value(json!({
+                        "summary": "done",
+                        "task_id": task_id,
+                    }))?,
+                ))
+                .await?;
+        let report_value = report.structured_content.expect("structured result");
+        assert_eq!(report_value["ok"], json!(true));
+        assert_eq!(report_value["recipient"], json!("manager"));
+
+        let msg = client
+            .call_tool(
+                CallToolRequestParams::new("msg_to").with_arguments(serde_json::from_str(
+                    &format!(r#"{{"agent":"developer","task_id":"{task_id}","message":"ping"}}"#),
+                )?),
+            )
+            .await?;
+        let msg_value = msg.structured_content.expect("structured result");
+        assert_eq!(msg_value["ok"], json!(true));
+        assert_eq!(msg_value["agent"], json!("developer"));
+
+        // The executor must NOT see the manager-only alias.
+        assert!(
+            client
+                .read_resource(ReadResourceRequestParams::new("swarm://executors"))
+                .await
+                .is_err()
+        );
+
+        client.cancel().await?;
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
 }

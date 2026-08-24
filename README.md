@@ -5,10 +5,10 @@ Hermes development swarm. Version 0.2 is implemented in Rust and exposes a
 separate Streamable HTTP MCP endpoint for every role. A bearer token grants one
 role catalog only; it cannot be reused against another role's endpoint.
 
-The retired Python implementation is preserved under `src/old_python/` for
-audit and migration reference. It is not copied into the runtime image and is
-not part of the deployed service. The Python `requirements.txt` has been
-removed.
+The retired Python implementation was removed from the tree; the migration
+review of it lives in [REVIEW.md](REVIEW.md) (the code itself is preserved in
+git history under `src/swarm_mcp/`). It is not part of the deployed service,
+and the Python `requirements.txt` has been removed.
 
 The detailed review of the retired implementation, completed fixes, known
 limits, and capability roadmap is in [REVIEW.md](REVIEW.md).
@@ -27,7 +27,7 @@ With this configuration the catalogs are:
 
 | Caller | Tools |
 |---|---|
-| `manager` | `order`, `order_all` |
+| `manager` | `order`, `order_all`, `messaging_disable`, `messaging_enable`, `messaging_clear_queue` |
 | `lead-developer` | `order`, `report`, `msg_to`, `msg_all` |
 | `developer`, `junior`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
 
@@ -36,10 +36,31 @@ single-target `order`; the generated JSON Schema enumerates exactly the targets
 allowed to that caller. Reverse ACL lookup determines the valid `report`
 recipients. Executors may coordinate only with other executors.
 
-Every mutating tool accepts an optional `idempotency_key`. Callers should reuse
+Every dispatch tool accepts an optional `idempotency_key`. Callers should reuse
 the same key when retrying the same logical action. Reusing a key with different
-arguments is rejected. Keys must not be recycled for unrelated work; their
-records expire with `SWARM_OPERATION_RETENTION_DAYS`.
+arguments is rejected. A dispatch that **definitively failed** (the agent API
+rejected it, nothing was started) releases its key: retrying with the same key
+re-executes. `accepted`, `partial`, and `indeterminate` results replay — an
+`indeterminate` result means the downstream may have accepted the operation, so
+do not re-run it; inspect `swarm://operations` first. Keys must not be recycled
+for unrelated work; their records expire with `SWARM_OPERATION_RETENTION_DAYS`.
+Independently of caller keys, the server suppresses a content-identical
+sender/kind/target dispatch inside `SWARM_DUPLICATE_WINDOW_SECONDS`. Whitespace
+differences do not bypass this circuit breaker. A genuinely new correction must
+contain new evidence or a changed action.
+
+Starting with 0.3.0, `report`, `msg_to`, and `msg_all` require the originating
+`task_id`. This keeps
+progress, handoffs, and peer coordination attached to one work item; untracked
+chat cannot wake another Hermes run. The server verifies that the ID belongs to
+an accepted `order`/`order_all` which actually targeted the sending role, so a
+model cannot invent a fresh ID to evade duplicate suppression.
+
+Progress reports are durable and Telegram-audited but do not automatically
+start another supervisor run. Only statuses listed in
+`SWARM_REPORT_WAKE_STATUSES` wake the supervisor; the production default is
+`completed,blocked,failed`. This separates observation from orchestration and
+prevents a stream of routine updates from recursively consuming manager turns.
 
 ## Resources
 
@@ -50,6 +71,7 @@ records expire with `SWARM_OPERATION_RETENTION_DAYS`.
 | `swarm://operations` | every role | Recent durable operations sent or received by that role |
 | `swarm://activity` | ordering authorities | Current and recent passive subordinate lifecycle state |
 | `swarm://outbox` | every role | Telegram delivery state; manager also sees the inbound offset and last successful poll |
+| `swarm://messaging` | manager | Persistent executor circuit-breaker state and undelivered queue counts |
 
 The activity endpoint records only lifecycle state. It never starts an agent,
 changes cron configuration, or sends Telegram messages. Timestamps make
@@ -64,6 +86,7 @@ The store provides:
 - WAL mode and an asynchronous connection pool;
 - a role-scoped operation ledger;
 - idempotency conflict and replay handling;
+- automatic recent-content duplicate suppression;
 - per-role persistent rate limits and a global in-flight dispatch bound;
 - explicit `accepted`, `partial`, `failed`, and `indeterminate` states;
 - automatic import of the old Python activity tables;
@@ -72,11 +95,38 @@ The store provides:
 - a durable Telegram outbox with bounded retries, `Retry-After` support, and
   per-chunk checkpoints.
 
+The manager can atomically disable an executor's Swarm MCP send/receive path
+and cancel pending/dead Telegram audit items sent by or addressed to it.
+Disabled state survives a restart. A disabled executor cannot send reports or
+peer messages and cannot receive orders, peer messages, broadcasts, or
+Telegram-inbound dispatches. `messaging_enable` never revives cancelled outbox
+records. With `clear_queue=false`, pending audits involving the disabled role
+are held without occupying the delivery batch and resume only after the role is
+explicitly enabled. Delivered audit history remains intact.
+
+Starting with 0.4.0, re-enable is guarded against an agent bypassing a breaker
+merely to make its rejected order succeed. `messaging_enable` requires a
+non-empty remediation reason and the exact `changed_at` value from a fresh
+`swarm://messaging` read. It is rejected until
+`SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS` expires, and a stale observation is
+rejected atomically. A breaker rejection is a stop-and-escalate condition for
+the current agent run; resume belongs to a later, explicit human request.
+
 Telegram delivery is asynchronous. A successful tool response reports an
 `outbox_id`; temporary Telegram failure does not turn a successfully accepted
 agent run into a failed command. Telegram delivery is at-least-once, so a crash
 between Telegram accepting a message and the local acknowledgement can produce
-a duplicate.
+a duplicate. Non-retryable Telegram 4xx responses are dead-lettered on the
+first attempt instead of being replayed repeatedly. A retryable transport
+failure stops the current batch and defers every pending item sharing that bot
+transport, so `Retry-After` cannot be bypassed by later rows from the same
+already-selected batch.
+
+Peer-delivery prompts are task-scoped and deliberately one-way by default: ACK, closure,
+stand-by, and unchanged-evidence messages must not trigger another `msg_to`.
+This prevents conversational acknowledgement loops from turning into new
+Hermes runs. The persistent manager circuit breaker remains the hard stop for
+unexpected model behavior.
 
 ## Shared Telegram gateway
 
@@ -111,6 +161,10 @@ commands are:
 /roles
 /help
 ```
+
+Role commands are generated from the configured live roster. Disabled Compose
+profiles are not included in `SWARM_AGENT_ROLES`, cannot receive orders, and do
+not appear in `/roles` or the MCP hierarchy resource.
 
 `SWARM_TELEGRAM_INBOUND_TARGETS` limits which configured roles these commands
 may address; `*` enables all roles. Each accepted Telegram update is reserved
@@ -163,7 +217,7 @@ Important groups:
 | Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
 | Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_ORDER_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
 | Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY` |
-| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS` |
+| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS`, `SWARM_REPORT_WAKE_STATUSES` |
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
 | Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |

@@ -6,6 +6,9 @@ pub mod probe;
 pub mod store;
 pub mod telegram;
 
+#[cfg(test)]
+pub(crate) mod testutil;
+
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -38,5 +41,20 @@ impl AppState {
 
     pub fn pool(&self) -> &SqlitePool {
         self.store.pool()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_builds_store_and_dispatcher() -> anyhow::Result<()> {
+        let path = crate::testutil::temp_db_path("lib");
+        let config = crate::testutil::fixture_config(&path);
+        let state = AppState::initialize(config).await?;
+        let _ = state.pool();
+        crate::testutil::remove_db_files(&path).await;
+        Ok(())
     }
 }
