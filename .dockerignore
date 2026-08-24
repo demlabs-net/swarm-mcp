@@ -9,3 +9,6 @@ README.md
 REVIEW.md
 REVIEW-PLAN.md
 .agents
+
+.env
+/data

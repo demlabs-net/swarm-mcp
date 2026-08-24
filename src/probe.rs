@@ -280,6 +280,7 @@ fn expected_tools(config: &Config, role: &str) -> BTreeSet<String> {
     if config.agent_roles.iter().any(|candidate| candidate == role) {
         tools.extend(["msg_all", "msg_to", "report"].map(str::to_string));
     }
+    tools.insert("telegram_reply".to_string());
     tools
 }
 
@@ -337,7 +338,8 @@ mod tests {
                 "messaging_disable".to_string(),
                 "messaging_enable".to_string(),
                 "order".to_string(),
-                "order_all".to_string()
+                "order_all".to_string(),
+                "telegram_reply".to_string()
             ])
         );
         let mut manager_resources = BTreeSet::from([
@@ -356,7 +358,8 @@ mod tests {
                 "msg_all".to_string(),
                 "msg_to".to_string(),
                 "order".to_string(),
-                "report".to_string()
+                "report".to_string(),
+                "telegram_reply".to_string()
             ])
         );
         manager_resources.remove("swarm://executors");
@@ -371,7 +374,8 @@ mod tests {
             BTreeSet::from([
                 "msg_all".to_string(),
                 "msg_to".to_string(),
-                "report".to_string()
+                "report".to_string(),
+                "telegram_reply".to_string()
             ])
         );
         assert_eq!(
