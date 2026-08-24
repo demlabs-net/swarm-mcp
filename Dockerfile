@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # Бинарь собирается локально (`cargo deb -o dist`) и доставляется .deb-пакетом —
-# внутри Docker компиляции нет.
-FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
+# внутри Docker компиляции нет. Хост и образ — Debian 13 (trixie, glibc 2.41),
+# поэтому deb, собранный на хосте, ставится чисто.
+FROM debian:trixie-slim
 
 COPY dist/swarm-mcp_*.deb /tmp/swarm-mcp.deb
 RUN apt-get update \
