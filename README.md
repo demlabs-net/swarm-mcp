@@ -62,6 +62,32 @@ start another supervisor run. Only statuses listed in
 `completed,blocked,failed`. This separates observation from orchestration and
 prevents a stream of routine updates from recursively consuming manager turns.
 
+## Role dispatch modes
+
+Swarm MCP is a message bus: dispatches carry a message to a role, and roles
+communicate back through the MCP server (`telegram_reply`, `report`,
+`msg_to`, …). Tasks and knowledge live outside the bus (e.g. in SLC MCP); the
+bus never queues work. How a dispatch reaches a role is per-role, configured
+with `<ROLE>_API_KIND`:
+
+| Mode | `<ROLE>_API_KIND` | Initiation | Answers | Required config |
+|---|---|---|---|---|
+| Hermes agent | `hermes` (default) | Swarm MCP calls the Hermes api_server (`POST /v1/runs`), polls the run and delivers its final `output` to the operator automatically | automatic + `telegram_reply` | `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY` |
+| OpenAI-compatible system | `openai` | Swarm MCP fires `POST {api_url}/v1/chat/completions` with `{message, instructions}` (bearer `<ROLE>_AGENT_API_KEY`); the system starts its own agent | through the swarm MCP server (`telegram_reply` at any point during the work) | `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY`, optional `<ROLE>_API_MODEL` |
+| MCP-only participant | `mcp` | none — the role initiates interaction with the roe by its own logic (its own schedule, tasks pulled from SLC, etc.); dispatches addressed to it are rejected with a clear error | proactive `telegram_reply` at any time | `<ROLE>_SWARM_MCP_TOKEN` only |
+
+A roe can mix all three kinds freely: inbound routing (`/команды`, `@роль`,
+plain text to the manager) picks the target role and dispatches it according to
+that role's mode. Hermes results carry `run_id` in the dispatch result;
+OpenAI initiation carries `initiated: true`.
+
+`telegram_reply` is the shared answer channel for non-Hermes roles. It may be
+called at any point during the work (intermediate updates and/or the final
+answer). The target chat resolves as: the most recent Telegram inbound dispatch
+of the calling role → the most recent Telegram inbound dispatch of any role
+(the operator's chat) → the group. This lets MCP-only participants message the
+operator proactively even before anyone has addressed them.
+
 ## Resources
 
 | URI | Visibility | Purpose |
@@ -216,7 +242,7 @@ Important groups:
 |---|---|
 | Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
 | Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_ORDER_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
-| Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY` |
+| Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_KIND` (`hermes`/`openai`/`mcp`), `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY`, `<ROLE>_API_MODEL` |
 | Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS`, `SWARM_REPORT_WAKE_STATUSES` |
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
