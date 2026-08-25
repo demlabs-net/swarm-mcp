@@ -47,6 +47,8 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
                 role: role.clone(),
                 api_url: "http://127.0.0.1:1".parse().expect("fixture URL"),
                 api_key: Secret::new(format!("fixture-api-key-{role}")),
+                api_kind: crate::config::ApiKind::Hermes,
+                api_model: None,
                 mcp_token: Secret::new(format!("fixture-mcp-token-{role}-0123456789")),
                 telegram_bot_token: None,
             },
@@ -191,6 +193,31 @@ pub(crate) async fn spawn_mock_hermes(behavior: MockHermes) -> String {
                             .to_string();
                         let (status, payload) =
                             behavior(&bearer, &format!("GET /v1/runs/{run_id}"));
+                        (
+                            axum::http::StatusCode::from_u16(status)
+                                .expect("mock status is valid"),
+                            axum::Json(payload),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let behavior = behavior.clone();
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let behavior = behavior.clone();
+                    async move {
+                        let bearer = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (status, payload) = behavior(
+                            &bearer,
+                            &format!("POST /v1/chat/completions {}", body.to_string()),
+                        );
                         (
                             axum::http::StatusCode::from_u16(status)
                                 .expect("mock status is valid"),

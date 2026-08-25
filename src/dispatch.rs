@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, TelegramBotMode},
+    config::{ApiKind, Config, TelegramBotMode},
     store::{AuditMessage, OutboxItem, Reservation, Store},
 };
 
@@ -51,6 +51,24 @@ enum RunOutcome {
     Failed,
     /// The run is still in progress.
     Running,
+}
+
+/// Where a dispatch to a role went: a Hermes run or an OpenAI-style
+/// initiation (the role answers through the swarm MCP server).
+#[derive(Clone, Debug)]
+pub enum DispatchHandle {
+    Run(String),
+    Initiated,
+}
+
+impl DispatchHandle {
+    /// `("run_id", id)` or `("initiated", "true")` for JSON results.
+    fn key_value(&self) -> (&'static str, String) {
+        match self {
+            DispatchHandle::Run(run_id) => ("run_id", run_id.clone()),
+            DispatchHandle::Initiated => ("initiated", "true".to_string()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -147,11 +165,12 @@ impl BroadcastSummary {
         }
     }
 
-    fn push(&mut self, target: String, result: Result<String, RunFailure>) {
+    fn push(&mut self, target: String, result: Result<DispatchHandle, RunFailure>) {
         match result {
-            Ok(run_id) => {
+            Ok(handle) => {
                 self.succeeded += 1;
-                self.results.insert(target, json!({"run_id": run_id}));
+                let (key, value) = handle.key_value();
+                self.results.insert(target, json!({ (key): value }));
             }
             Err(error) => {
                 warn!(%target, error = %error, "{}", self.label);
@@ -364,17 +383,18 @@ impl Dispatcher {
             }
         };
         match self
-            .start_run(&target, &message, &self.config.executor_run_instructions)
+            .dispatch_role(&target, &message, &self.config.executor_run_instructions)
             .await
         {
-            Ok(run_id) => {
+            Ok(handle) => {
+                let (key, value) = handle.key_value();
                 let mut result = json!({
                     "ok": true,
                     "task_id": task_id,
                     "authority": sender,
                     "agent": target,
-                    "run_id": run_id,
                 });
+                result[key] = json!(value);
                 let audit = self.audit(
                     sender,
                     "ORDER",
@@ -444,7 +464,7 @@ impl Dispatcher {
                 &command,
             ) {
                 Ok(message) => {
-                    self.start_run(target, &message, &self.config.executor_run_instructions)
+                    self.dispatch_role(target, &message, &self.config.executor_run_instructions)
                         .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
@@ -584,23 +604,24 @@ impl Dispatcher {
             }
         };
         match self
-            .start_run(
+            .dispatch_role(
                 &recipient,
                 &message,
                 &self.config.supervisor_report_instructions,
             )
             .await
         {
-            Ok(run_id) => {
+            Ok(handle) => {
+                let (key, value) = handle.key_value();
                 let mut result = json!({
                     "ok": true,
                     "report_id": dispatch_id,
                     "recipient": recipient,
-                    "recipient_run_id": run_id,
                     "task_id": task_id,
                     "status": status,
                     "supervisor_woken": true,
                 });
+                result[format!("recipient_{key}")] = json!(value);
                 let audit = self.audit(
                     sender,
                     "REPORT",
@@ -701,17 +722,18 @@ impl Dispatcher {
             }
         };
         match self
-            .start_run(&target, &body, &self.config.peer_run_instructions)
+            .dispatch_role(&target, &body, &self.config.peer_run_instructions)
             .await
         {
-            Ok(run_id) => {
+            Ok(handle) => {
+                let (key, value) = handle.key_value();
                 let mut result = json!({
                     "ok": true,
                     "message_id": message_id,
                     "task_id": task_id,
                     "agent": target,
-                    "run_id": run_id,
                 });
+                result[key] = json!(value);
                 let audit = self.audit(
                     sender,
                     "MSG",
@@ -794,7 +816,7 @@ impl Dispatcher {
             );
             let result = match body {
                 Ok(body) => {
-                    self.start_run(target, &body, &self.config.peer_run_instructions)
+                    self.dispatch_role(target, &body, &self.config.peer_run_instructions)
                         .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
@@ -918,7 +940,7 @@ impl Dispatcher {
             );
             let result = match body {
                 Ok(body) => {
-                    self.start_run(target, &body, &self.config.telegram_inbound_instructions)
+                    self.dispatch_role(target, &body, &self.config.telegram_inbound_instructions)
                         .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
@@ -1244,6 +1266,75 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Dispatch a message to a role: Hermes api_server run (current
+    /// mechanism) or OpenAI-compatible initiation for third-party roles.
+    async fn dispatch_role(
+        &self,
+        role: &str,
+        message: &str,
+        instructions: &str,
+    ) -> Result<DispatchHandle, RunFailure> {
+        let agent = self
+            .config
+            .agents
+            .get(role)
+            .ok_or_else(|| RunFailure::rejected(anyhow!("unknown target role")))?;
+        match agent.api_kind {
+            ApiKind::OpenAi => {
+                self.initiate_openai(agent, message, instructions).await?;
+                Ok(DispatchHandle::Initiated)
+            }
+            ApiKind::Hermes => {
+                let run_id = self.start_run(role, message, instructions).await?;
+                Ok(DispatchHandle::Run(run_id))
+            }
+        }
+    }
+
+    /// Fire-and-forget initiation of a third-party role via an
+    /// OpenAI-compatible endpoint. The role then works and sends its answers
+    /// through the swarm MCP server (telegram_reply) at any point.
+    async fn initiate_openai(
+        &self,
+        agent: &crate::config::AgentConfig,
+        message: &str,
+        instructions: &str,
+    ) -> Result<(), RunFailure> {
+        let url = format!(
+            "{}/v1/chat/completions",
+            agent.api_url.as_str().trim_end_matches('/')
+        );
+        let model = agent
+            .api_model
+            .clone()
+            .unwrap_or_else(|| self.config.hermes_model_alias.clone());
+        let response = self
+            .hermes_client
+            .post(&url)
+            .bearer_auth(agent.api_key.expose())
+            .json(&json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": message},
+                ],
+                "stream": false,
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                RunFailure::indeterminate(anyhow!("openai initiate to {}: {error}", agent.role))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(RunFailure::rejected(anyhow!(
+                "openai initiate to {} returned HTTP {status}",
+                agent.role
+            )));
+        }
+        Ok(())
+    }
+
     async fn start_run(
         &self,
         role: &str,
@@ -1259,7 +1350,10 @@ impl Dispatcher {
             .await
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is saturated")))?
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is shutting down")))?;
-        let url = format!("{}/v1/runs", agent.api_url.as_str().trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/runs",
+            agent.api_url.as_str().trim_end_matches('/')
+        );
         let response = self
             .hermes_client
             .post(url)
@@ -3035,6 +3129,65 @@ mod tests {
         assert_eq!(reply.chat_id, Some(424_242));
 
         // The run is no longer tracked once delivered.
+        assert!(dispatcher.run_replies.lock().unwrap().is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_role_is_initiated_via_chat_completions() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-openai");
+        let telegram_base = spawn_mock_telegram_with(Arc::new(|_, _| (200, json!({"ok": true}), None))).await;
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = crate::config::TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(crate::config::Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        config.telegram_api_base_url = telegram_base.parse()?;
+        let initiated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = initiated.clone();
+        let mock = testutil::spawn_mock_hermes(Arc::new(move |_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                (
+                    200,
+                    json!({"id": "chatcmpl-1", "choices": [{"message": {"role": "assistant", "content": ""}}]}),
+                )
+            } else {
+                (404, json!({"error": "unexpected endpoint"}))
+            }
+        }))
+        .await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = mock.parse()?;
+        }
+        config
+            .agents
+            .get_mut("developer")
+            .expect("fixture has developer")
+            .api_kind = crate::config::ApiKind::OpenAi;
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 7,
+                message_id: 200,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
+        assert_eq!(outcome.value["results"]["developer"]["initiated"], json!("true"));
+        assert!(initiated.load(std::sync::atomic::Ordering::SeqCst));
+        // OpenAI roles have no Hermes run to poll.
         assert!(dispatcher.run_replies.lock().unwrap().is_empty());
         testutil::remove_db_files(&path).await;
         Ok(())

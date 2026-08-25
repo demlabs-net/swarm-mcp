@@ -34,10 +34,25 @@ impl fmt::Debug for Secret {
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub role: String,
+    /// API endpoint used to initiate work for this role. For Hermes agents it
+    /// is the api_server (`/v1/runs`); for third-party roles
+    /// (`api_kind = openai`) it is any OpenAI-compatible endpoint.
     pub api_url: Url,
     pub api_key: Secret,
+    /// How dispatches reach the role: the Hermes api_server protocol or an
+    /// OpenAI-compatible chat endpoint (the role then answers through the
+    /// swarm MCP server, e.g. telegram_reply).
+    pub api_kind: ApiKind,
+    /// Model id for `api_kind = openai`; falls back to the swarm alias.
+    pub api_model: Option<String>,
     pub mcp_token: Secret,
     pub telegram_bot_token: Option<Secret>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiKind {
+    Hermes,
+    OpenAi,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,6 +295,17 @@ impl Config {
                 api_key.expose().len() >= 16,
                 "{prefix}_AGENT_API_KEY is too short"
             );
+            // Сторонние системы: {PREFIX}_API_KIND=openai — диспатч идёт через
+            // OpenAI-совместимый endpoint, ответы — через swarm MCP.
+            let api_kind = match optional(env, &format!("{prefix}_API_KIND"))
+                .as_deref()
+                .unwrap_or("hermes")
+            {
+                "hermes" => ApiKind::Hermes,
+                "openai" => ApiKind::OpenAi,
+                other => bail!("{prefix}_API_KIND must be hermes or openai, got {other}"),
+            };
+            let api_model = optional(env, &format!("{prefix}_API_MODEL"));
             let token_value = required(env, &format!("{prefix}_SWARM_MCP_TOKEN"))?;
             ensure!(
                 token_value.len() >= 24,
@@ -297,6 +323,8 @@ impl Config {
                     role: role.clone(),
                     api_url,
                     api_key,
+                    api_kind,
+                    api_model,
                     mcp_token: Secret(token_value),
                     telegram_bot_token,
                 },

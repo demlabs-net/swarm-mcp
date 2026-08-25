@@ -218,7 +218,7 @@ impl RoleMcp {
         }
         tools.push(tool(
             "telegram_reply",
-            "Send the final answer to the operator who started the most recent Telegram dispatch for this role.",
+            "Send a message to the operator who started the most recent Telegram dispatch for this role. May be used at any point during the work (intermediate updates and/or the final answer).",
             object_schema(
                 &json!({
                     "message": {
