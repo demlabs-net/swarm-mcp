@@ -216,7 +216,7 @@ pub(crate) async fn spawn_mock_hermes(behavior: MockHermes) -> String {
                             .to_string();
                         let (status, payload) = behavior(
                             &bearer,
-                            &format!("POST /v1/chat/completions {}", body.to_string()),
+                            &format!("POST /v1/chat/completions {body}"),
                         );
                         (
                             axum::http::StatusCode::from_u16(status)

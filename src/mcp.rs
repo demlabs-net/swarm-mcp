@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_arguments_validates_the_json_contract() {
+    fn parse_arguments_requires_known_fields_and_ignores_stray_fields() {
         let valid: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
             serde_json::from_str(r#"{"agent":"developer","command":"x"}"#).unwrap(),
         ));
@@ -780,7 +780,9 @@ mod tests {
         let unknown: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
             serde_json::from_str(r#"{"agent":"developer","command":"x","extra":1}"#).unwrap(),
         ));
-        assert!(unknown.is_err(), "deny_unknown_fields must reject extras");
+        let unknown = unknown.expect("stray LLM fields must be ignored");
+        assert_eq!(unknown.agent, "developer");
+        assert_eq!(unknown.command, "x");
         let missing: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
             serde_json::from_str(r#"{"agent":"developer"}"#).unwrap(),
         ));

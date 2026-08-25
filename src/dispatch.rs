@@ -33,7 +33,7 @@ pub struct Dispatcher {
     inflight: Arc<Semaphore>,
     messaging_gate: Arc<RwLock<()>>,
     /// Runs dispatched from Telegram inbound, awaiting their final answer so
-    /// it can be delivered to the operator's chat (see spawn_run_reply_worker).
+    /// it can be delivered to the operator's chat (see `spawn_run_reply_worker`).
     run_replies: Arc<Mutex<HashMap<String, PendingRunReply>>>,
 }
 
@@ -850,6 +850,7 @@ impl Dispatcher {
                 "error": "Telegram update contains invalid identifiers",
             }));
         }
+        let private_chat = args.chat_id == args.user_id;
         let message = match self.clean_text(&args.message, "message") {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -968,19 +969,32 @@ impl Dispatcher {
             "username": args.username,
             "results": summary.results.clone(),
         });
-        let audit = self.audit(
-            &manager,
-            "TELEGRAM_INBOUND",
-            &targets.join(", "),
-            &format!(
-                "{dispatch_id} [{status}]\nTelegram user {} ({}) → {}:\n{message}\n\nDispatch result: {}",
-                args.username,
-                args.user_id,
-                targets.join(", "),
-                Value::Object(summary.results)
-            ),
-            &mut result,
-        );
+        let audit = if private_chat {
+            // A private operator conversation must never be copied into the
+            // shared Telegram audit group. The dispatch itself stays durable,
+            // and its final answer is delivered back to the source chat by the
+            // run-reply worker.
+            result["telegram"] = json!({
+                "queued": false,
+                "enabled": self.config.telegram_enabled,
+                "privacy": "private_chat",
+            });
+            None
+        } else {
+            self.audit(
+                &manager,
+                "TELEGRAM_INBOUND",
+                &targets.join(", "),
+                &format!(
+                    "{dispatch_id} [{status}]\nTelegram user {} ({}) → {}:\n{message}\n\nDispatch result: {}",
+                    args.username,
+                    args.user_id,
+                    targets.join(", "),
+                    Value::Object(summary.results)
+                ),
+                &mut result,
+            )
+        };
         self.finish(&dispatch_id, status, &result, audit, !ok).await
     }
 
@@ -1049,7 +1063,7 @@ impl Dispatcher {
 
     /// Polls Telegram-dispatched runs and delivers their final answer to the
     /// operator's chat — the reply does not depend on the model calling
-    /// telegram_reply (api_server runs are fire-and-forget).
+    /// `telegram_reply` (`api_server` runs are fire-and-forget).
     pub fn spawn_run_reply_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
         let dispatcher = self.clone();
         tokio::spawn(async move {
@@ -1221,8 +1235,7 @@ impl Dispatcher {
                 .trim_end_matches('/'),
             token.expose()
         );
-        let header = format!("[{}] {} -> {}", item.event, item.sender, item.recipients);
-        let chunks = telegram_chunks(&header, &item.text, self.config.telegram_message_limit);
+        let chunks = telegram_chunks_for_item(item, self.config.telegram_message_limit);
         let start = usize::try_from(item.next_chunk).unwrap_or(usize::MAX);
         if start > chunks.len() {
             return Err(TelegramFailure::permanent(
@@ -1232,8 +1245,7 @@ impl Dispatcher {
         for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
             let chat_id = item
                 .chat_id
-                .map(|chat_id| chat_id.to_string())
-                .unwrap_or_else(|| group.clone());
+                .map_or_else(|| group.clone(), |chat_id| chat_id.to_string());
             let response = self
                 .telegram_client
                 .post(&url)
@@ -1256,7 +1268,7 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Dispatch a message to a role: Hermes api_server run (current
+    /// Dispatch a message to a role: Hermes `api_server` run (current
     /// mechanism) or OpenAI-compatible initiation for third-party roles.
     async fn dispatch_role(
         &self,
@@ -1286,7 +1298,7 @@ impl Dispatcher {
 
     /// Fire-and-forget initiation of a third-party role via an
     /// OpenAI-compatible endpoint. The role then works and sends its answers
-    /// through the swarm MCP server (telegram_reply) at any point.
+    /// through the swarm MCP server (`telegram_reply`) at any point.
     async fn initiate_openai(
         &self,
         agent: &crate::config::AgentConfig,
@@ -1995,6 +2007,30 @@ fn telegram_chunks(header: &str, text: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
+fn telegram_plain_chunks(text: &str, limit: usize) -> Vec<String> {
+    let room = limit.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(room)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
+fn telegram_chunks_for_item(item: &OutboxItem, limit: usize) -> Vec<String> {
+    // Telegram private chats have positive IDs. Direct agent replies should
+    // read like normal conversation, while group-bound messages retain their
+    // audit envelope and attribution.
+    if item.event == "TELEGRAM_REPLY" && item.chat_id.is_some_and(|chat_id| chat_id > 0) {
+        telegram_plain_chunks(&item.text, limit)
+    } else {
+        let header = format!("[{}] {} -> {}", item.event, item.sender, item.recipients);
+        telegram_chunks(&header, &item.text, limit)
+    }
+}
+
 fn tool_error_message(error: anyhow::Error) -> ToolOutcome {
     tool_error(json!({"ok": false, "error": error.to_string()}))
 }
@@ -2037,6 +2073,35 @@ mod tests {
             .map(|chunk| chunk.split_once('\n').unwrap().1)
             .collect::<String>();
         assert_eq!(reconstructed, "🦀".repeat(2000));
+    }
+
+    #[test]
+    fn private_telegram_reply_chunks_are_plain() {
+        let mut item = outbox_item();
+        item.event = "TELEGRAM_REPLY".to_string();
+        item.recipients = "operator".to_string();
+        item.text = "Личный ответ 🦀".repeat(100);
+        item.chat_id = Some(42);
+
+        let chunks = telegram_chunks_for_item(&item, 128);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 128));
+        assert!(chunks.iter().all(|chunk| !chunk.contains("TELEGRAM_REPLY")));
+        assert_eq!(chunks.concat(), item.text);
+    }
+
+    #[test]
+    fn group_telegram_reply_keeps_audit_header() {
+        let mut item = outbox_item();
+        item.event = "TELEGRAM_REPLY".to_string();
+        item.recipients = "operator".to_string();
+        item.text = "group reply".to_string();
+        item.chat_id = Some(-100_123);
+
+        assert_eq!(
+            telegram_chunks_for_item(&item, 512),
+            vec!["[TELEGRAM_REPLY] manager -> operator\ngroup reply"]
+        );
     }
 
     #[test]
@@ -3083,6 +3148,89 @@ mod tests {
             .fetch_one(store.pool())
             .await?;
         assert_eq!(outbox, 1, "one audit entry for the accepted update");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_telegram_inbound_is_not_copied_to_the_group_outbox() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-private"}))))
+                .await?;
+
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 6,
+                message_id: 101,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "private operator request".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 42,
+            })
+            .await;
+
+        assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
+        assert_eq!(outcome.value["telegram"]["queued"], json!(false));
+        assert_eq!(outcome.value["telegram"]["privacy"], json!("private_chat"));
+        let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            outbox, 0,
+            "private inbound text and dispatch metadata must not enter the shared group outbox"
+        );
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_telegram_reply_wire_payload_has_no_audit_header() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "run-private"}))),
+            Arc::new(move |_, body| {
+                sent_clone.lock().expect("sent").push(body.to_string());
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+
+        let inbound = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 7,
+                message_id: 102,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "private operator request".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 42,
+            })
+            .await;
+        assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
+
+        let reply_text = "Ответ без служебного заголовка";
+        let reply = dispatcher
+            .telegram_reply("developer", reply_text.to_string())
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        dispatcher.flush_outbox().await?;
+
+        let payload: Value = {
+            let bodies = sent.lock().expect("sent");
+            assert_eq!(bodies.len(), 1, "only the private reply should be sent");
+            serde_json::from_str(&bodies[0])?
+        };
+        assert_eq!(payload["chat_id"], json!("42"));
+        assert_eq!(payload["text"], json!(reply_text));
+        assert!(
+            !payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("TELEGRAM_REPLY")
+        );
         testutil::remove_db_files(&path).await;
         Ok(())
     }

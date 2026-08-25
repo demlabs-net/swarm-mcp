@@ -352,7 +352,7 @@ fn parse_mention(text: &str, allowed_targets: &[String]) -> Option<ParsedCommand
             })
         };
     }
-    if allowed_targets.iter().any(|target| target == &mention) && !rest.is_empty() {
+    if allowed_targets.iter().any(|target| target == mention) && !rest.is_empty() {
         return Some(ParsedCommand::Dispatch {
             targets: vec![mention.to_string()],
             message: rest.to_string(),

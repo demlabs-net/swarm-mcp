@@ -35,14 +35,14 @@ impl fmt::Debug for Secret {
 pub struct AgentConfig {
     pub role: String,
     /// API endpoint used to initiate work for this role. For Hermes agents it
-    /// is the api_server (`/v1/runs`); for `api_kind = openai` it is any
+    /// is the `api_server` (`/v1/runs`); for `api_kind = openai` it is any
     /// OpenAI-compatible endpoint. Absent for `api_kind = mcp` (the role is
     /// reachable only through the swarm MCP server and initiates interaction
     /// itself).
     pub api_url: Option<Url>,
     pub api_key: Option<Secret>,
     /// How dispatches reach the role:
-    /// - `hermes` — the Hermes api_server protocol (`/v1/runs` + result polling)
+    /// - `hermes` — the Hermes `api_server` protocol (`/v1/runs` + result polling)
     /// - `openai` — an OpenAI-compatible chat endpoint (fire-and-forget
     ///   initiation; the role answers through the swarm MCP server)
     /// - `mcp` — MCP-only: no dispatch endpoint, the role initiates

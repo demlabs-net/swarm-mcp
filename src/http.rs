@@ -17,7 +17,6 @@ use axum::{
     routing::{get, post},
 };
 use chrono::DateTime;
-use futures::stream::{StreamExt, once};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
     session::local::LocalSessionManager,
@@ -155,6 +154,7 @@ async fn serve_with_shutdown(
         .await;
     cancellation.cancel();
     let _ = outbox.await;
+    let _ = run_replies.await;
     if let Some(worker) = telegram_inbound {
         let _ = worker.await;
     }

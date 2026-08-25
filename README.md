@@ -163,15 +163,19 @@ Telegram audit delivery has two mutually exclusive modes:
 | `per-role` | `<ROLE>_TELEGRAM_BOT_TOKEN` for every role | disabled |
 | `shared` | one `SWARM_TELEGRAM_BOT_TOKEN` owned by Swarm MCP | optional |
 
-In shared mode every `order`, `order_all`, `report`, `msg_to`, `msg_all`, and
-accepted Telegram command is copied to `TELEGRAM_GROUP_ID` by the same bot. The
-audit header still identifies the event, sender, and recipients, so individual
+In shared mode every `order`, `order_all`, `report`, `msg_to`, and `msg_all` is
+copied to `TELEGRAM_GROUP_ID` by the same bot. Commands originating in that
+group are audited there as well. Private chats are isolated: their inbound
+text, user metadata, and dispatch result never enter the group outbox, and the
+final answer is sent back to the source chat without an audit header. Group
+audit messages still identify the event, sender, and recipients, so individual
 Hermes containers do not need Telegram credentials. Executors report through
 Swarm MCP; their reports are therefore published by the shared bot as well.
 
 Set `SWARM_TELEGRAM_INBOUND_ENABLED=true` to let authorized people address the
-swarm through that bot. The gateway accepts only messages from the exact
-numeric `TELEGRAM_GROUP_ID` and positive numeric user IDs listed in
+swarm through that bot. The gateway accepts messages either from the exact
+numeric `TELEGRAM_GROUP_ID` or from a private chat whose positive chat ID
+matches the sender ID; in both cases the sender must be listed in
 `TELEGRAM_ALLOWED_USERS`. Plain group conversation is ignored. Supported
 commands are:
 
