@@ -600,7 +600,9 @@ fn object_schema(properties: &Value, required: &[&str]) -> Arc<JsonObject> {
             "type": "object",
             "properties": properties,
             "required": required,
-            "additionalProperties": false,
+            // Lenient: LLM clients occasionally add stray fields (e.g. wait_s);
+            // rejecting them breaks the whole call. Unknown fields are ignored.
+            "additionalProperties": true,
         })
         .as_object()
         .cloned()

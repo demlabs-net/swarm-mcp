@@ -201,7 +201,6 @@ impl BroadcastSummary {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OrderArgs {
     pub agent: String,
     pub command: String,
@@ -209,14 +208,12 @@ pub struct OrderArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BroadcastArgs {
     pub command: String,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReportArgs {
     pub summary: String,
     pub task_id: String,
@@ -227,7 +224,6 @@ pub struct ReportArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessageArgs {
     pub agent: String,
     pub task_id: String,
@@ -236,7 +232,6 @@ pub struct MessageArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessageAllArgs {
     pub task_id: String,
     pub message: String,
@@ -244,7 +239,6 @@ pub struct MessageAllArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DisableMessagingArgs {
     pub agent: String,
     #[serde(default)]
@@ -254,7 +248,6 @@ pub struct DisableMessagingArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EnableMessagingArgs {
     pub agent: String,
     pub reason: String,
@@ -262,7 +255,6 @@ pub struct EnableMessagingArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClearMessageQueueArgs {
     pub agent: String,
     #[serde(default = "default_true")]
@@ -270,7 +262,6 @@ pub struct ClearMessageQueueArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TelegramReplyArgs {
     pub message: String,
 }
