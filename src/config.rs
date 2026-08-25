@@ -35,13 +35,18 @@ impl fmt::Debug for Secret {
 pub struct AgentConfig {
     pub role: String,
     /// API endpoint used to initiate work for this role. For Hermes agents it
-    /// is the api_server (`/v1/runs`); for third-party roles
-    /// (`api_kind = openai`) it is any OpenAI-compatible endpoint.
-    pub api_url: Url,
-    pub api_key: Secret,
-    /// How dispatches reach the role: the Hermes api_server protocol or an
-    /// OpenAI-compatible chat endpoint (the role then answers through the
-    /// swarm MCP server, e.g. telegram_reply).
+    /// is the api_server (`/v1/runs`); for `api_kind = openai` it is any
+    /// OpenAI-compatible endpoint. Absent for `api_kind = mcp` (the role is
+    /// reachable only through the swarm MCP server and initiates interaction
+    /// itself).
+    pub api_url: Option<Url>,
+    pub api_key: Option<Secret>,
+    /// How dispatches reach the role:
+    /// - `hermes` — the Hermes api_server protocol (`/v1/runs` + result polling)
+    /// - `openai` — an OpenAI-compatible chat endpoint (fire-and-forget
+    ///   initiation; the role answers through the swarm MCP server)
+    /// - `mcp` — MCP-only: no dispatch endpoint, the role initiates
+    ///   interaction with the roe on its own logic
     pub api_kind: ApiKind,
     /// Model id for `api_kind = openai`; falls back to the swarm alias.
     pub api_model: Option<String>,
@@ -53,6 +58,7 @@ pub struct AgentConfig {
 pub enum ApiKind {
     Hermes,
     OpenAi,
+    Mcp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,25 +292,43 @@ impl Config {
         let mut tokens = BTreeSet::new();
         for role in &all_roles {
             let prefix = role.to_uppercase().replace('-', "_");
-            let api_url = parse_http_url(
-                &format!("{prefix}_API_URL"),
-                &required(env, &format!("{prefix}_API_URL"))?,
-            )?;
-            let api_key = Secret(required(env, &format!("{prefix}_AGENT_API_KEY"))?);
-            ensure!(
-                api_key.expose().len() >= 16,
-                "{prefix}_AGENT_API_KEY is too short"
-            );
-            // Сторонние системы: {PREFIX}_API_KIND=openai — диспатч идёт через
-            // OpenAI-совместимый endpoint, ответы — через swarm MCP.
+            // Сторонние системы: {PREFIX}_API_KIND=openai — инициация через
+            // OpenAI-совместимый endpoint; =mcp — роль доступна только через
+            // swarm MCP и сама инициирует взаимодействие (endpoint не нужен).
             let api_kind = match optional(env, &format!("{prefix}_API_KIND"))
                 .as_deref()
                 .unwrap_or("hermes")
             {
                 "hermes" => ApiKind::Hermes,
                 "openai" => ApiKind::OpenAi,
-                other => bail!("{prefix}_API_KIND must be hermes or openai, got {other}"),
+                "mcp" => ApiKind::Mcp,
+                other => bail!("{prefix}_API_KIND must be hermes, openai or mcp, got {other}"),
             };
+            let api_url = match optional(env, &format!("{prefix}_API_URL")) {
+                Some(value) => Some(parse_http_url(&format!("{prefix}_API_URL"), &value)?),
+                None => None,
+            };
+            let api_key = match optional(env, &format!("{prefix}_AGENT_API_KEY")) {
+                Some(value) => {
+                    let key = Secret(value);
+                    ensure!(
+                        key.expose().len() >= 16,
+                        "{prefix}_AGENT_API_KEY is too short"
+                    );
+                    Some(key)
+                }
+                None => None,
+            };
+            if api_kind != ApiKind::Mcp {
+                ensure!(
+                    api_url.is_some(),
+                    "{prefix}_API_URL is required for api_kind {api_kind:?}"
+                );
+                ensure!(
+                    api_key.is_some(),
+                    "{prefix}_AGENT_API_KEY is required for api_kind {api_kind:?}"
+                );
+            }
             let api_model = optional(env, &format!("{prefix}_API_MODEL"));
             let token_value = required(env, &format!("{prefix}_SWARM_MCP_TOKEN"))?;
             ensure!(

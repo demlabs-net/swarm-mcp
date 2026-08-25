@@ -633,7 +633,10 @@ impl Store {
     }
 
     /// Source Telegram chat of the most recent Telegram inbound dispatch
-    /// targeting `role` (used to route agent replies back to the operator).
+    /// Source Telegram chat for a role's reply: the most recent Telegram
+    /// inbound dispatch targeting the role; falls back to the most recent
+    /// Telegram inbound dispatch of any role (the operator's chat) so that
+    /// MCP-only roles can initiate messages proactively.
     pub async fn telegram_chat_for_role(&self, role: &str) -> anyhow::Result<Option<i64>> {
         let chat_id: Option<i64> = sqlx::query_scalar(
             r#"SELECT d.telegram_chat_id
@@ -646,7 +649,18 @@ impl Store {
         .bind(role)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(chat_id)
+        if chat_id.is_some() {
+            return Ok(chat_id);
+        }
+        let fallback: Option<i64> = sqlx::query_scalar(
+            r#"SELECT telegram_chat_id
+               FROM dispatches
+               WHERE kind = 'telegram_inbound' AND telegram_chat_id IS NOT NULL
+               ORDER BY created_ms DESC LIMIT 1"#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(fallback)
     }
 
     pub async fn enqueue_outbox(&self, audit: AuditMessage) -> anyhow::Result<()> {

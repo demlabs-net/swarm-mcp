@@ -45,8 +45,8 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
             role.clone(),
             AgentConfig {
                 role: role.clone(),
-                api_url: "http://127.0.0.1:1".parse().expect("fixture URL"),
-                api_key: Secret::new(format!("fixture-api-key-{role}")),
+                api_url: Some("http://127.0.0.1:1".parse().expect("fixture URL")),
+                api_key: Some(Secret::new(format!("fixture-api-key-{role}"))),
                 api_kind: crate::config::ApiKind::Hermes,
                 api_model: None,
                 mcp_token: Secret::new(format!("fixture-mcp-token-{role}-0123456789")),

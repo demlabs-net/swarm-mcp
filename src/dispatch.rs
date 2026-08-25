@@ -1007,14 +1007,10 @@ impl Dispatcher {
                 "error": "Telegram reply must not be empty",
             }));
         }
+        // MCP-only roles may reply proactively with no prior dispatch: the
+        // chat falls back to the latest operator chat, then to the group.
         let chat_id = match self.store.telegram_chat_for_role(sender).await {
-            Ok(Some(chat_id)) => chat_id,
-            Ok(None) => {
-                return tool_error(json!({
-                    "ok": false,
-                    "error": "no active Telegram dispatch for this role",
-                }));
-            }
+            Ok(chat_id) => chat_id,
             Err(error) => {
                 warn!(role = %sender, error = %error, "Telegram reply chat lookup failed");
                 return tool_error_message(error);
@@ -1026,7 +1022,7 @@ impl Dispatcher {
             event: "TELEGRAM_REPLY".to_string(),
             recipients: "operator".to_string(),
             text: message,
-            chat_id: Some(chat_id),
+            chat_id,
         };
         if let Err(error) = self.store.enqueue_outbox(audit).await {
             warn!(role = %sender, error = %error, "Telegram reply enqueue failed");
@@ -1106,15 +1102,18 @@ impl Dispatcher {
             .agents
             .get(role)
             .ok_or_else(|| anyhow!("unknown target role {role}"))?;
+        let (Some(api_url), Some(api_key)) = (&agent.api_url, &agent.api_key) else {
+            return Ok(RunOutcome::Running);
+        };
         let url = format!(
             "{}/v1/runs/{}",
-            agent.api_url.as_str().trim_end_matches('/'),
+            api_url.as_str().trim_end_matches('/'),
             run_id
         );
         let response = self
             .hermes_client
             .get(&url)
-            .bearer_auth(agent.api_key.expose())
+            .bearer_auth(api_key.expose())
             .send()
             .await
             .map_err(|error| anyhow!("run status request failed: {error}"))?;
@@ -1288,6 +1287,9 @@ impl Dispatcher {
                 let run_id = self.start_run(role, message, instructions).await?;
                 Ok(DispatchHandle::Run(run_id))
             }
+            ApiKind::Mcp => Err(RunFailure::rejected(anyhow!(
+                "role {role} is MCP-only and initiates interaction itself; it has no dispatch endpoint"
+            ))),
         }
     }
 
@@ -1300,9 +1302,15 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<(), RunFailure> {
+        let api_url = agent.api_url.as_ref().ok_or_else(|| {
+            RunFailure::rejected(anyhow!("role {} has no api_url", agent.role))
+        })?;
+        let api_key = agent.api_key.as_ref().ok_or_else(|| {
+            RunFailure::rejected(anyhow!("role {} has no api key", agent.role))
+        })?;
         let url = format!(
             "{}/v1/chat/completions",
-            agent.api_url.as_str().trim_end_matches('/')
+            api_url.as_str().trim_end_matches('/')
         );
         let model = agent
             .api_model
@@ -1311,7 +1319,7 @@ impl Dispatcher {
         let response = self
             .hermes_client
             .post(&url)
-            .bearer_auth(agent.api_key.expose())
+            .bearer_auth(api_key.expose())
             .json(&json!({
                 "model": model,
                 "messages": [
@@ -1346,18 +1354,21 @@ impl Dispatcher {
             .agents
             .get(role)
             .ok_or_else(|| RunFailure::rejected(anyhow!("unknown target role")))?;
+        let api_url = agent.api_url.as_ref().ok_or_else(|| {
+            RunFailure::rejected(anyhow!("role {role} has no api_url"))
+        })?;
+        let api_key = agent.api_key.as_ref().ok_or_else(|| {
+            RunFailure::rejected(anyhow!("role {role} has no api key"))
+        })?;
         let _permit = tokio::time::timeout(self.config.api_timeout, self.inflight.acquire())
             .await
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is saturated")))?
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is shutting down")))?;
-        let url = format!(
-            "{}/v1/runs",
-            agent.api_url.as_str().trim_end_matches('/')
-        );
+        let url = format!("{}/v1/runs", api_url.as_str().trim_end_matches('/'));
         let response = self
             .hermes_client
             .post(url)
-            .bearer_auth(agent.api_key.expose())
+            .bearer_auth(api_key.expose())
             .json(&json!({
                 "model": self.config.hermes_model_alias,
                 "input": message,
@@ -2096,7 +2107,7 @@ mod tests {
         let mut config = testutil::fixture_config(&path);
         let mock = testutil::spawn_mock_hermes(behavior).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
@@ -2354,7 +2365,7 @@ mod tests {
         }))
         .await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
@@ -2654,7 +2665,7 @@ mod tests {
         let mock =
             testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
@@ -2816,7 +2827,7 @@ mod tests {
         config.telegram_api_base_url = telegram_base.parse()?;
         let mock = testutil::spawn_mock_hermes(behavior).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
@@ -3162,7 +3173,7 @@ mod tests {
         }))
         .await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         config
             .agents
@@ -3188,6 +3199,71 @@ mod tests {
         assert_eq!(outcome.value["results"]["developer"]["initiated"], json!("true"));
         assert!(initiated.load(std::sync::atomic::Ordering::SeqCst));
         // OpenAI roles have no Hermes run to poll.
+        assert!(dispatcher.run_replies.lock().unwrap().is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_only_role_rejects_dispatches_and_can_reply_proactively() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-mcp-only");
+        let telegram_base =
+            spawn_mock_telegram_with(Arc::new(|_, _| (200, json!({"ok": true}), None))).await;
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = crate::config::TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(crate::config::Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        config.telegram_api_base_url = telegram_base.parse()?;
+        let mock = testutil::spawn_mock_hermes(Arc::new(|_, _| {
+            (404, json!({"error": "unexpected endpoint"}))
+        }))
+        .await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(mock.parse()?);
+        }
+        config
+            .agents
+            .get_mut("developer")
+            .expect("fixture has developer")
+            .api_kind = crate::config::ApiKind::Mcp;
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        // Proactive telegram_reply works for MCP-only roles: with no prior
+        // dispatch the message falls back to the group chat.
+        let reply = dispatcher.telegram_reply("developer", "Инициатива снизу".to_string()).await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        let items = store.due_outbox(10).await?;
+        let item = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("reply must be queued");
+        assert_eq!(item.text, "Инициатива снизу");
+        assert_eq!(item.chat_id, None, "no dispatch yet — falls back to the group");
+
+        // A dispatch addressed to an MCP-only role is rejected with a clear
+        // error (the role initiates interaction itself).
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 9,
+                message_id: 300,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let error = outcome.value["results"]["developer"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(error.contains("MCP-only"), "unexpected: {error}");
         assert!(dispatcher.run_replies.lock().unwrap().is_empty());
         testutil::remove_db_files(&path).await;
         Ok(())
@@ -3561,7 +3637,7 @@ mod tests {
         let mock =
             testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;

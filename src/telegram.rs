@@ -667,7 +667,7 @@ mod tests {
         config.telegram_backlog_mode = backlog;
         config.telegram_api_base_url = telegram_base.parse()?;
         for agent in config.agents.values_mut() {
-            agent.api_url = hermes_base.parse()?;
+            agent.api_url = Some(hermes_base.parse()?);
         }
         let config = Arc::new(config);
         let store = crate::store::Store::connect(&config).await?;

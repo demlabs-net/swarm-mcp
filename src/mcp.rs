@@ -797,7 +797,7 @@ mod tests {
         let mut config = testutil::fixture_config(&path);
         config.allowed_hosts = vec!["127.0.0.1".to_string()];
         for agent in config.agents.values_mut() {
-            agent.api_url = hermes.parse()?;
+            agent.api_url = Some(hermes.parse()?);
         }
         let config = Arc::new(config);
         let store = crate::store::Store::connect(&config).await?;
