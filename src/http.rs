@@ -112,6 +112,9 @@ async fn serve_with_shutdown(
     let outbox = state
         .dispatcher
         .spawn_outbox_worker(cancellation.child_token());
+    let run_replies = state
+        .dispatcher
+        .spawn_run_reply_worker(cancellation.child_token());
     let telegram_inbound =
         telegram::spawn_inbound_worker(state.clone(), cancellation.child_token());
     let cleanup_state = state.clone();

@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, ensure};
 use chrono::{DateTime, Utc};
@@ -12,7 +16,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -28,6 +32,25 @@ pub struct Dispatcher {
     telegram_client: Client,
     inflight: Arc<Semaphore>,
     messaging_gate: Arc<RwLock<()>>,
+    /// Runs dispatched from Telegram inbound, awaiting their final answer so
+    /// it can be delivered to the operator's chat (see spawn_run_reply_worker).
+    run_replies: Arc<Mutex<HashMap<String, PendingRunReply>>>,
+}
+
+#[derive(Clone)]
+struct PendingRunReply {
+    chat_id: i64,
+    role: String,
+    started_at: Instant,
+}
+
+enum RunOutcome {
+    /// The run finished and produced this final answer.
+    Completed(String),
+    /// The run finished without a usable answer (failed/cancelled/empty).
+    Failed,
+    /// The run is still in progress.
+    Running,
 }
 
 #[derive(Debug)]
@@ -269,6 +292,7 @@ impl Dispatcher {
         Ok(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight_dispatches)),
             messaging_gate: Arc::new(RwLock::new(())),
+            run_replies: Arc::new(Mutex::new(HashMap::new())),
             config,
             store,
             hermes_client,
@@ -905,6 +929,20 @@ impl Dispatcher {
         for (target, result) in join_all(requests).await {
             summary.push(target, result);
         }
+        // Запоминаем запущенные раны, чтобы их итоговый ответ доставился
+        // оператору в исходный чат (см. spawn_run_reply_worker).
+        for (target, value) in &summary.results {
+            if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
+                self.run_replies.lock().unwrap().insert(
+                    run_id.to_string(),
+                    PendingRunReply {
+                        chat_id: args.chat_id,
+                        role: target.clone(),
+                        started_at: Instant::now(),
+                    },
+                );
+            }
+        }
         let ok = summary.succeeded == targets.len();
         let status = summary.status(targets.len());
         let mut result = json!({
@@ -917,7 +955,7 @@ impl Dispatcher {
             "username": args.username,
             "results": summary.results.clone(),
         });
-        let audit = self.audit_with_chat(
+        let audit = self.audit(
             &manager,
             "TELEGRAM_INBOUND",
             &targets.join(", "),
@@ -928,7 +966,6 @@ impl Dispatcher {
                 targets.join(", "),
                 Value::Object(summary.results)
             ),
-            Some(args.chat_id),
             &mut result,
         );
         self.finish(&dispatch_id, status, &result, audit, !ok).await
@@ -999,6 +1036,103 @@ impl Dispatcher {
                 }
             }
         })
+    }
+
+    /// Polls Telegram-dispatched runs and delivers their final answer to the
+    /// operator's chat — the reply does not depend on the model calling
+    /// telegram_reply (api_server runs are fire-and-forget).
+    pub fn spawn_run_reply_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = dispatcher.flush_run_replies().await {
+                            error!(error = %error, "Telegram run reply flush failed");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn flush_run_replies(&self) -> anyhow::Result<()> {
+        let ttl = Duration::from_secs(30 * 60);
+        let pending: Vec<(String, PendingRunReply)> = {
+            let mut map = self.run_replies.lock().unwrap();
+            map.retain(|_, reply| reply.started_at.elapsed() < ttl);
+            map.iter().map(|(run_id, reply)| (run_id.clone(), reply.clone())).collect()
+        };
+        for (run_id, reply) in pending {
+            match self.fetch_run_outcome(&run_id, &reply.role).await {
+                Ok(outcome) => self.deliver_run_reply(&run_id, &reply, outcome).await,
+                // transient HTTP error: retry on the next tick
+                Err(error) => {
+                    debug!(run_id = %run_id, error = %error, "run reply poll failed; will retry");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_run_outcome(&self, run_id: &str, role: &str) -> anyhow::Result<RunOutcome> {
+        let agent = self
+            .config
+            .agents
+            .get(role)
+            .ok_or_else(|| anyhow!("unknown target role {role}"))?;
+        let url = format!(
+            "{}/v1/runs/{}",
+            agent.api_url.as_str().trim_end_matches('/'),
+            run_id
+        );
+        let response = self
+            .hermes_client
+            .get(&url)
+            .bearer_auth(agent.api_key.expose())
+            .send()
+            .await
+            .map_err(|error| anyhow!("run status request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Ok(RunOutcome::Running);
+        }
+        let payload: Value = response.json().await?;
+        match payload.get("status").and_then(Value::as_str) {
+            Some("completed") => Ok(RunOutcome::Completed(
+                payload.get("output").and_then(Value::as_str).unwrap_or("").to_string(),
+            )),
+            Some("failed" | "cancelled") => Ok(RunOutcome::Failed),
+            _ => Ok(RunOutcome::Running),
+        }
+    }
+
+    async fn deliver_run_reply(&self, run_id: &str, reply: &PendingRunReply, outcome: RunOutcome) {
+        let text = match outcome {
+            RunOutcome::Completed(output) if !output.is_empty() => output,
+            RunOutcome::Completed(_) => {
+                format!("⚠️ Агент {} ответил пустым сообщением.", reply.role)
+            }
+            RunOutcome::Failed => {
+                format!("⚠️ Агент {} не смог обработать запрос.", reply.role)
+            }
+            RunOutcome::Running => return,
+        };
+        let audit = AuditMessage {
+            id: format!("reply_{}", Uuid::new_v4().simple()),
+            sender: reply.role.clone(),
+            event: "TELEGRAM_REPLY".to_string(),
+            recipients: "operator".to_string(),
+            text,
+            chat_id: Some(reply.chat_id),
+        };
+        if let Err(error) = self.store.enqueue_outbox(audit).await {
+            warn!(run_id = %run_id, error = %error, "Telegram run reply enqueue failed");
+            return;
+        }
+        self.run_replies.lock().unwrap().remove(run_id);
     }
 
     async fn flush_outbox(&self) -> anyhow::Result<()> {
@@ -2853,6 +2987,55 @@ mod tests {
             .fetch_one(store.pool())
             .await?;
         assert_eq!(outbox, 1, "one audit entry for the accepted update");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_reply_worker_delivers_final_answer_to_source_chat() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/") {
+                (
+                    200,
+                    json!({
+                        "object": "hermes.run",
+                        "run_id": "run-tg",
+                        "status": "completed",
+                        "output": "Ответ от агента",
+                    }),
+                )
+            } else {
+                (202, json!({"run_id": "run-tg"}))
+            }
+        }))
+        .await?;
+
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 5,
+                message_id: 100,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
+        assert!(!dispatcher.run_replies.lock().unwrap().is_empty());
+
+        dispatcher.flush_run_replies().await?;
+
+        let items = store.due_outbox(10).await?;
+        let reply = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("the run reply must be enqueued");
+        assert_eq!(reply.text, "Ответ от агента");
+        assert_eq!(reply.chat_id, Some(424_242));
+
+        // The run is no longer tracked once delivered.
+        assert!(dispatcher.run_replies.lock().unwrap().is_empty());
         testutil::remove_db_files(&path).await;
         Ok(())
     }

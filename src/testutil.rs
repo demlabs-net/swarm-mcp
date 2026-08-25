@@ -153,27 +153,53 @@ pub(crate) type MockHermes = Arc<dyn Fn(&str, &str) -> (u16, Value) + Send + Syn
 
 /// Spawn a mock Hermes `/v1/runs` endpoint on an ephemeral port and return its base URL.
 pub(crate) async fn spawn_mock_hermes(behavior: MockHermes) -> String {
-    let router = axum::Router::new().route(
-        "/v1/runs",
-        axum::routing::post({
-            let behavior = behavior.clone();
-            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+    let router = axum::Router::new()
+        .route(
+            "/v1/runs",
+            axum::routing::post({
                 let behavior = behavior.clone();
-                async move {
-                    let bearer = headers
-                        .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string();
-                    let (status, payload) = behavior(&bearer, &body.to_string());
-                    (
-                        axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
-                        axum::Json(payload),
-                    )
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let behavior = behavior.clone();
+                    async move {
+                        let bearer = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (status, payload) = behavior(&bearer, &body.to_string());
+                        (
+                            axum::http::StatusCode::from_u16(status)
+                                .expect("mock status is valid"),
+                            axum::Json(payload),
+                        )
+                    }
                 }
-            }
-        }),
-    );
+            }),
+        )
+        .route(
+            "/v1/runs/{run_id}",
+            axum::routing::get({
+                let behavior = behavior.clone();
+                move |headers: axum::http::HeaderMap,
+                      axum::extract::Path(run_id): axum::extract::Path<String>| {
+                    let behavior = behavior.clone();
+                    async move {
+                        let bearer = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (status, payload) =
+                            behavior(&bearer, &format!("GET /v1/runs/{run_id}"));
+                        (
+                            axum::http::StatusCode::from_u16(status)
+                                .expect("mock status is valid"),
+                            axum::Json(payload),
+                        )
+                    }
+                }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock Hermes");
