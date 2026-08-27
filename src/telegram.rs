@@ -339,7 +339,9 @@ impl TelegramGateway {
 /// Returns None when the message is not a mention of an allowed target.
 fn parse_mention(text: &str, allowed_targets: &[String]) -> Option<ParsedCommand> {
     let text = text.trim();
-    let (raw_mention, rest) = text.split_once(char::is_whitespace).map_or((text, ""), |(m, r)| (m, r.trim()));
+    let (raw_mention, rest) = text
+        .split_once(char::is_whitespace)
+        .map_or((text, ""), |(m, r)| (m, r.trim()));
     let mention = raw_mention.strip_prefix('@')?.to_lowercase();
     let mention = mention.split('@').next().unwrap_or_default();
     if mention == "all" {
@@ -481,19 +483,16 @@ mod tests {
     #[test]
     fn parses_role_mentions() {
         let allowed = targets();
-        let ParsedCommand::Dispatch {
-            targets,
-            message,
-        } = parse_mention("@developer implement it", &allowed).unwrap()
+        let ParsedCommand::Dispatch { targets, message } =
+            parse_mention("@developer implement it", &allowed).unwrap()
         else {
             panic!("expected a mention dispatch");
         };
         assert_eq!(targets, vec!["developer"]);
         assert_eq!(message, "implement it");
 
-        let ParsedCommand::Dispatch {
-            targets: all, ..
-        } = parse_mention("@all status check", &allowed).unwrap()
+        let ParsedCommand::Dispatch { targets: all, .. } =
+            parse_mention("@all status check", &allowed).unwrap()
         else {
             panic!("expected an @all dispatch");
         };

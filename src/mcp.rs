@@ -447,7 +447,12 @@ impl ServerHandler for RoleMcp {
                 Err(outcome) => outcome,
             },
             "telegram_reply" => match parse_arguments::<TelegramReplyArgs>(request.arguments) {
-                Ok(args) => self.state.dispatcher.telegram_reply(&self.role, args.message).await,
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .telegram_reply(&self.role, args.message)
+                        .await
+                }
                 Err(outcome) => outcome,
             },
             "messaging_disable" => match parse_arguments::<DisableMessagingArgs>(request.arguments)

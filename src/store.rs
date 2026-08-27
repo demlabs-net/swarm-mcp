@@ -619,11 +619,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn set_dispatch_telegram_chat(
-        &self,
-        id: &str,
-        chat_id: i64,
-    ) -> anyhow::Result<()> {
+    pub async fn set_dispatch_telegram_chat(&self, id: &str, chat_id: i64) -> anyhow::Result<()> {
         sqlx::query("UPDATE dispatches SET telegram_chat_id = ? WHERE id = ?")
             .bind(chat_id)
             .bind(id)
@@ -732,6 +728,7 @@ impl Store {
         let mut operations = Vec::new();
         for row in rows {
             let id = row.get::<String, _>("id");
+            let kind = row.get::<String, _>("kind");
             let mut targets = sqlx::query_scalar::<_, String>(
                 "SELECT target FROM dispatch_targets WHERE dispatch_id = ? ORDER BY target",
             )
@@ -741,6 +738,11 @@ impl Store {
             let mut result: Option<Value> = row
                 .try_get::<Option<String>, _>("result_json")?
                 .and_then(|raw| serde_json::from_str(&raw).ok());
+            if kind == "report"
+                && let Some(value) = result.as_mut()
+            {
+                self.hydrate_legacy_report_summary(value).await?;
+            }
             let is_sender = row.get::<String, _>("sender") == role;
             if !is_sender {
                 targets.retain(|target| target == role);
@@ -749,7 +751,7 @@ impl Store {
             operations.push(json!({
                 "id": id,
                 "sender": row.get::<String, _>("sender"),
-                "kind": row.get::<String, _>("kind"),
+                "kind": kind,
                 "targets": targets,
                 "status": row.get::<String, _>("status"),
                 "result": result,
@@ -758,6 +760,29 @@ impl Store {
             }));
         }
         Ok(json!({"caller": role, "operations": operations}))
+    }
+
+    async fn hydrate_legacy_report_summary(&self, result: &mut Value) -> anyhow::Result<()> {
+        if result.get("summary").and_then(Value::as_str).is_some() {
+            return Ok(());
+        }
+        let Some(outbox_id) = result
+            .get("telegram")
+            .and_then(|telegram| telegram.get("outbox_id"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(());
+        };
+        let audit_text = sqlx::query_scalar::<_, String>(
+            "SELECT text FROM telegram_outbox WHERE id = ? AND event IN ('REPORT', 'REPORT_FAILED')",
+        )
+        .bind(outbox_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((_, summary)) = audit_text.as_deref().and_then(|text| text.split_once('\n')) {
+            result["summary"] = json!(summary);
+        }
+        Ok(())
     }
 
     pub async fn recent_outbox(
@@ -2259,6 +2284,66 @@ mod tests {
         assert_eq!(
             operation["result"]["results"]["lead-developer"]["status"],
             json!("failed")
+        );
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_operations_restores_legacy_report_summary_without_leaking() -> anyhow::Result<()>
+    {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-report-summary-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        sqlx::query(
+            "INSERT INTO dispatches
+             (id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
+             VALUES ('report_legacy','lead-developer','report','fp','accepted',?,2,2)",
+        )
+        .bind(
+            json!({
+                "ok": true,
+                "task_id": "task_parent",
+                "status": "blocked",
+                "telegram": {"outbox_id": "audit_legacy"}
+            })
+            .to_string(),
+        )
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO dispatch_targets(dispatch_id,target) VALUES ('report_legacy','manager')",
+        )
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_outbox
+             (id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms)
+             VALUES ('audit_legacy','lead-developer','REPORT','manager',?,
+                     'delivered',0,0,2,2)",
+        )
+        .bind("task_parent [blocked]\nExact corrective context and artifact path")
+        .execute(store.pool())
+        .await?;
+
+        let manager_view = store.recent_operations("manager", 10).await?;
+        assert_eq!(
+            manager_view["operations"][0]["result"]["summary"],
+            json!("Exact corrective context and artifact path")
+        );
+        let sender_view = store.recent_operations("lead-developer", 10).await?;
+        assert_eq!(
+            sender_view["operations"][0]["result"]["summary"],
+            json!("Exact corrective context and artifact path")
+        );
+        assert_eq!(
+            store.recent_operations("developer", 10).await?["operations"],
+            json!([]),
+            "an unrelated role must not see the report or its restored body"
         );
 
         store.pool.close().await;

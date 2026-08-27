@@ -557,6 +557,7 @@ impl Dispatcher {
                 "recipient": recipient,
                 "task_id": task_id,
                 "status": status,
+                "summary": summary,
                 "supervisor_woken": false,
             });
             let audit = self.audit(
@@ -610,6 +611,7 @@ impl Dispatcher {
                     "recipient": recipient,
                     "task_id": task_id,
                     "status": status,
+                    "summary": summary,
                     "supervisor_woken": true,
                 });
                 result[format!("recipient_{key}")] = json!(value);
@@ -1087,7 +1089,9 @@ impl Dispatcher {
         let pending: Vec<(String, PendingRunReply)> = {
             let mut map = self.run_replies.lock().unwrap();
             map.retain(|_, reply| reply.started_at.elapsed() < ttl);
-            map.iter().map(|(run_id, reply)| (run_id.clone(), reply.clone())).collect()
+            map.iter()
+                .map(|(run_id, reply)| (run_id.clone(), reply.clone()))
+                .collect()
         };
         for (run_id, reply) in pending {
             match self.fetch_run_outcome(&run_id, &reply.role).await {
@@ -1128,7 +1132,11 @@ impl Dispatcher {
         let payload: Value = response.json().await?;
         match payload.get("status").and_then(Value::as_str) {
             Some("completed") => Ok(RunOutcome::Completed(
-                payload.get("output").and_then(Value::as_str).unwrap_or("").to_string(),
+                payload
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             )),
             Some("failed" | "cancelled") => Ok(RunOutcome::Failed),
             _ => Ok(RunOutcome::Running),
@@ -1305,12 +1313,14 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<(), RunFailure> {
-        let api_url = agent.api_url.as_ref().ok_or_else(|| {
-            RunFailure::rejected(anyhow!("role {} has no api_url", agent.role))
-        })?;
-        let api_key = agent.api_key.as_ref().ok_or_else(|| {
-            RunFailure::rejected(anyhow!("role {} has no api key", agent.role))
-        })?;
+        let api_url = agent
+            .api_url
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {} has no api_url", agent.role)))?;
+        let api_key = agent
+            .api_key
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {} has no api key", agent.role)))?;
         let url = format!(
             "{}/v1/chat/completions",
             api_url.as_str().trim_end_matches('/')
@@ -1357,12 +1367,14 @@ impl Dispatcher {
             .agents
             .get(role)
             .ok_or_else(|| RunFailure::rejected(anyhow!("unknown target role")))?;
-        let api_url = agent.api_url.as_ref().ok_or_else(|| {
-            RunFailure::rejected(anyhow!("role {role} has no api_url"))
-        })?;
-        let api_key = agent.api_key.as_ref().ok_or_else(|| {
-            RunFailure::rejected(anyhow!("role {role} has no api key"))
-        })?;
+        let api_url = agent
+            .api_url
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {role} has no api_url")))?;
+        let api_key = agent
+            .api_key
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {role} has no api key")))?;
         let _permit = tokio::time::timeout(self.config.api_timeout, self.inflight.acquire())
             .await
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is saturated")))?
@@ -2627,6 +2639,7 @@ mod tests {
             .await;
         assert!(!outcome.is_error, "unexpected: {outcome:?}");
         assert_eq!(outcome.value["recipient_run_id"], json!("run-report"));
+        assert_eq!(outcome.value["summary"], json!("done"));
 
         // unknown status is rejected.
         let outcome = dispatcher
@@ -3287,7 +3300,8 @@ mod tests {
     #[tokio::test]
     async fn openai_role_is_initiated_via_chat_completions() -> anyhow::Result<()> {
         let path = testutil::temp_db_path("dispatch-openai");
-        let telegram_base = spawn_mock_telegram_with(Arc::new(|_, _| (200, json!({"ok": true}), None))).await;
+        let telegram_base =
+            spawn_mock_telegram_with(Arc::new(|_, _| (200, json!({"ok": true}), None))).await;
         let mut config = testutil::fixture_config(&path);
         config.telegram_enabled = true;
         config.telegram_bot_mode = crate::config::TelegramBotMode::Shared;
@@ -3335,7 +3349,10 @@ mod tests {
             })
             .await;
         assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
-        assert_eq!(outcome.value["results"]["developer"]["initiated"], json!("true"));
+        assert_eq!(
+            outcome.value["results"]["developer"]["initiated"],
+            json!("true")
+        );
         assert!(initiated.load(std::sync::atomic::Ordering::SeqCst));
         // OpenAI roles have no Hermes run to poll.
         assert!(dispatcher.run_replies.lock().unwrap().is_empty());
@@ -3375,7 +3392,9 @@ mod tests {
 
         // Proactive telegram_reply works for MCP-only roles: with no prior
         // dispatch the message falls back to the group chat.
-        let reply = dispatcher.telegram_reply("developer", "Инициатива снизу".to_string()).await;
+        let reply = dispatcher
+            .telegram_reply("developer", "Инициатива снизу".to_string())
+            .await;
         assert!(!reply.is_error, "unexpected: {:?}", reply.value);
         let items = store.due_outbox(10).await?;
         let item = items
@@ -3383,7 +3402,10 @@ mod tests {
             .find(|item| item.event == "TELEGRAM_REPLY")
             .expect("reply must be queued");
         assert_eq!(item.text, "Инициатива снизу");
-        assert_eq!(item.chat_id, None, "no dispatch yet — falls back to the group");
+        assert_eq!(
+            item.chat_id, None,
+            "no dispatch yet — falls back to the group"
+        );
 
         // A dispatch addressed to an MCP-only role is rejected with a clear
         // error (the role initiates interaction itself).

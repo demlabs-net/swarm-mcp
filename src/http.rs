@@ -12,14 +12,13 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
     response::sse::{Event as SseEvent, KeepAlive, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::DateTime;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -168,10 +167,7 @@ async fn serve_with_shutdown(
 /// первом POST initialize (без Mcp-Session-Id); после initialize клиент
 /// открывает настоящий стрим сессии GET-ом уже с session id. Здесь просто
 /// держим соединение живым (ответы на запросы приходят в теле POST).
-async fn sse_bootstrap(
-    request: Request,
-    next: Next,
-) -> Response {
+async fn sse_bootstrap(request: Request, next: Next) -> Response {
     let is_get = request.method() == Method::GET;
     let accept_sse = request
         .headers()
@@ -217,21 +213,20 @@ pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToke
             .mcp_token
             .expose()
             .to_string();
-        let protected =
-            Router::new()
-                .nest_service(path, service)
-                .layer(middleware::from_fn(sse_bootstrap))
-                .layer(middleware::from_fn_with_state(
-                    RoleAuth {
-                        role: role.clone(),
-                        token,
-                        limiter: Arc::new(RequestLimiter::new(
-                            state.config.mcp_request_rate_limit,
-                            state.config.mcp_request_rate_window,
-                        )),
-                    },
-                    role_auth,
-                ));
+        let protected = Router::new()
+            .nest_service(path, service)
+            .layer(middleware::from_fn(sse_bootstrap))
+            .layer(middleware::from_fn_with_state(
+                RoleAuth {
+                    role: role.clone(),
+                    token,
+                    limiter: Arc::new(RequestLimiter::new(
+                        state.config.mcp_request_rate_limit,
+                        state.config.mcp_request_rate_window,
+                    )),
+                },
+                role_auth,
+            ));
         app = app.merge(protected);
     }
 

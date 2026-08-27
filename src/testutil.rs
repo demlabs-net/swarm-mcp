@@ -170,8 +170,7 @@ pub(crate) async fn spawn_mock_hermes(behavior: MockHermes) -> String {
                             .to_string();
                         let (status, payload) = behavior(&bearer, &body.to_string());
                         (
-                            axum::http::StatusCode::from_u16(status)
-                                .expect("mock status is valid"),
+                            axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
                             axum::Json(payload),
                         )
                     }
@@ -194,8 +193,7 @@ pub(crate) async fn spawn_mock_hermes(behavior: MockHermes) -> String {
                         let (status, payload) =
                             behavior(&bearer, &format!("GET /v1/runs/{run_id}"));
                         (
-                            axum::http::StatusCode::from_u16(status)
-                                .expect("mock status is valid"),
+                            axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
                             axum::Json(payload),
                         )
                     }
@@ -214,13 +212,10 @@ pub(crate) async fn spawn_mock_hermes(behavior: MockHermes) -> String {
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or_default()
                             .to_string();
-                        let (status, payload) = behavior(
-                            &bearer,
-                            &format!("POST /v1/chat/completions {body}"),
-                        );
+                        let (status, payload) =
+                            behavior(&bearer, &format!("POST /v1/chat/completions {body}"));
                         (
-                            axum::http::StatusCode::from_u16(status)
-                                .expect("mock status is valid"),
+                            axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
                             axum::Json(payload),
                         )
                     }

@@ -94,7 +94,7 @@ operator proactively even before anyone has addressed them.
 |---|---|---|
 | `swarm://hierarchy` | every role | Effective roles, ACL, supervisors, tools, and safeguards |
 | `swarm://executors` | manager | Compatibility alias for the hierarchy |
-| `swarm://operations` | every role | Recent durable operations sent or received by that role |
+| `swarm://operations` | every role | Recent durable operations sent or received by that role, including the report summary visible to its sender and recipient |
 | `swarm://activity` | ordering authorities | Current and recent passive subordinate lifecycle state |
 | `swarm://outbox` | every role | Telegram delivery state; manager also sees the inbound offset and last successful poll |
 | `swarm://messaging` | manager | Persistent executor circuit-breaker state and undelivered queue counts |
