@@ -283,6 +283,17 @@ probe invokes an agent tool.
 
 ## Docker
 
+Перед сборкой runtime-образа создайте пакет из текущего checkout:
+
+```bash
+scripts/build-deb.sh
+docker build -t demlabs/swarm-mcp:local .
+```
+
+Скрипт использует закреплённый Rust builder и `cargo-deb`, удаляет старые
+одноимённые пакеты и оставляет в `dist/` ровно один `.deb`. Это не позволяет
+Docker cache незаметно развернуть бинарник от предыдущего commit.
+
 The image uses digest-pinned Rust, Dockerfile frontend, and minimal Debian base
 images. The runtime installs no packages and copies only the CA bundle and
 compiled binary. It runs as UID/GID 1000 with no Linux capabilities, a read-only
