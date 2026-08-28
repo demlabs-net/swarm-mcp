@@ -16,6 +16,7 @@ extended-description = """Authenticated, role-aware MCP communication plane for 
 Telegram router (shared bot), role hierarchy, dispatch, outbox and MCP server."""
 assets = [
   ["target/release/swarm-mcp", "usr/local/bin/", "755"],
+  ["packaging/swarm-mcp.service", "lib/systemd/system/", "644"],
 ]
 
 [dependencies]
