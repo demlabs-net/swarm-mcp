@@ -165,9 +165,17 @@ async fn serve_with_shutdown(
 /// Плейсхолдер SSE для session-less GET: клиенты (go-sdk / Yandex AI
 /// Studio) открывают event stream до initialize. Сессию создаёт сам rmcp при
 /// первом POST initialize (без Mcp-Session-Id); после initialize клиент
-/// открывает настоящий стрим сессии GET-ом уже с session id. Здесь просто
-/// держим соединение живым (ответы на запросы приходят в теле POST).
-async fn sse_bootstrap(request: Request, next: Next) -> Response {
+/// открывает настоящий стрим сессии GET-ом уже с session id.
+///
+/// Yandex "HTTP with SSE" voice agents OPEN the stream and then WAIT for
+/// `event: endpoint` before POSTing JSON-RPC — an empty stream times out.
+/// The endpoint must be the PUBLIC path (nginx strips the /swarm prefix, so
+/// the request path alone would 404 on the public side): prefix from
+/// SWARM_PUBLIC_PREFIX (default "/swarm") + the (stripped) request path.
+async fn sse_bootstrap(
+    request: Request,
+    next: Next,
+) -> Response {
     let is_get = request.method() == Method::GET;
     let accept_sse = request
         .headers()
@@ -176,11 +184,16 @@ async fn sse_bootstrap(request: Request, next: Next) -> Response {
         .is_some_and(|v| v.contains("text/event-stream"));
     let has_session = request.headers().contains_key("mcp-session-id");
     if is_get && accept_sse && !has_session {
-        return Sse::new(futures::stream::empty::<
-            Result<SseEvent, std::convert::Infallible>,
-        >())
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response();
+        let prefix = std::env::var("SWARM_PUBLIC_PREFIX").unwrap_or_else(|_| "/swarm".into());
+        let endpoint = format!("{}{}", prefix, request.uri().path());
+        let stream = futures::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(
+                SseEvent::default().event("endpoint").data(endpoint),
+            )
+        });
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response();
     }
     next.run(request).await
 }
