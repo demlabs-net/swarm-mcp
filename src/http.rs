@@ -17,6 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::DateTime;
+use futures::StreamExt;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -172,7 +173,13 @@ async fn serve_with_shutdown(
 /// The endpoint must be the PUBLIC path (nginx strips the /swarm prefix, so
 /// the request path alone would 404 on the public side): prefix from
 /// SWARM_PUBLIC_PREFIX (default "/swarm") + the (stripped) request path.
+///
+/// Replies to POSTs are ALSO fanned out over this stream (event: message) —
+/// SSE-only clients ignore the POST response body and wait on the GET
+/// channel. The fan-out comes from the shared broadcast: every POST response
+/// (parsed from the body) is published tagged with its role.
 async fn sse_bootstrap(
+    State(events): State<std::sync::Arc<tokio::sync::broadcast::Sender<serde_json::Value>>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -186,22 +193,96 @@ async fn sse_bootstrap(
     if is_get && accept_sse && !has_session {
         let prefix = std::env::var("SWARM_PUBLIC_PREFIX").unwrap_or_else(|_| "/swarm".into());
         let endpoint = format!("{}{}", prefix, request.uri().path());
+        let role = role_from_path(request.uri().path()).to_string();
         let stream = futures::stream::once(async move {
             Ok::<_, std::convert::Infallible>(
                 SseEvent::default().event("endpoint").data(endpoint),
             )
-        });
+        })
+        .chain(futures::stream::unfold(
+            events.subscribe(),
+            move |mut rx| {
+                let role = role.clone();
+                async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(evt) => {
+                                if evt.get("role").and_then(|v| v.as_str()) == Some(&role) {
+                                    if let Some(resp) = evt.get("response") {
+                                        return Some((
+                                            Ok::<_, std::convert::Infallible>(
+                                                SseEvent::default()
+                                                    .event("message")
+                                                    .data(resp.to_string()),
+                                            ),
+                                            rx,
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                }
+            },
+        ));
         return Sse::new(stream)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
             .into_response();
     }
+    if request.method() == Method::POST {
+        let role = role_from_path(request.uri().path()).to_string();
+        let response = next.run(request).await;
+        // Publish the JSON-RPC reply on the broadcast so SSE-only clients
+        // (Yandex voice agents) receive it over their GET stream. The POST
+        // body itself passes through unchanged — streamable clients read it
+        // there.
+        let (published, response) = {
+            let (parts, body) = response.into_parts();
+            let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => return Response::from_parts(parts, axum::body::Body::empty()),
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let candidate = text
+                .lines()
+                .find_map(|l| l.strip_prefix("data:").map(str::trim))
+                .unwrap_or(text.trim());
+            let value: Option<serde_json::Value> = serde_json::from_str(candidate).ok();
+            let published = value.filter(|v| v.get("id").is_some());
+            let response = Response::from_parts(parts, axum::body::Body::from(bytes));
+            (published, response)
+        };
+        if let Some(resp) = published {
+            let _ = events.send(serde_json::json!({
+                "role": role,
+                "response": resp,
+            }));
+        }
+        return response;
+    }
     next.run(request).await
+}
+
+/// The role segment of `/roles/{role}/mcp`.
+fn role_from_path(path: &str) -> &str {
+    path.trim_matches('/')
+        .split('/')
+        .nth(1)
+        .unwrap_or_default()
 }
 
 pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToken) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready));
+    // Server→client reply fan-out: SSE-only clients (Yandex voice agents)
+    // wait for JSON-RPC replies on their GET stream, not in the POST body.
+    // Every POST response is published here tagged with its role; the
+    // sse_bootstrap GET stream filters by its own role.
+    let (events_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    let events_tx = std::sync::Arc::new(events_tx);
 
     for (role, path) in &state.config.role_paths {
         let handler_state = state.clone();
@@ -228,7 +309,10 @@ pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToke
             .to_string();
         let protected = Router::new()
             .nest_service(path, service)
-            .layer(middleware::from_fn(sse_bootstrap))
+            .layer(middleware::from_fn_with_state(
+                events_tx.clone(),
+                sse_bootstrap,
+            ))
             .layer(middleware::from_fn_with_state(
                 RoleAuth {
                     role: role.clone(),
