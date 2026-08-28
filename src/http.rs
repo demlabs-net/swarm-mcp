@@ -245,9 +245,11 @@ async fn sse_bootstrap(
                 Err(_) => return Response::from_parts(parts, axum::body::Body::empty()),
             };
             let text = String::from_utf8_lossy(&bytes);
+            // rmcp SSE replies lead with an EMPTY `data:` line (keep-alive
+            // preamble) — skip empty payloads and take the first real one.
             let candidate = text
                 .lines()
-                .find_map(|l| l.strip_prefix("data:").map(str::trim))
+                .find_map(|l| l.strip_prefix("data:").map(str::trim).filter(|s| !s.is_empty()))
                 .unwrap_or(text.trim());
             let value: Option<serde_json::Value> = serde_json::from_str(candidate).ok();
             let published = value.filter(|v| v.get("id").is_some());
