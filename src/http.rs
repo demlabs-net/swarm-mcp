@@ -163,6 +163,18 @@ async fn serve_with_shutdown(
     Ok(())
 }
 
+/// Shared SSE-bridge state: the reply fan-out bus + the legacy-SSE session
+/// map. Yandex "HTTP with SSE" clients address sessions by `?sessionId=…`
+/// in the endpoint URL (classic MCP SSE), while rmcp streamable addresses
+/// them via the `Mcp-Session-Id` header — this map translates one into the
+/// other: client-side query id → server-side rmcp session id (learned from
+/// the initialize response header).
+#[derive(Clone)]
+struct SseBridge {
+    events: std::sync::Arc<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    sessions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+}
+
 /// Плейсхолдер SSE для session-less GET: клиенты (go-sdk / Yandex AI
 /// Studio) открывают event stream до initialize. Сессию создаёт сам rmcp при
 /// первом POST initialize (без Mcp-Session-Id); после initialize клиент
@@ -173,13 +185,16 @@ async fn serve_with_shutdown(
 /// The endpoint must be the PUBLIC path (nginx strips the /swarm prefix, so
 /// the request path alone would 404 on the public side): prefix from
 /// SWARM_PUBLIC_PREFIX (default "/swarm") + the (stripped) request path.
+/// The endpoint carries `?sessionId=<uuid>` — the legacy-SSE addressing rmcp
+/// streamable does not speak; POSTs with that query param get the header
+/// `Mcp-Session-Id` injected from the session map.
 ///
 /// Replies to POSTs are ALSO fanned out over this stream (event: message) —
 /// SSE-only clients ignore the POST response body and wait on the GET
 /// channel. The fan-out comes from the shared broadcast: every POST response
 /// (parsed from the body) is published tagged with its role.
 async fn sse_bootstrap(
-    State(events): State<std::sync::Arc<tokio::sync::broadcast::Sender<serde_json::Value>>>,
+    State(bridge): State<SseBridge>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -192,7 +207,11 @@ async fn sse_bootstrap(
     let has_session = request.headers().contains_key("mcp-session-id");
     if is_get && accept_sse && !has_session {
         let prefix = std::env::var("SWARM_PUBLIC_PREFIX").unwrap_or_else(|_| "/swarm".into());
-        let endpoint = format!("{}{}", prefix, request.uri().path());
+        // Legacy-SSE session id: the client will POST JSON-RPC to
+        // `endpoint?sessionId=<this>` — the map translates it to the
+        // rmcp session id returned by initialize.
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let endpoint = format!("{}{}?sessionId={}", prefix, request.uri().path(), query_id);
         let role = role_from_path(request.uri().path()).to_string();
         let stream = futures::stream::once(async move {
             Ok::<_, std::convert::Infallible>(
@@ -200,7 +219,7 @@ async fn sse_bootstrap(
             )
         })
         .chain(futures::stream::unfold(
-            events.subscribe(),
+            bridge.events.subscribe(),
             move |mut rx| {
                 let role = role.clone();
                 async move {
@@ -233,7 +252,66 @@ async fn sse_bootstrap(
     }
     if request.method() == Method::POST {
         let role = role_from_path(request.uri().path()).to_string();
+        // Legacy-SSE addressing: `?sessionId=<query_id>` → `Mcp-Session-Id`
+        // header. The initialize POST itself carries no header — rmcp creates
+        // the session and returns its id; we learn the mapping from the
+        // response header and store it for subsequent POSTs.
+        let query_id = request
+            .uri()
+            .query()
+            .and_then(|q| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("sessionId="))
+            })
+            .map(String::from);
+        let is_initialize = {
+            // Peek at the body to decide whether to inject the header.
+            // initialize → no header (rmcp must create the session).
+            let (parts, body) = request.into_parts();
+            let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => return api_error(StatusCode::BAD_REQUEST, "failed to read body"),
+            };
+            let is_init = String::from_utf8_lossy(&bytes).contains("\"method\":\"initialize\"");
+            let request = Request::from_parts(parts, axum::body::Body::from(bytes));
+            (request, is_init)
+        };
+        let (mut request, is_initialize) = is_initialize;
+        if !is_initialize {
+            if let Some(qid) = &query_id {
+                let sid = bridge
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(qid)
+                    .cloned();
+                if let Some(sid) = sid {
+                    if let Ok(hv) = header::HeaderValue::from_str(&sid) {
+                        request.headers_mut().insert(
+                            header::HeaderName::from_static("mcp-session-id"),
+                            hv,
+                        );
+                    }
+                }
+            }
+        }
         let response = next.run(request).await;
+        // Learn the rmcp session id from the initialize response header.
+        if is_initialize {
+            if let Some(qid) = &query_id {
+                if let Some(sid) = response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    bridge
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(qid.clone(), sid.to_string());
+                }
+            }
+        }
         // Publish the JSON-RPC reply on the broadcast so SSE-only clients
         // (Yandex voice agents) receive it over their GET stream. The POST
         // body itself passes through unchanged — streamable clients read it
@@ -257,7 +335,7 @@ async fn sse_bootstrap(
             (published, response)
         };
         if let Some(resp) = published {
-            let _ = events.send(serde_json::json!({
+            let _ = bridge.events.send(serde_json::json!({
                 "role": role,
                 "response": resp,
             }));
@@ -284,7 +362,10 @@ pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToke
     // Every POST response is published here tagged with its role; the
     // sse_bootstrap GET stream filters by its own role.
     let (events_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
-    let events_tx = std::sync::Arc::new(events_tx);
+    let bridge = SseBridge {
+        events: std::sync::Arc::new(events_tx),
+        sessions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
 
     for (role, path) in &state.config.role_paths {
         let handler_state = state.clone();
@@ -312,7 +393,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToke
         let protected = Router::new()
             .nest_service(path, service)
             .layer(middleware::from_fn_with_state(
-                events_tx.clone(),
+                bridge.clone(),
                 sse_bootstrap,
             ))
             .layer(middleware::from_fn_with_state(
@@ -477,6 +558,12 @@ async fn activity(
 }
 
 async fn role_auth(State(auth): State<RoleAuth>, request: Request, next: Next) -> Response {
+    // DELETE closes a session. Yandex SSE clients send it without the
+    // Authorization header (the session itself is the credential) — let rmcp
+    // validate the session instead of rejecting the transport op here.
+    if request.method() == Method::DELETE {
+        return next.run(request).await;
+    }
     let Some(provided) = bearer_token(request.headers()) else {
         return unauthorized();
     };
