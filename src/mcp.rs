@@ -184,11 +184,10 @@ impl RoleMcp {
             ));
             tools.push(tool(
                 "msg_to",
-                "Send a direct coordination message to another executor.",
+                "Send a direct coordination message to another executor (e.g. hand a lead to the contactor for a callback).",
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": peers},
-                        "task_id": task_id_schema(),
                         "message": {
                             "type": "string",
                             "minLength": 1,
@@ -196,7 +195,7 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["agent", "task_id", "message"],
+                    &["agent", "message"],
                 ),
             ));
             tools.push(tool(
@@ -204,7 +203,6 @@ impl RoleMcp {
                 "Send the same coordination message to every other executor.",
                 object_schema(
                     &json!({
-                        "task_id": task_id_schema(),
                         "message": {
                             "type": "string",
                             "minLength": 1,
@@ -212,7 +210,7 @@ impl RoleMcp {
                         },
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["task_id", "message"],
+                    &["message"],
                 ),
             ));
         }
@@ -625,15 +623,6 @@ fn idempotency_schema() -> Value {
     })
 }
 
-fn task_id_schema() -> Value {
-    json!({
-        "type": "string",
-        "minLength": 1,
-        "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
-        "description": "Task identifier from the active order; peer coordination without task lineage is rejected."
-    })
-}
-
 fn tool_result(outcome: ToolOutcome) -> CallToolResult {
     let mut result = if outcome.is_error {
         CallToolResult::structured_error(outcome.value)
@@ -990,7 +979,7 @@ mod tests {
         let msg = client
             .call_tool(
                 CallToolRequestParams::new("msg_to").with_arguments(serde_json::from_str(
-                    &format!(r#"{{"agent":"developer","task_id":"{task_id}","message":"ping"}}"#),
+                    &format!(r#"{{"agent":"developer","message":"ping"}}"#),
                 )?),
             )
             .await?;

@@ -568,8 +568,8 @@ impl Config {
         validate_template(
             "SWARM_PEER_PROMPT_TEMPLATE",
             &peer_template,
-            &["message_id", "sender", "recipient", "task_id", "message"],
-            &["message_id", "sender", "task_id", "message"],
+            &["message_id", "sender", "recipient", "message"],
+            &["message_id", "sender", "message"],
         )?;
         let telegram_inbound_template = required(env, "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE")?;
         validate_template(
@@ -1161,7 +1161,7 @@ mod tests {
         );
         env.insert(
             "SWARM_PEER_PROMPT_TEMPLATE".into(),
-            "{message_id}|{sender}|{recipient}|{task_id}|{message}".into(),
+            "{message_id}|{sender}|{recipient}|{message}".into(),
         );
         env.insert(
             "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE".into(),

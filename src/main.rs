@@ -183,7 +183,7 @@ mod tests {
         );
         env.insert(
             "SWARM_PEER_PROMPT_TEMPLATE".into(),
-            "{message_id}|{sender}|{recipient}|{task_id}|{message}".into(),
+            "{message_id}|{sender}|{recipient}|{message}".into(),
         );
         env.insert(
             "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE".into(),

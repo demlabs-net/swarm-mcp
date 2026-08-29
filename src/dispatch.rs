@@ -226,14 +226,12 @@ pub struct ReportArgs {
 #[derive(Debug, Deserialize)]
 pub struct MessageArgs {
     pub agent: String,
-    pub task_id: String,
     pub message: String,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MessageAllArgs {
-    pub task_id: String,
     pub message: String,
     pub idempotency_key: Option<String>,
 }
@@ -666,13 +664,6 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        let task_id = match validate_identifier(&args.task_id, "task_id") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
-            return outcome;
-        }
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -681,7 +672,6 @@ impl Dispatcher {
         let targets = vec![target.clone()];
         let fingerprint = fingerprint(&json!({
             "target": target,
-            "task_id": task_id,
             "message": normalize_dispatch_text(&message),
         }));
         if let Some(outcome) = self
@@ -703,7 +693,6 @@ impl Dispatcher {
                 ("message_id", message_id.as_str()),
                 ("sender", sender),
                 ("recipient", target.as_str()),
-                ("task_id", task_id.as_str()),
                 ("message", message.as_str()),
             ]),
         ) {
@@ -723,7 +712,6 @@ impl Dispatcher {
                 let mut result = json!({
                     "ok": true,
                     "message_id": message_id,
-                    "task_id": task_id,
                     "agent": target,
                 });
                 result[key] = json!(value);
@@ -750,10 +738,6 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        let task_id = match validate_identifier(&args.task_id, "task_id") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -775,12 +759,8 @@ impl Dispatcher {
         if let Some(outcome) = self.messaging_block(sender, &targets).await {
             return outcome;
         }
-        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
-            return outcome;
-        }
         let fingerprint = fingerprint(&json!({
             "targets": targets,
-            "task_id": task_id,
             "message": normalize_dispatch_text(&message),
         }));
         if let Some(outcome) = self
@@ -803,7 +783,6 @@ impl Dispatcher {
                     ("message_id", message_id.as_str()),
                     ("sender", sender),
                     ("recipient", target.as_str()),
-                    ("task_id", task_id.as_str()),
                     ("message", message.as_str()),
                 ]),
             );
@@ -825,7 +804,6 @@ impl Dispatcher {
         let mut result = json!({
             "ok": ok,
             "message_id": message_id,
-            "task_id": task_id,
             "results": summary.results,
         });
         let audit = self.audit(
@@ -2382,7 +2360,6 @@ mod tests {
                 "lead-developer",
                 MessageArgs {
                     agent: "developer".to_string(),
-                    task_id: "task-blocked".to_string(),
                     message: "must not arrive".to_string(),
                     idempotency_key: None,
                 },
@@ -2745,7 +2722,6 @@ mod tests {
             .message_all(
                 "developer",
                 MessageAllArgs {
-                    task_id: "task-no-peers".to_string(),
                     message: "hi".to_string(),
                     idempotency_key: None,
                 },
@@ -2758,6 +2734,53 @@ mod tests {
                 .unwrap()
                 .contains("no peer executors")
         );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn msg_to_without_task_id_is_a_plain_handoff() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-msg-no-task");
+        let mut config = testutil::fixture_config(&path);
+        let mock =
+            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(mock.parse()?);
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        // developer → lead-developer, no task_id: must be accepted as a
+        // plain coordination message (no order lineage exists for sender).
+        let outcome = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "lead-developer".to_string(),
+                    message: "Перезвони клиенту: Иван, +79139849832, хочет сайт".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.value);
+        assert_eq!(outcome.value["ok"], json!(true));
+        assert_eq!(outcome.value["agent"], json!("lead-developer"));
+
+        // Same again — idempotency replay must not flip it to an error.
+        let replay = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "lead-developer".to_string(),
+                    message: "Перезвони клиенту: Иван, +79139849832, хочет сайт".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!replay.is_error, "replay failed: {}", replay.value);
+        assert_eq!(replay.value["ok"], json!(true));
+
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -2969,7 +2992,6 @@ mod tests {
                 "developer",
                 MessageArgs {
                     agent: "lead-developer".to_string(),
-                    task_id,
                     message: " ping ".to_string(),
                     idempotency_key: None,
                 },
@@ -2997,7 +3019,6 @@ mod tests {
                 "developer",
                 MessageArgs {
                     agent: "developer".to_string(),
-                    task_id: "task-self".to_string(),
                     message: "self".to_string(),
                     idempotency_key: None,
                 },
@@ -3009,7 +3030,6 @@ mod tests {
                 "developer",
                 MessageArgs {
                     agent: "manager".to_string(),
-                    task_id: "task-not-peer".to_string(),
                     message: "not a peer".to_string(),
                     idempotency_key: None,
                 },
@@ -3052,7 +3072,6 @@ mod tests {
             .message_all(
                 "developer",
                 MessageAllArgs {
-                    task_id,
                     message: "sync".to_string(),
                     idempotency_key: None,
                 },
