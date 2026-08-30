@@ -980,13 +980,12 @@ mod tests {
         assert_eq!(report_value["ok"], json!(true));
         assert_eq!(report_value["recipient"], json!("manager"));
 
-        let msg = client
-            .call_tool(
-                CallToolRequestParams::new("msg_to").with_arguments(serde_json::from_str(
-                    &format!(r#"{{"agent":"developer","message":"ping"}}"#),
-                )?),
-            )
-            .await?;
+        let msg =
+            client
+                .call_tool(CallToolRequestParams::new("msg_to").with_arguments(
+                    serde_json::from_value(json!({"agent": "developer", "message": "ping"}))?,
+                ))
+                .await?;
         let msg_value = msg.structured_content.expect("structured result");
         assert_eq!(msg_value["ok"], json!(true));
         assert_eq!(msg_value["agent"], json!("developer"));

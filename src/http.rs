@@ -181,10 +181,10 @@ struct SseBridge {
 /// открывает настоящий стрим сессии GET-ом уже с session id.
 ///
 /// Yandex "HTTP with SSE" voice agents OPEN the stream and then WAIT for
-/// `event: endpoint` before POSTing JSON-RPC — an empty stream times out.
+/// `event: endpoint` before sending a JSON-RPC POST — an empty stream times out.
 /// The endpoint must be the PUBLIC path (nginx strips the /swarm prefix, so
 /// the request path alone would 404 on the public side): prefix from
-/// SWARM_PUBLIC_PREFIX (default "/swarm") + the (stripped) request path.
+/// `SWARM_PUBLIC_PREFIX` (default "/swarm") + the (stripped) request path.
 /// The endpoint carries `?sessionId=<uuid>` — the legacy-SSE addressing rmcp
 /// streamable does not speak; POSTs with that query param get the header
 /// `Mcp-Session-Id` injected from the session map.
@@ -193,11 +193,7 @@ struct SseBridge {
 /// SSE-only clients ignore the POST response body and wait on the GET
 /// channel. The fan-out comes from the shared broadcast: every POST response
 /// (parsed from the body) is published tagged with its role.
-async fn sse_bootstrap(
-    State(bridge): State<SseBridge>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn sse_bootstrap(State(bridge): State<SseBridge>, request: Request, next: Next) -> Response {
     let is_get = request.method() == Method::GET;
     let accept_sse = request
         .headers()
@@ -214,9 +210,7 @@ async fn sse_bootstrap(
         let endpoint = format!("{}{}?sessionId={}", prefix, request.uri().path(), query_id);
         let role = role_from_path(request.uri().path()).to_string();
         let stream = futures::stream::once(async move {
-            Ok::<_, std::convert::Infallible>(
-                SseEvent::default().event("endpoint").data(endpoint),
-            )
+            Ok::<_, std::convert::Infallible>(SseEvent::default().event("endpoint").data(endpoint))
         })
         .chain(futures::stream::unfold(
             bridge.events.subscribe(),
@@ -226,20 +220,20 @@ async fn sse_bootstrap(
                     loop {
                         match rx.recv().await {
                             Ok(evt) => {
-                                if evt.get("role").and_then(|v| v.as_str()) == Some(&role) {
-                                    if let Some(resp) = evt.get("response") {
-                                        return Some((
-                                            Ok::<_, std::convert::Infallible>(
-                                                SseEvent::default()
-                                                    .event("message")
-                                                    .data(resp.to_string()),
-                                            ),
-                                            rx,
-                                        ));
-                                    }
+                                if evt.get("role").and_then(|v| v.as_str()) == Some(&role)
+                                    && let Some(resp) = evt.get("response")
+                                {
+                                    return Some((
+                                        Ok::<_, std::convert::Infallible>(
+                                            SseEvent::default()
+                                                .event("message")
+                                                .data(resp.to_string()),
+                                        ),
+                                        rx,
+                                    ));
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                         }
                     }
@@ -259,58 +253,49 @@ async fn sse_bootstrap(
         let query_id = request
             .uri()
             .query()
-            .and_then(|q| {
-                q.split('&')
-                    .find_map(|kv| kv.strip_prefix("sessionId="))
-            })
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("sessionId=")))
             .map(String::from);
         let is_initialize = {
             // Peek at the body to decide whether to inject the header.
             // initialize → no header (rmcp must create the session).
             let (parts, body) = request.into_parts();
-            let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
-                Ok(b) => b,
-                Err(_) => return api_error(StatusCode::BAD_REQUEST, "failed to read body"),
+            let Ok(bytes) = axum::body::to_bytes(body, 1024 * 1024).await else {
+                return api_error(StatusCode::BAD_REQUEST, "failed to read body");
             };
             let is_init = String::from_utf8_lossy(&bytes).contains("\"method\":\"initialize\"");
             let request = Request::from_parts(parts, axum::body::Body::from(bytes));
             (request, is_init)
         };
         let (mut request, is_initialize) = is_initialize;
-        if !is_initialize {
-            if let Some(qid) = &query_id {
-                let sid = bridge
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get(qid)
-                    .cloned();
-                if let Some(sid) = sid {
-                    if let Ok(hv) = header::HeaderValue::from_str(&sid) {
-                        request.headers_mut().insert(
-                            header::HeaderName::from_static("mcp-session-id"),
-                            hv,
-                        );
-                    }
-                }
+        if !is_initialize && let Some(qid) = &query_id {
+            let sid = bridge
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(qid)
+                .cloned();
+            if let Some(sid) = sid
+                && let Ok(hv) = header::HeaderValue::from_str(&sid)
+            {
+                request
+                    .headers_mut()
+                    .insert(header::HeaderName::from_static("mcp-session-id"), hv);
             }
         }
         let response = next.run(request).await;
         // Learn the rmcp session id from the initialize response header.
-        if is_initialize {
-            if let Some(qid) = &query_id {
-                if let Some(sid) = response
-                    .headers()
-                    .get("mcp-session-id")
-                    .and_then(|v| v.to_str().ok())
-                {
-                    bridge
-                        .sessions
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(qid.clone(), sid.to_string());
-                }
-            }
+        if is_initialize
+            && let Some(qid) = &query_id
+            && let Some(sid) = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+        {
+            bridge
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(qid.clone(), sid.to_string());
         }
         // Publish the JSON-RPC reply on the broadcast so SSE-only clients
         // (Yandex voice agents) receive it over their GET stream. The POST
@@ -318,16 +303,19 @@ async fn sse_bootstrap(
         // there.
         let (published, response) = {
             let (parts, body) = response.into_parts();
-            let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
-                Ok(b) => b,
-                Err(_) => return Response::from_parts(parts, axum::body::Body::empty()),
+            let Ok(bytes) = axum::body::to_bytes(body, 16 * 1024 * 1024).await else {
+                return Response::from_parts(parts, axum::body::Body::empty());
             };
             let text = String::from_utf8_lossy(&bytes);
             // rmcp SSE replies lead with an EMPTY `data:` line (keep-alive
             // preamble) — skip empty payloads and take the first real one.
             let candidate = text
                 .lines()
-                .find_map(|l| l.strip_prefix("data:").map(str::trim).filter(|s| !s.is_empty()))
+                .find_map(|l| {
+                    l.strip_prefix("data:")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or(text.trim());
             let value: Option<serde_json::Value> = serde_json::from_str(candidate).ok();
             let published = value.filter(|v| v.get("id").is_some());
@@ -347,10 +335,7 @@ async fn sse_bootstrap(
 
 /// The role segment of `/roles/{role}/mcp`.
 fn role_from_path(path: &str) -> &str {
-    path.trim_matches('/')
-        .split('/')
-        .nth(1)
-        .unwrap_or_default()
+    path.trim_matches('/').split('/').nth(1).unwrap_or_default()
 }
 
 pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToken) -> Router {

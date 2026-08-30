@@ -2761,7 +2761,6 @@ mod tests {
             .as_str()
             .expect("assigned task id")
             .to_string();
-
         let outcome = dispatcher
             .report(
                 "developer",
@@ -3197,7 +3196,7 @@ mod tests {
         let (dispatcher, store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-msg"})))).await?;
 
-        let assignment = dispatcher
+        let _assignment = dispatcher
             .order(
                 "manager",
                 OrderArgs {
@@ -3207,10 +3206,6 @@ mod tests {
                 },
             )
             .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
 
         let outcome = dispatcher
             .message(
@@ -3276,7 +3271,7 @@ mod tests {
         });
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
-        let assignment = dispatcher
+        let _assignment = dispatcher
             .order(
                 "manager",
                 OrderArgs {
@@ -3286,11 +3281,6 @@ mod tests {
                 },
             )
             .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-
         // The developer's only peer is lead-developer, whose server error is
         // indeterminate because the downstream may still have accepted it.
         let outcome = dispatcher
