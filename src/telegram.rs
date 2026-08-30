@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, anyhow, bail, ensure};
 use futures::StreamExt;
@@ -96,6 +100,7 @@ struct TelegramGateway {
     client: Client,
     bot_url: String,
     group_id: i64,
+    queued_notices: Mutex<HashSet<i64>>,
 }
 
 impl TelegramGateway {
@@ -133,6 +138,7 @@ impl TelegramGateway {
             client,
             bot_url,
             group_id,
+            queued_notices: Mutex::new(HashSet::new()),
         })
     }
 
@@ -294,6 +300,29 @@ impl TelegramGateway {
                 {
                     bail!("Telegram dispatch could not be reserved");
                 }
+                if outcome
+                    .value
+                    .get("retryable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let first_notice = self
+                        .queued_notices
+                        .lock()
+                        .expect("Telegram queue notice lock")
+                        .insert(update.update_id);
+                    if first_notice {
+                        let notice = "⏳ Запрос принят и ждёт свободного слота менеджера. Отвечу автоматически; повторять сообщение не нужно.";
+                        if let Err(error) = self.send_text(message.chat.id, notice).await {
+                            warn!(error = %error, "send Telegram queued notice failed");
+                        }
+                    }
+                    bail!("Telegram target is busy; update retained for retry");
+                }
+                self.queued_notices
+                    .lock()
+                    .expect("Telegram queue notice lock")
+                    .remove(&update.update_id);
                 let audit_queued = outcome
                     .value
                     .pointer("/telegram/queued")
@@ -651,10 +680,22 @@ mod tests {
         backlog: TelegramBacklogMode,
         bot: MockBot,
     ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
+        gateway_with_mocks_and_hermes(
+            backlog,
+            bot,
+            Arc::new(|_, _| (202, json!({"run_id": "run-1"}))),
+        )
+        .await
+    }
+
+    async fn gateway_with_mocks_and_hermes(
+        backlog: TelegramBacklogMode,
+        bot: MockBot,
+        hermes_behavior: testutil::MockHermes,
+    ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
         let path = testutil::temp_db_path("telegram");
         let telegram_base = spawn_mock_telegram(bot).await;
-        let hermes_base =
-            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "run-1"})))).await;
+        let hermes_base = testutil::spawn_mock_hermes(hermes_behavior).await;
         let mut config = testutil::fixture_config(&path);
         config.telegram_enabled = true;
         config.telegram_bot_mode = TelegramBotMode::Shared;
@@ -714,6 +755,56 @@ mod tests {
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(status, "accepted", "the Telegram command reached the swarm");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_target_retains_update_and_sends_one_queue_notice() -> anyhow::Result<()> {
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (gateway, store, path) = gateway_with_mocks_and_hermes(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([allowed_update()]), sent.clone()),
+            Arc::new(|_, _| (429, json!({"error": "busy"}))),
+        )
+        .await?;
+
+        let first = gateway.poll_once().await;
+        assert!(
+            first.is_err(),
+            "busy target must retain the Telegram update"
+        );
+        assert_eq!(
+            store.telegram_update_offset().await?,
+            None,
+            "the durable offset must not advance before target admission"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE id='telegram_5'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "failed", "the failed reservation is retryable");
+        let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            outbox, 0,
+            "transient queue pressure must not spam the shared audit group"
+        );
+        assert_eq!(sent.lock().expect("sent").len(), 1);
+        assert!(
+            sent.lock().expect("sent")[0].contains("ждёт свободного слота"),
+            "operator receives a queue notice"
+        );
+
+        let second = gateway.poll_once().await;
+        assert!(second.is_err());
+        assert_eq!(
+            sent.lock().expect("sent").len(),
+            1,
+            "the same update must not spam repeated queue notices"
+        );
 
         testutil::remove_db_files(&path).await;
         Ok(())

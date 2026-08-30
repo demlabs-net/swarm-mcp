@@ -11,7 +11,9 @@ use std::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::config::{AgentConfig, Config, Secret, TelegramBacklogMode, TelegramBotMode};
+use crate::config::{
+    AgentConfig, Config, ManagerReportWakeMode, Secret, TelegramBacklogMode, TelegramBotMode,
+};
 
 /// Unique temp `SQLite` path; clean up with `remove_db_files`.
 pub(crate) fn temp_db_path(name: &str) -> PathBuf {
@@ -117,6 +119,7 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
             "in_progress".to_string(),
         ],
         report_wake_statuses: BTreeSet::from(["completed".to_string(), "failed".to_string()]),
+        manager_report_wake_mode: ManagerReportWakeMode::Immediate,
         telegram_enabled: false,
         telegram_bot_mode: TelegramBotMode::PerRole,
         telegram_bot_token: None,

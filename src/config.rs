@@ -73,6 +73,12 @@ pub enum TelegramBacklogMode {
     Process,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagerReportWakeMode {
+    Immediate,
+    Scheduled,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_ip: IpAddr,
@@ -115,6 +121,10 @@ pub struct Config {
     pub mcp_request_rate_window: Duration,
     pub report_statuses: Vec<String>,
     pub report_wake_statuses: BTreeSet<String>,
+    /// Whether terminal reports addressed to the manager should start an
+    /// immediate manager run. Deployments with a reconciliation cron can
+    /// disable this to prevent report storms from starving operator traffic.
+    pub manager_report_wake_mode: ManagerReportWakeMode,
     pub telegram_enabled: bool,
     pub telegram_bot_mode: TelegramBotMode,
     pub telegram_bot_token: Option<Secret>,
@@ -445,6 +455,12 @@ impl Config {
                 .all(|status| report_statuses.contains(status)),
             "SWARM_REPORT_WAKE_STATUSES must be a subset of SWARM_REPORT_STATUSES"
         );
+        let manager_report_wake_mode = if bool_env(env, "SWARM_MANAGER_REPORT_WAKE_ENABLED", true)?
+        {
+            ManagerReportWakeMode::Immediate
+        } else {
+            ManagerReportWakeMode::Scheduled
+        };
 
         let telegram_enabled = bool_env(env, "SWARM_TELEGRAM_ENABLED", false)?;
         let telegram_bot_mode = match optional(env, "SWARM_TELEGRAM_BOT_MODE")
@@ -640,6 +656,7 @@ impl Config {
             mcp_request_rate_window: seconds(env, "SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS")?,
             report_statuses,
             report_wake_statuses,
+            manager_report_wake_mode,
             telegram_enabled,
             telegram_bot_mode,
             telegram_bot_token,

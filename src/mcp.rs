@@ -324,6 +324,10 @@ impl RoleMcp {
                 "duplicate_window_seconds": config.duplicate_window.as_secs(),
                 "messaging_reenable_cooldown_seconds": config.messaging_reenable_cooldown.as_secs(),
                 "report_wake_statuses": config.report_wake_statuses,
+                "manager_report_wake_enabled": matches!(
+                    config.manager_report_wake_mode,
+                    crate::config::ManagerReportWakeMode::Immediate
+                ),
                 "max_inflight_dispatches": config.max_inflight_dispatches,
                 "telegram_outbox": config.telegram_enabled,
                 "telegram_bot_mode": match config.telegram_bot_mode {

@@ -61,6 +61,18 @@ start another supervisor run. Only statuses listed in
 `SWARM_REPORT_WAKE_STATUSES` wake the supervisor; the production default is
 `completed,blocked,failed`. This separates observation from orchestration and
 prevents a stream of routine updates from recursively consuming manager turns.
+When `SWARM_MANAGER_REPORT_WAKE_ENABLED=false`, terminal reports addressed to
+the manager are accepted and persisted without starting one run per report;
+the manager's bounded reconciliation scheduler consumes them from
+`swarm://operations`. Reports to other supervisors retain the normal wake
+behavior. A transient downstream `429` likewise accepts the durable report and
+marks its wake as deferred instead of making the executor retry the report.
+
+Telegram inbound treats a downstream `429` or the dispatcher's own transient
+rate limit as queue pressure, not rejection. The Telegram update offset is not
+advanced, the operator receives one queued notice, and the same update is
+retried with capped polling backoff until the target accepts it. Hard validation
+or authorization failures are still rejected immediately.
 
 ## Role dispatch modes
 
@@ -247,7 +259,7 @@ Important groups:
 | Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
 | Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_ORDER_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
 | Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_KIND` (`hermes`/`openai`/`mcp`), `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY`, `<ROLE>_API_MODEL` |
-| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS`, `SWARM_REPORT_WAKE_STATUSES` |
+| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS`, `SWARM_REPORT_WAKE_STATUSES`, `SWARM_MANAGER_REPORT_WAKE_ENABLED` |
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
 | Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |

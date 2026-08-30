@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{ApiKind, Config, TelegramBotMode},
+    config::{ApiKind, Config, ManagerReportWakeMode, TelegramBotMode},
     store::{AuditMessage, OutboxItem, Reservation, Store},
 };
 
@@ -81,6 +81,7 @@ pub struct ToolOutcome {
 struct RunFailure {
     error: anyhow::Error,
     indeterminate: bool,
+    retry_after_seconds: Option<u64>,
 }
 
 impl RunFailure {
@@ -88,6 +89,7 @@ impl RunFailure {
         Self {
             error,
             indeterminate: false,
+            retry_after_seconds: None,
         }
     }
 
@@ -95,7 +97,20 @@ impl RunFailure {
         Self {
             error,
             indeterminate: true,
+            retry_after_seconds: None,
         }
+    }
+
+    fn retryable(error: anyhow::Error, retry_after_seconds: u64) -> Self {
+        Self {
+            error,
+            indeterminate: false,
+            retry_after_seconds: Some(retry_after_seconds.max(1)),
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        self.retry_after_seconds.is_some()
     }
 
     fn status(&self) -> &'static str {
@@ -153,6 +168,8 @@ struct BroadcastSummary {
     results: Map<String, Value>,
     succeeded: usize,
     indeterminate: usize,
+    retryable: usize,
+    retry_after_seconds: u64,
 }
 
 impl BroadcastSummary {
@@ -162,6 +179,8 @@ impl BroadcastSummary {
             results: Map::new(),
             succeeded: 0,
             indeterminate: 0,
+            retryable: 0,
+            retry_after_seconds: 0,
         }
     }
 
@@ -175,16 +194,24 @@ impl BroadcastSummary {
             Err(error) => {
                 warn!(%target, error = %error, "{}", self.label);
                 self.indeterminate += usize::from(error.indeterminate);
-                self.results.insert(
-                    target,
-                    json!({
-                        "error": error.to_string(),
-                        "status": error.status(),
-                        "recovery_required": error.indeterminate,
-                    }),
-                );
+                let mut result = json!({
+                    "error": error.to_string(),
+                    "status": error.status(),
+                    "recovery_required": error.indeterminate,
+                });
+                if let Some(retry_after_seconds) = error.retry_after_seconds {
+                    self.retryable += 1;
+                    self.retry_after_seconds = self.retry_after_seconds.max(retry_after_seconds);
+                    result["retryable"] = json!(true);
+                    result["retry_after_seconds"] = json!(retry_after_seconds);
+                }
+                self.results.insert(target, result);
             }
         }
+    }
+
+    fn entirely_retryable(&self, total: usize) -> bool {
+        total > 0 && self.succeeded == 0 && self.retryable == total
     }
 
     fn status(&self, total: usize) -> &'static str {
@@ -569,6 +596,31 @@ impl Dispatcher {
                 .finish(&dispatch_id, "accepted", &result, audit, false)
                 .await;
         }
+        if recipient == self.config.manager_role
+            && self.config.manager_report_wake_mode == ManagerReportWakeMode::Scheduled
+        {
+            let mut result = json!({
+                "ok": true,
+                "report_id": dispatch_id,
+                "recipient": recipient,
+                "task_id": task_id,
+                "status": status,
+                "summary": summary,
+                "supervisor_woken": false,
+                "wake_deferred": true,
+                "wake_policy": "scheduled_reconciliation",
+            });
+            let audit = self.audit(
+                sender,
+                "REPORT",
+                &recipient,
+                &format!("{task_id} [{status}]\n{summary}"),
+                &mut result,
+            );
+            return self
+                .finish(&dispatch_id, "accepted", &result, audit, false)
+                .await;
+        }
         let message = match render_template(
             &self.config.report_template,
             &BTreeMap::from([
@@ -613,6 +665,29 @@ impl Dispatcher {
                     "supervisor_woken": true,
                 });
                 result[format!("recipient_{key}")] = json!(value);
+                let audit = self.audit(
+                    sender,
+                    "REPORT",
+                    &recipient,
+                    &format!("{task_id} [{status}]\n{summary}"),
+                    &mut result,
+                );
+                self.finish(&dispatch_id, "accepted", &result, audit, false)
+                    .await
+            }
+            Err(error) if error.is_retryable() => {
+                let mut result = json!({
+                    "ok": true,
+                    "report_id": dispatch_id,
+                    "recipient": recipient,
+                    "task_id": task_id,
+                    "status": status,
+                    "summary": summary,
+                    "supervisor_woken": false,
+                    "wake_deferred": true,
+                    "wake_policy": "supervisor_busy",
+                    "retry_after_seconds": error.retry_after_seconds,
+                });
                 let audit = self.audit(
                     sender,
                     "REPORT",
@@ -939,6 +1014,8 @@ impl Dispatcher {
         }
         let ok = summary.succeeded == targets.len();
         let status = summary.status(targets.len());
+        let entirely_retryable = summary.entirely_retryable(targets.len());
+        let retry_after_seconds = summary.retry_after_seconds;
         let mut result = json!({
             "ok": ok,
             "dispatch_id": dispatch_id,
@@ -949,7 +1026,21 @@ impl Dispatcher {
             "username": args.username,
             "results": summary.results.clone(),
         });
-        let audit = if private_chat {
+        if entirely_retryable {
+            result["retryable"] = json!(true);
+            result["retry_after_seconds"] = json!(retry_after_seconds.max(1));
+        }
+        let audit = if entirely_retryable {
+            // Queue pressure is not an auditable rejection. The Telegram
+            // gateway retains this update and will retry it; emitting an
+            // outbox item here would spam the shared group on every retry.
+            result["telegram"] = json!({
+                "queued": false,
+                "enabled": self.config.telegram_enabled,
+                "delivery": "retrying_inbound",
+            });
+            None
+        } else if private_chat {
             // A private operator conversation must never be copied into the
             // shared Telegram audit group. The dispatch itself stays durable,
             // and its final answer is delivered back to the source chat by the
@@ -1373,8 +1464,17 @@ impl Dispatcher {
                 RunFailure::indeterminate(anyhow!("dispatch run to {role}: {error}"))
             })?;
         if response.status() != reqwest::StatusCode::ACCEPTED {
-            let error = anyhow!("{role} API returned HTTP {}", response.status());
-            return Err(if response.status().is_server_error() {
+            let status = response.status();
+            let retry_after_seconds = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1);
+            let error = anyhow!("{role} API returned HTTP {status}");
+            return Err(if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                RunFailure::retryable(error, retry_after_seconds)
+            } else if status.is_server_error() {
                 RunFailure::indeterminate(error)
             } else {
                 RunFailure::rejected(error)
@@ -1698,6 +1798,7 @@ impl Dispatcher {
             }) => Some(tool_error(json!({
                 "ok": false,
                 "error": "dispatch rate limit exceeded",
+                "retryable": true,
                 "retry_after_seconds": retry_after_seconds,
             }))),
             Err(error) => {
@@ -2682,6 +2783,130 @@ mod tests {
             1,
             "the assignment starts one run; progress must not start another"
         );
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(outcome.value["report_id"].as_str().expect("report id"))
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "accepted");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_terminal_report_can_be_reconciled_without_consuming_a_run()
+    -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-manager-report-reconcile");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let mock = testutil::spawn_mock_hermes(Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (202, json!({"run_id": "run-assignment"}))
+        }))
+        .await;
+        let mut config = testutil::fixture_config(&path);
+        config.manager_report_wake_mode = ManagerReportWakeMode::Scheduled;
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(mock.parse()?);
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config, store.clone())?;
+
+        let assignment = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "Implement the assigned work".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let task_id = assignment.value["task_id"]
+            .as_str()
+            .expect("assigned task id")
+            .to_string();
+        let outcome = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "terminal evidence".to_string(),
+                    task_id,
+                    status: "completed".to_string(),
+                    recipient: Some("manager".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+
+        assert!(!outcome.is_error, "unexpected: {outcome:?}");
+        assert_eq!(outcome.value["supervisor_woken"], json!(false));
+        assert_eq!(outcome.value["wake_deferred"], json!(true));
+        assert_eq!(
+            outcome.value["wake_policy"],
+            json!("scheduled_reconciliation")
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the original assignment may start a run"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
+            .bind(outcome.value["report_id"].as_str().expect("report id"))
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "accepted");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_report_is_accepted_when_supervisor_is_temporarily_busy() -> anyhow::Result<()>
+    {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
+            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (202, json!({"run_id": "run-assignment"}))
+            } else {
+                (429, json!({"error": "busy"}))
+            }
+        }))
+        .await?;
+        let assignment = dispatcher
+            .order(
+                "manager",
+                OrderArgs {
+                    agent: "developer".to_string(),
+                    command: "Implement the assigned work".to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        let task_id = assignment.value["task_id"]
+            .as_str()
+            .expect("assigned task id")
+            .to_string();
+
+        let outcome = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "terminal evidence".to_string(),
+                    task_id,
+                    status: "completed".to_string(),
+                    recipient: Some("lead-developer".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+
+        assert!(!outcome.is_error, "unexpected: {outcome:?}");
+        assert_eq!(outcome.value["supervisor_woken"], json!(false));
+        assert_eq!(outcome.value["wake_deferred"], json!(true));
+        assert_eq!(outcome.value["wake_policy"], json!("supervisor_busy"));
         let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
             .bind(outcome.value["report_id"].as_str().expect("report id"))
             .fetch_one(store.pool())
