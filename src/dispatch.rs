@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{ApiKind, Config, ManagerReportWakeMode, TelegramBotMode},
-    store::{AuditMessage, OutboxItem, Reservation, Store},
+    store::{AuditMessage, MediaPayload, OutboxItem, Reservation, Store},
 };
 
 #[derive(Clone)]
@@ -277,8 +277,20 @@ pub struct ClearMessageQueueArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelegramReplyArgs {
     pub message: String,
+    #[serde(default)]
+    pub files: Vec<TelegramFileArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramFileArgs {
+    pub filename: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    pub content_b64: String,
 }
 
 #[derive(Debug)]
@@ -1057,19 +1069,38 @@ impl Dispatcher {
         self.finish(&dispatch_id, status, &result, audit, !ok).await
     }
 
-    /// Delivers the agent's final answer to the operator who started the most
-    /// recent Telegram inbound dispatch targeting `sender` (used by the
-    /// `telegram_reply` MCP tool).
-    pub async fn telegram_reply(&self, sender: &str, message: String) -> ToolOutcome {
+    /// Delivers the agent's answer (text and/or one or more files) to the
+    /// operator who started the most recent Telegram inbound dispatch
+    /// targeting `sender` (used by the `telegram_reply` MCP tool).
+    pub async fn telegram_reply(
+        &self,
+        sender: &str,
+        message: String,
+        files: Vec<TelegramFileArgs>,
+    ) -> ToolOutcome {
         let message = match self.clean_text(&message, "message") {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        if message.is_empty() {
+        if message.is_empty() && files.is_empty() {
             return tool_error(json!({
                 "ok": false,
                 "error": "Telegram reply must not be empty",
             }));
+        }
+        let mut media = Vec::with_capacity(files.len());
+        for file in files {
+            if file.filename.is_empty() || file.content_b64.is_empty() {
+                return tool_error(json!({
+                    "ok": false,
+                    "error": "Telegram file must have a filename and content_b64",
+                }));
+            }
+            media.push(MediaPayload {
+                filename: file.filename,
+                mime_type: file.mime_type,
+                content_b64: file.content_b64,
+            });
         }
         // MCP-only roles may reply proactively with no prior dispatch: the
         // chat falls back to the latest operator chat, then to the group.
@@ -1087,6 +1118,7 @@ impl Dispatcher {
             recipients: "operator".to_string(),
             text: message,
             chat_id,
+            media,
         };
         if let Err(error) = self.store.enqueue_outbox(audit).await {
             warn!(role = %sender, error = %error, "Telegram reply enqueue failed");
@@ -1224,6 +1256,7 @@ impl Dispatcher {
             recipients: "operator".to_string(),
             text,
             chat_id: Some(chat_id),
+            media: vec![],
         };
         if let Err(error) = self.store.enqueue_outbox(audit).await {
             warn!(run_id = %run_id, error = %error, "Telegram run reply enqueue failed");
@@ -1300,14 +1333,20 @@ impl Dispatcher {
             .telegram_group_id
             .as_ref()
             .ok_or_else(|| TelegramFailure::permanent("Telegram group is not configured"))?;
-        let url = format!(
-            "{}/bot{}/sendMessage",
-            self.config
-                .telegram_api_base_url
-                .as_str()
-                .trim_end_matches('/'),
-            token.expose()
-        );
+        let api_base = self
+            .config
+            .telegram_api_base_url
+            .as_str()
+            .trim_end_matches('/');
+        let chat_id = item
+            .chat_id
+            .map_or_else(|| group.clone(), |chat_id| chat_id.to_string());
+        if !item.media.is_empty() {
+            return self
+                .send_telegram_media(api_base, token.expose(), &chat_id, item)
+                .await;
+        }
+        let url = format!("{api_base}/bot{}/sendMessage", token.expose());
         let chunks = telegram_chunks_for_item(item, self.config.telegram_message_limit);
         let start = usize::try_from(item.next_chunk).unwrap_or(usize::MAX);
         if start > chunks.len() {
@@ -1316,9 +1355,6 @@ impl Dispatcher {
             ));
         }
         for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
-            let chat_id = item
-                .chat_id
-                .map_or_else(|| group.clone(), |chat_id| chat_id.to_string());
             let response = self
                 .telegram_client
                 .post(&url)
@@ -1338,6 +1374,59 @@ impl Dispatcher {
                     TelegramFailure::new(format!("outbox checkpoint failed: {error}"), None)
                 })?;
         }
+        Ok(())
+    }
+
+    /// Deliver an attached file as a single sendPhoto (image/*) or
+    /// sendDocument message; the item text becomes the caption (≤1024 chars).
+    /// Deliver attached files: one sendPhoto (image/*) or sendDocument message
+    /// per file; the item text is the caption of the first file (≤1024 chars).
+    async fn send_telegram_media(
+        &self,
+        api_base: &str,
+        token: &str,
+        chat_id: &str,
+        item: &OutboxItem,
+    ) -> Result<(), TelegramFailure> {
+        use base64::Engine as _;
+        let caption: String = item.text.chars().take(1024).collect();
+        for (index, media) in item.media.iter().enumerate() {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&media.content_b64)
+                .map_err(|_| TelegramFailure::new("Telegram media base64 decode failed", None))?;
+            let mime =
+                media.mime_type.clone().unwrap_or_else(|| "application/octet-stream".into());
+            let is_image = mime.starts_with("image/");
+            let method = if is_image { "sendPhoto" } else { "sendDocument" };
+            let field = if is_image { "photo" } else { "document" };
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(media.filename.clone())
+                .mime_str(&mime)
+                .map_err(|error| {
+                    TelegramFailure::new(format!("media mime failed: {error}"), None)
+                })?;
+            let form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .text("caption", if index == 0 { caption.clone() } else { String::new() })
+                .part(field, part);
+            let url = format!("{api_base}/bot{token}/{method}");
+            let response = self
+                .telegram_client
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|_| TelegramFailure::new("Telegram media request failed", None))?;
+            validate_telegram_response(response).await?;
+        }
+        // Media items are not chunked: advance the chunk cursor past the end.
+        let chunks = telegram_chunks_for_item(item, self.config.telegram_message_limit);
+        self.store
+            .mark_outbox_chunk_sent(&item.id, i64::try_from(chunks.len()).unwrap_or(i64::MAX))
+            .await
+            .map_err(|error| {
+                TelegramFailure::new(format!("outbox checkpoint failed: {error}"), None)
+            })?;
         Ok(())
     }
 
@@ -1840,6 +1929,7 @@ impl Dispatcher {
             recipients: recipients.to_string(),
             text: text.to_string(),
             chat_id,
+            media: vec![],
         })
     }
 
@@ -3456,7 +3546,7 @@ mod tests {
 
         let reply_text = "Ответ без служебного заголовка";
         let reply = dispatcher
-            .telegram_reply("developer", reply_text.to_string())
+            .telegram_reply("developer", reply_text.to_string(), vec![])
             .await;
         assert!(!reply.is_error, "unexpected: {:?}", reply.value);
         dispatcher.flush_outbox().await?;
@@ -3474,6 +3564,57 @@ mod tests {
                 .unwrap_or_default()
                 .contains("TELEGRAM_REPLY")
         );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_queues_attached_files() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        // Устанавливаем чат оператора диспатчем.
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 11,
+                message_id: 400,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let files = vec![
+            TelegramFileArgs {
+                filename: "cover_ru.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                content_b64: "aGVsbG8=".to_string(),
+            },
+            TelegramFileArgs {
+                filename: "report.pdf".to_string(),
+                mime_type: None,
+                content_b64: "cGRm".to_string(),
+            },
+        ];
+        let reply = dispatcher
+            .telegram_reply("developer", "Готово".to_string(), files)
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        let items = store.due_outbox(10).await?;
+        let item = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("reply with files must be queued");
+        assert_eq!(item.media.len(), 2);
+        assert_eq!(item.media[0].filename, "cover_ru.png");
+        assert_eq!(item.media[0].mime_type.as_deref(), Some("image/png"));
+        assert_eq!(item.media[1].filename, "report.pdf");
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -3623,7 +3764,7 @@ mod tests {
         // Proactive telegram_reply works for MCP-only roles: with no prior
         // dispatch the message falls back to the group chat.
         let reply = dispatcher
-            .telegram_reply("developer", "Инициатива снизу".to_string())
+            .telegram_reply("developer", "Инициатива снизу".to_string(), vec![])
             .await;
         assert!(!reply.is_error, "unexpected: {:?}", reply.value);
         let items = store.due_outbox(10).await?;
@@ -3854,6 +3995,7 @@ mod tests {
             attempts: 0,
             next_chunk: 0,
             chat_id: None,
+            media: vec![],
         }
     }
 

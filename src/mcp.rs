@@ -17,8 +17,8 @@ use crate::{
     config::TelegramBotMode,
     dispatch::{
         BroadcastArgs, ClearMessageQueueArgs, DisableMessagingArgs, EnableMessagingArgs,
-        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramReplyArgs, ToolOutcome,
-        parse_arguments, render_template,
+        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramFileArgs, TelegramReplyArgs,
+        ToolOutcome, parse_arguments, render_template,
     },
 };
 
@@ -216,13 +216,26 @@ impl RoleMcp {
         }
         tools.push(tool(
             "telegram_reply",
-            "Send a message to the operator who started the most recent Telegram dispatch for this role. May be used at any point during the work (intermediate updates and/or the final answer).",
+            "Send a message (and optionally one or more files) to the operator who started the most recent Telegram dispatch for this role. May be used at any point during the work (intermediate updates and/or the final answer). For files, pass base64 content in files[].content_b64; images (mime image/*) are sent as photos, anything else as a document. The message text becomes the caption of the first file.",
             object_schema(
                 &json!({
                     "message": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": config.max_message_chars
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+                                "mime_type": {"type": "string", "maxLength": 100},
+                                "content_b64": {"type": "string", "minLength": 1, "maxLength": 8_000_000}
+                            },
+                            "required": ["filename", "content_b64"],
+                            "additionalProperties": false
+                        }
                     }
                 }),
                 &["message"],
@@ -452,7 +465,7 @@ impl ServerHandler for RoleMcp {
                 Ok(args) => {
                     self.state
                         .dispatcher
-                        .telegram_reply(&self.role, args.message)
+                        .telegram_reply(&self.role, args.message, args.files)
                         .await
                 }
                 Err(outcome) => outcome,

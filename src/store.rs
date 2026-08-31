@@ -30,6 +30,15 @@ pub enum Reservation {
     RateLimited { retry_after_seconds: i64 },
 }
 
+/// Optional file attachment delivered with a Telegram reply.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MediaPayload {
+    pub filename: String,
+    pub mime_type: Option<String>,
+    /// Base64-encoded file content.
+    pub content_b64: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuditMessage {
     pub id: String,
@@ -39,6 +48,8 @@ pub struct AuditMessage {
     pub text: String,
     /// Telegram chat to deliver to; None means the configured group.
     pub chat_id: Option<i64>,
+    /// Optional file attachments (each sent as sendPhoto/sendDocument).
+    pub media: Vec<MediaPayload>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +63,8 @@ pub struct OutboxItem {
     pub next_chunk: i64,
     /// Telegram chat to deliver to; None means the configured group.
     pub chat_id: Option<i64>,
+    /// Optional file attachments (each sent as sendPhoto/sendDocument).
+    pub media: Vec<MediaPayload>,
 }
 
 pub struct ActivityRecord<'a> {
@@ -130,6 +143,11 @@ impl Store {
         }
         if !Self::has_column(&mut tx, "telegram_outbox", "chat_id").await? {
             sqlx::query("ALTER TABLE telegram_outbox ADD COLUMN chat_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "telegram_outbox", "media_json").await? {
+            sqlx::query("ALTER TABLE telegram_outbox ADD COLUMN media_json TEXT")
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1032,7 +1050,7 @@ impl Store {
     pub async fn due_outbox(&self, limit: i64) -> anyhow::Result<Vec<OutboxItem>> {
         let rows = sqlx::query(
             r#"SELECT o.id, o.sender, o.event, o.recipients, o.text,
-                      o.attempts, o.next_chunk, o.chat_id
+                      o.attempts, o.next_chunk, o.chat_id, o.media_json
                FROM telegram_outbox o
                WHERE o.status = 'pending' AND o.next_attempt_ms <= ?
                  AND NOT EXISTS (
@@ -1063,6 +1081,10 @@ impl Store {
                 attempts: row.get("attempts"),
                 next_chunk: row.get("next_chunk"),
                 chat_id: row.get("chat_id"),
+                media: row
+                    .get::<Option<String>, _>("media_json")
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
             })
             .collect())
     }
@@ -1299,8 +1321,8 @@ async fn insert_outbox(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"INSERT INTO telegram_outbox
-           (id, sender, event, recipients, text, status, attempts, next_chunk, next_attempt_ms, created_ms, chat_id)
-           VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?)"#,
+           (id, sender, event, recipients, text, status, attempts, next_chunk, next_attempt_ms, created_ms, chat_id, media_json)
+           VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?, ?)"#,
     )
     .bind(&audit.id)
     .bind(&audit.sender)
@@ -1310,6 +1332,11 @@ async fn insert_outbox(
     .bind(now)
     .bind(now)
     .bind(audit.chat_id)
+    .bind(if audit.media.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&audit.media).unwrap_or_default())
+    })
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1413,7 +1440,8 @@ const SCHEMA: &[&str] = &[
          last_error TEXT,
          created_ms INTEGER NOT NULL,
          delivered_ms INTEGER,
-         chat_id INTEGER
+         chat_id INTEGER,
+         media_json TEXT
        )"#,
     "CREATE INDEX IF NOT EXISTS telegram_outbox_due_idx ON telegram_outbox(status, next_attempt_ms)",
     r#"CREATE TABLE IF NOT EXISTS role_messaging (
@@ -2107,6 +2135,7 @@ mod tests {
                     recipients: "developer".to_string(),
                     text: "task".to_string(),
                     chat_id: None,
+                    media: vec![],
                 }),
             )
             .await?;
@@ -2598,6 +2627,7 @@ mod tests {
                     recipients: "developer".to_string(),
                     text: "task".to_string(),
                     chat_id: None,
+                    media: vec![],
                 }),
             )
             .await?;

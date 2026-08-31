@@ -21,13 +21,14 @@ assets = [
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 axum = { version = "0.8", features = ["http1", "json", "macros", "tokio"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 http = "1"
 regex = "1.11"
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "socks", "stream"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "multipart", "rustls", "socks", "stream"] }
 rmcp = { version = "3.1.1", default-features = false, features = [
   "client",
   "server",
