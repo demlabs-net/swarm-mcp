@@ -667,6 +667,47 @@ impl Store {
         Ok(())
     }
 
+    /// Durable tracking of Telegram-dispatched Hermes runs awaiting their
+    /// final answer (survives restarts; see the run-reply worker).
+    pub async fn track_run_reply(&self, run_id: &str, role: &str, chat_id: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO run_replies (run_id, role, chat_id, created_ms) VALUES (?, ?, ?, ?)",
+        )
+        .bind(run_id)
+        .bind(role)
+        .bind(chat_id)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// All tracked runs: `(run_id, role, chat_id, created_ms)`.
+    pub async fn due_run_replies(&self) -> anyhow::Result<Vec<(String, String, i64, i64)>> {
+        let rows = sqlx::query("SELECT run_id, role, chat_id, created_ms FROM run_replies")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get("run_id"),
+                    row.get("role"),
+                    row.get("chat_id"),
+                    row.get("created_ms"),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn untrack_run_reply(&self, run_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM run_replies WHERE run_id = ?")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn mark_dispatch_indeterminate(&self, id: &str, reason: &str) -> anyhow::Result<()> {
         let now = Utc::now().timestamp_millis();
         let result = json!({
@@ -1386,6 +1427,12 @@ const SCHEMA: &[&str] = &[
          key TEXT PRIMARY KEY,
          value_int INTEGER NOT NULL,
          updated_ms INTEGER NOT NULL
+       )"#,
+    r#"CREATE TABLE IF NOT EXISTS run_replies (
+         run_id TEXT PRIMARY KEY,
+         role TEXT NOT NULL,
+         chat_id INTEGER NOT NULL,
+         created_ms INTEGER NOT NULL
        )"#,
 ];
 

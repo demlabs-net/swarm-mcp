@@ -10,3 +10,4 @@ __pycache__/
 .idea/
 .vscode/
 dist/
+.env.agent-sales-0

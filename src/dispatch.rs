@@ -1,7 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    collections::BTreeMap,
 };
 
 use anyhow::{anyhow, ensure};
@@ -32,16 +30,6 @@ pub struct Dispatcher {
     telegram_client: Client,
     inflight: Arc<Semaphore>,
     messaging_gate: Arc<RwLock<()>>,
-    /// Runs dispatched from Telegram inbound, awaiting their final answer so
-    /// it can be delivered to the operator's chat (see `spawn_run_reply_worker`).
-    run_replies: Arc<Mutex<HashMap<String, PendingRunReply>>>,
-}
-
-#[derive(Clone)]
-struct PendingRunReply {
-    chat_id: i64,
-    role: String,
-    started_at: Instant,
 }
 
 enum RunOutcome {
@@ -327,7 +315,6 @@ impl Dispatcher {
         Ok(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight_dispatches)),
             messaging_gate: Arc::new(RwLock::new(())),
-            run_replies: Arc::new(Mutex::new(HashMap::new())),
             config,
             store,
             hermes_client,
@@ -998,18 +985,17 @@ impl Dispatcher {
         for (target, result) in join_all(requests).await {
             summary.push(target, result);
         }
-        // Запоминаем запущенные раны, чтобы их итоговый ответ доставился
-        // оператору в исходный чат (см. spawn_run_reply_worker).
+        // Запоминаем запущенные раны (долговечно, в БД), чтобы их итоговый
+        // ответ доставился оператору в исходный чат (см. spawn_run_reply_worker).
         for (target, value) in &summary.results {
             if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
-                self.run_replies.lock().unwrap().insert(
-                    run_id.to_string(),
-                    PendingRunReply {
-                        chat_id: args.chat_id,
-                        role: target.clone(),
-                        started_at: Instant::now(),
-                    },
-                );
+                if let Err(error) = self
+                    .store
+                    .track_run_reply(run_id, target, args.chat_id)
+                    .await
+                {
+                    warn!(run_id = %run_id, error = %error, "tracking run reply failed");
+                }
             }
         }
         let ok = summary.succeeded == targets.len();
@@ -1154,17 +1140,17 @@ impl Dispatcher {
     }
 
     async fn flush_run_replies(&self) -> anyhow::Result<()> {
-        let ttl = Duration::from_secs(30 * 60);
-        let pending: Vec<(String, PendingRunReply)> = {
-            let mut map = self.run_replies.lock().unwrap();
-            map.retain(|_, reply| reply.started_at.elapsed() < ttl);
-            map.iter()
-                .map(|(run_id, reply)| (run_id.clone(), reply.clone()))
-                .collect()
-        };
-        for (run_id, reply) in pending {
-            match self.fetch_run_outcome(&run_id, &reply.role).await {
-                Ok(outcome) => self.deliver_run_reply(&run_id, &reply, outcome).await,
+        let ttl = Duration::from_secs(6 * 60 * 60);
+        let now = Utc::now().timestamp_millis();
+        for (run_id, role, chat_id, created_ms) in self.store.due_run_replies().await? {
+            // Долгие задачи (медленные модели) живут до 6 часов; просроченные
+            // снимаются с трекинга, чтобы поллер не висел вечно.
+            if now - created_ms > i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX) {
+                self.store.untrack_run_reply(&run_id).await?;
+                continue;
+            }
+            match self.fetch_run_outcome(&run_id, &role).await {
+                Ok(outcome) => self.deliver_run_reply(&run_id, &role, chat_id, outcome).await,
                 // transient HTTP error: retry on the next tick
                 Err(error) => {
                     debug!(run_id = %run_id, error = %error, "run reply poll failed; will retry");
@@ -1212,30 +1198,38 @@ impl Dispatcher {
         }
     }
 
-    async fn deliver_run_reply(&self, run_id: &str, reply: &PendingRunReply, outcome: RunOutcome) {
+    async fn deliver_run_reply(
+        &self,
+        run_id: &str,
+        role: &str,
+        chat_id: i64,
+        outcome: RunOutcome,
+    ) {
         let text = match outcome {
             RunOutcome::Completed(output) if !output.is_empty() => output,
             RunOutcome::Completed(_) => {
-                format!("⚠️ Агент {} ответил пустым сообщением.", reply.role)
+                format!("⚠️ Агент {role} ответил пустым сообщением.")
             }
             RunOutcome::Failed => {
-                format!("⚠️ Агент {} не смог обработать запрос.", reply.role)
+                format!("⚠️ Агент {role} не смог обработать запрос.")
             }
             RunOutcome::Running => return,
         };
         let audit = AuditMessage {
             id: format!("reply_{}", Uuid::new_v4().simple()),
-            sender: reply.role.clone(),
+            sender: role.to_string(),
             event: "TELEGRAM_REPLY".to_string(),
             recipients: "operator".to_string(),
             text,
-            chat_id: Some(reply.chat_id),
+            chat_id: Some(chat_id),
         };
         if let Err(error) = self.store.enqueue_outbox(audit).await {
             warn!(run_id = %run_id, error = %error, "Telegram run reply enqueue failed");
             return;
         }
-        self.run_replies.lock().unwrap().remove(run_id);
+        if let Err(error) = self.store.untrack_run_reply(run_id).await {
+            warn!(run_id = %run_id, error = %error, "untracking run reply failed");
+        }
     }
 
     async fn flush_outbox(&self) -> anyhow::Result<()> {
@@ -3513,7 +3507,7 @@ mod tests {
             })
             .await;
         assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
-        assert!(!dispatcher.run_replies.lock().unwrap().is_empty());
+        assert_eq!(store.due_run_replies().await?.len(), 1);
 
         dispatcher.flush_run_replies().await?;
 
@@ -3526,7 +3520,7 @@ mod tests {
         assert_eq!(reply.chat_id, Some(424_242));
 
         // The run is no longer tracked once delivered.
-        assert!(dispatcher.run_replies.lock().unwrap().is_empty());
+        assert!(store.due_run_replies().await?.is_empty());
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -3589,7 +3583,7 @@ mod tests {
         );
         assert!(initiated.load(std::sync::atomic::Ordering::SeqCst));
         // OpenAI roles have no Hermes run to poll.
-        assert!(dispatcher.run_replies.lock().unwrap().is_empty());
+        assert!(store.due_run_replies().await?.is_empty());
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -3659,7 +3653,7 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(error.contains("MCP-only"), "unexpected: {error}");
-        assert!(dispatcher.run_replies.lock().unwrap().is_empty());
+        assert!(store.due_run_replies().await?.is_empty());
         testutil::remove_db_files(&path).await;
         Ok(())
     }
