@@ -1092,9 +1092,15 @@ impl Dispatcher {
         message: String,
         files: Vec<TelegramFileArgs>,
     ) -> ToolOutcome {
-        let message = match self.clean_text(&message, "message") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
+        // Files-only replies are valid: the message is optional when files
+        // are attached, so only clean a non-empty message.
+        let message = if message.trim().is_empty() {
+            String::new()
+        } else {
+            match self.clean_text(&message, "message") {
+                Ok(value) => value,
+                Err(error) => return tool_error_message(error),
+            }
         };
         if message.is_empty() && files.is_empty() {
             return tool_error(json!({
@@ -1392,6 +1398,9 @@ impl Dispatcher {
     /// sendDocument message; the item text becomes the caption (≤1024 chars).
     /// Deliver attached files: one sendPhoto (image/*) or sendDocument message
     /// per file; the item text is the caption of the first file (≤1024 chars).
+    /// The outbox chunk cursor tracks the number of files already sent, so a
+    /// retry after a mid-batch failure resumes without re-sending earlier
+    /// files.
     async fn send_telegram_media(
         &self,
         api_base: &str,
@@ -1401,7 +1410,13 @@ impl Dispatcher {
     ) -> Result<(), TelegramFailure> {
         use base64::Engine as _;
         let caption: String = item.text.chars().take(1024).collect();
-        for (index, media) in item.media.iter().enumerate() {
+        let start = usize::try_from(item.next_chunk).unwrap_or(usize::MAX);
+        if start > item.media.len() {
+            return Err(TelegramFailure::permanent(
+                "Telegram media chunk cursor is invalid",
+            ));
+        }
+        for (index, media) in item.media.iter().enumerate().skip(start) {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&media.content_b64)
                 .map_err(|_| TelegramFailure::new("Telegram media base64 decode failed", None))?;
@@ -1442,15 +1457,14 @@ impl Dispatcher {
                 .await
                 .map_err(|_| TelegramFailure::new("Telegram media request failed", None))?;
             validate_telegram_response(response).await?;
+            // Checkpoint per file so a retry resumes after this one.
+            self.store
+                .mark_outbox_chunk_sent(&item.id, i64::try_from(index + 1).unwrap_or(i64::MAX))
+                .await
+                .map_err(|error| {
+                    TelegramFailure::new(format!("outbox checkpoint failed: {error}"), None)
+                })?;
         }
-        // Media items are not chunked: advance the chunk cursor past the end.
-        let chunks = telegram_chunks_for_item(item, self.config.telegram_message_limit);
-        self.store
-            .mark_outbox_chunk_sent(&item.id, i64::try_from(chunks.len()).unwrap_or(i64::MAX))
-            .await
-            .map_err(|error| {
-                TelegramFailure::new(format!("outbox checkpoint failed: {error}"), None)
-            })?;
         Ok(())
     }
 
@@ -2336,6 +2350,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::testutil;
+    use sqlx::Row;
 
     /// Build a dispatcher whose agents all point at one mock Hermes server.
     async fn dispatcher_with_mock(
@@ -3263,6 +3278,7 @@ mod tests {
     async fn spawn_mock_telegram_with(behavior: MockBot) -> String {
         use axum::{
             Json, Router,
+            body::Bytes,
             extract::{OriginalUri, State as AxumState},
             http::StatusCode,
             response::IntoResponse,
@@ -3270,8 +3286,9 @@ mod tests {
         };
         let handler = move |AxumState(behavior): AxumState<MockBot>,
                             uri: OriginalUri,
-                            Json(body): Json<Value>| async move {
-            let (status, payload, retry_after) = behavior(uri.path(), &body.to_string());
+                            body: Bytes| async move {
+            let body = String::from_utf8_lossy(&body).to_string();
+            let (status, payload, retry_after) = behavior(uri.path(), &body);
             let mut response = (
                 StatusCode::from_u16(status).expect("mock status"),
                 Json(payload),
@@ -3287,6 +3304,8 @@ mod tests {
         };
         let router = Router::new()
             .route("/bot{token}/sendMessage", post(handler))
+            .route("/bot{token}/sendPhoto", post(handler))
+            .route("/bot{token}/sendDocument", post(handler))
             .with_state(behavior);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3638,6 +3657,203 @@ mod tests {
         assert_eq!(item.media[0].filename, "cover_ru.png");
         assert_eq!(item.media[0].mime_type.as_deref(), Some("image/png"));
         assert_eq!(item.media[1].filename, "report.pdf");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_allows_files_without_message() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 12,
+                message_id: 401,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let reply = dispatcher
+            .telegram_reply(
+                "developer",
+                String::new(),
+                vec![TelegramFileArgs {
+                    filename: "x.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    content_b64: "eA==".to_string(),
+                }],
+            )
+            .await;
+        assert!(!reply.is_error, "files-only reply must work: {:?}", reply.value);
+        let items = store.due_outbox(10).await?;
+        assert!(items.iter().any(|item| item.media.len() == 1));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_delivery_resumes_after_a_mid_batch_failure() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let photo_calls = Arc::new(AtomicUsize::new(0));
+        let photo_count = photo_calls.clone();
+        let document_calls = Arc::new(AtomicUsize::new(0));
+        let document_count = document_calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |path, _| {
+                if path.ends_with("sendPhoto") {
+                    photo_count.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({"ok": true}), None)
+                } else if path.ends_with("sendDocument") {
+                    // Первый документ падает (retry_after=0, чтобы пункт
+                    // снова стал due) — доставка должна продолжиться со
+                    // второго файла без повтора фото.
+                    if document_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (500, json!({"ok": false, "description": "boom"}), Some("0".to_string()))
+                    } else {
+                        (200, json!({"ok": true}), None)
+                    }
+                } else {
+                    (200, json!({"ok": true}), None)
+                }
+            }),
+        )
+        .await?;
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 13,
+                message_id: 402,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let files = vec![
+            TelegramFileArgs {
+                filename: "a.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                content_b64: "YQ==".to_string(),
+            },
+            TelegramFileArgs {
+                filename: "b.pdf".to_string(),
+                mime_type: None,
+                content_b64: "Yg==".to_string(),
+            },
+            TelegramFileArgs {
+                filename: "c.pdf".to_string(),
+                mime_type: None,
+                content_b64: "Yw==".to_string(),
+            },
+        ];
+        assert!(
+            !dispatcher
+                .telegram_reply("developer", "docs".to_string(), files)
+                .await
+                .is_error
+        );
+        // Первый прогон: фото ушло, первый документ упал → пункт остаётся
+        // (статус/чекпоинт читаем напрямую — пункт отложен по backoff).
+        dispatcher.flush_outbox().await?;
+        let row = sqlx::query(
+            "SELECT status, attempts, next_chunk FROM telegram_outbox WHERE event = 'TELEGRAM_REPLY'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 1);
+        assert_eq!(row.get::<i64, _>("next_chunk"), 1, "только фото зачекпоинчено");
+        assert_eq!(photo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(document_calls.load(Ordering::SeqCst), 1);
+        // Второй прогон после дефолтного backoff (2^attempts): два документа
+        // досылаются, фото не повторяется.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        dispatcher.flush_outbox().await?;
+        let items = store.due_outbox(10).await?;
+        assert!(
+            !items.iter().any(|item| item.event == "TELEGRAM_REPLY"),
+            "reply delivered"
+        );
+        assert_eq!(photo_calls.load(Ordering::SeqCst), 1, "фото не повторяется");
+        // 1 упавший вызов при первом прогоне + 2 досланных документа.
+        assert_eq!(document_calls.load(Ordering::SeqCst), 3);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_reply_worker_drops_expired_tracks_without_delivery() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/") {
+                (
+                    200,
+                    json!({
+                        "object": "hermes.run",
+                        "run_id": "run-old",
+                        "status": "running",
+                    }),
+                )
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        store
+            .track_run_reply("run-old", "developer", 424_242)
+            .await?;
+        // Ставим created_ms в прошлом на 7 часов (TTL = 6ч).
+        sqlx::query("UPDATE run_replies SET created_ms = ? WHERE run_id = 'run-old'")
+            .bind(Utc::now().timestamp_millis() - 7 * 3600 * 1000)
+            .execute(store.pool())
+            .await?;
+        dispatcher.flush_run_replies().await?;
+        assert!(store.due_run_replies().await?.is_empty(), "expired track dropped");
+        let items = store.due_outbox(10).await?;
+        assert!(!items.iter().any(|item| item.event == "TELEGRAM_REPLY"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_falls_back_to_any_roles_operator_chat() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, _| {
+            (202, json!({"run_id": "run-x"}))
+        }))
+        .await?;
+        // Диспатч на developer устанавливает чат оператора.
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 14,
+                message_id: 403,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hi".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        // MCP-only роль (например designer) без собственного диспатча
+        // отвечает в тот же чат оператора.
+        let reply = dispatcher
+            .telegram_reply("designer", "proactive".to_string(), vec![])
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        let items = store.due_outbox(10).await?;
+        let item = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("reply queued");
+        assert_eq!(item.chat_id, Some(424_242));
         testutil::remove_db_files(&path).await;
         Ok(())
     }

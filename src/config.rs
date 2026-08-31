@@ -1254,6 +1254,42 @@ mod tests {
     }
 
     #[test]
+    fn mcp_only_role_needs_no_api_url_or_key() {
+        let mut env = valid_env();
+        env.insert("DEVELOPER_API_KIND".into(), "mcp".into());
+        env.remove("DEVELOPER_API_URL");
+        env.remove("DEVELOPER_AGENT_API_KEY");
+        let config = load(&env).unwrap();
+        let developer = &config.agents["developer"];
+        assert_eq!(developer.api_kind, ApiKind::Mcp);
+        assert!(developer.api_url.is_none());
+        assert!(developer.api_key.is_none());
+    }
+
+    #[test]
+    fn openai_role_requires_api_url_and_key() {
+        let mut env = valid_env();
+        env.insert("DEVELOPER_API_KIND".into(), "openai".into());
+        env.remove("DEVELOPER_API_URL");
+        let error = load(&env).unwrap_err().to_string();
+        assert!(error.contains("DEVELOPER_API_URL is required"), "{error}");
+
+        let mut env = valid_env();
+        env.insert("DEVELOPER_API_KIND".into(), "openai".into());
+        env.remove("DEVELOPER_AGENT_API_KEY");
+        let error = load(&env).unwrap_err().to_string();
+        assert!(error.contains("DEVELOPER_AGENT_API_KEY is required"), "{error}");
+    }
+
+    #[test]
+    fn unknown_api_kind_is_rejected() {
+        let mut env = valid_env();
+        env.insert("DEVELOPER_API_KIND".into(), "penpot".into());
+        let error = load(&env).unwrap_err().to_string();
+        assert!(error.contains("must be hermes, openai or mcp"), "{error}");
+    }
+
+    #[test]
     fn from_env_rejects_missing_vars() {
         let mut env = valid_env();
         env.remove("SWARM_LOG_LEVEL");
