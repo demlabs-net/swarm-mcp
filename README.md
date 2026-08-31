@@ -18,9 +18,9 @@ limits, and capability roadmap is in [REVIEW.md](REVIEW.md).
 The hierarchy is data-driven:
 
 ```dotenv
-SWARM_AGENT_ROLES=developer,junior,designer,lead-developer,tester,devops
+SWARM_AGENT_ROLES=dev-senior-0,dev-senior-1,dev-middle-0,dev-middle-1,dev-junior-0,dev-junior-1,dev-junior-2,dev-junior-3,designer-1,tester,devops
 SWARM_MANAGER_ROLE=manager
-SWARM_ORDER_ACL={"manager":["*"],"lead-developer":["developer","junior"]}
+SWARM_ORDER_ACL={"manager":["dev-senior-0","dev-senior-1","designer-1","devops"],"dev-senior-0":["dev-middle-0","dev-middle-1","dev-junior-0","dev-junior-1","dev-junior-2","dev-junior-3","designer-1","tester","devops"],"dev-senior-1":["dev-middle-0","dev-middle-1","dev-junior-0","dev-junior-1","dev-junior-2","dev-junior-3","designer-1","tester","devops"]}
 ```
 
 With this configuration the catalogs are:
@@ -28,13 +28,15 @@ With this configuration the catalogs are:
 | Caller | Tools |
 |---|---|
 | `manager` | `order`, `order_all`, `messaging_disable`, `messaging_enable`, `messaging_clear_queue` |
-| `lead-developer` | `order`, `report`, `msg_to`, `msg_all` |
-| `developer`, `junior`, `designer`, `tester`, `devops` | `report`, `msg_to`, `msg_all` |
+| `dev-senior-0/1` | `order`, `report`, `msg_to`, `msg_all` |
+| Other executors | `report`, `msg_to`, `msg_all` |
 
 `"*"` grants swarm-wide `order` and `order_all`. An explicit list grants only
 single-target `order`; the generated JSON Schema enumerates exactly the targets
-allowed to that caller. Reverse ACL lookup determines the valid `report`
-recipients. Executors may coordinate only with other executors.
+allowed to that caller. Executors may coordinate only with other executors.
+The production tiered topology assigns each development parent to a senior;
+that senior directly orders middle/junior work, design corrections, testing,
+and deployment. The manager is not a relay for the child workflow.
 
 Every dispatch tool accepts an optional `idempotency_key`. Callers should reuse
 the same key when retrying the same logical action. Reusing a key with different
@@ -55,6 +57,13 @@ progress, handoffs, and peer coordination attached to one work item; untracked
 chat cannot wake another Hermes run. The server verifies that the ID belongs to
 an accepted `order`/`order_all` which actually targeted the sending role, so a
 model cannot invent a fresh ID to evade duplicate suppression.
+
+A report is routed by persisted task lineage. Omitting `recipient` sends it to
+the exact authority that issued that order. Supplying a different recipient is
+rejected even when that role is another configured supervisor. Consequently a
+middle or junior reports to its senior issuer, while the senior's terminal
+parent report returns to the manager; child status cannot leak into a manager
+run merely because the manager sits higher in the hierarchy.
 
 Progress reports are durable and Telegram-audited but do not automatically
 start another supervisor run. Only statuses listed in

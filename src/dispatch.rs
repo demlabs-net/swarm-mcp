@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, ensure};
 use chrono::{DateTime, Utc};
@@ -512,24 +508,7 @@ impl Dispatcher {
 
     pub async fn report(&self, sender: &str, args: ReportArgs) -> ToolOutcome {
         let _messaging_guard = self.messaging_gate.read().await;
-        let supervisors = self.config.supervisors(sender);
-        let recipient = args
-            .recipient
-            .as_deref()
-            .unwrap_or(&self.config.manager_role)
-            .trim()
-            .to_lowercase();
-        if !supervisors.contains(&recipient) {
-            return tool_error(json!({
-                "ok": false,
-                "error": format!("{recipient} is not a supervisor of {sender}"),
-                "allowed": supervisors,
-            }));
-        }
-        if let Some(outcome) = self
-            .messaging_block(sender, std::slice::from_ref(&recipient))
-            .await
-        {
+        if let Some(outcome) = self.messaging_block(sender, &[]).await {
             return outcome;
         }
         let summary = match self.clean_text(&args.summary, "summary") {
@@ -548,7 +527,43 @@ impl Dispatcher {
                 "allowed": self.config.report_statuses,
             }));
         }
-        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
+        let issuer = match self.store.task_issuer(&task_id, sender).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return tool_error(json!({
+                    "ok": false,
+                    "error": "task_id is not an accepted Swarm order assigned to the sending role",
+                    "task_id": task_id,
+                    "sender": sender,
+                }));
+            }
+            Err(error) => {
+                error!(%sender, %task_id, error = %error, "task lineage lookup failed");
+                return tool_error(json!({
+                    "ok": false,
+                    "error": "task lineage is temporarily unavailable",
+                }));
+            }
+        };
+        let recipient = args
+            .recipient
+            .as_deref()
+            .unwrap_or(&issuer)
+            .trim()
+            .to_lowercase();
+        if recipient != issuer {
+            return tool_error(json!({
+                "ok": false,
+                "error": "reports must return to the authority that issued the task",
+                "issuer": issuer,
+                "recipient": recipient,
+                "task_id": task_id,
+            }));
+        }
+        if let Some(outcome) = self
+            .messaging_block(sender, std::slice::from_ref(&recipient))
+            .await
+        {
             return outcome;
         }
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
@@ -1002,14 +1017,13 @@ impl Dispatcher {
         // Запоминаем запущенные раны (долговечно, в БД), чтобы их итоговый
         // ответ доставился оператору в исходный чат (см. spawn_run_reply_worker).
         for (target, value) in &summary.results {
-            if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
-                if let Err(error) = self
+            if let Some(run_id) = value.get("run_id").and_then(Value::as_str)
+                && let Err(error) = self
                     .store
                     .track_run_reply(run_id, target, args.chat_id)
                     .await
-                {
-                    warn!(run_id = %run_id, error = %error, "tracking run reply failed");
-                }
+            {
+                warn!(run_id = %run_id, error = %error, "tracking run reply failed");
             }
         }
         let ok = summary.succeeded == targets.len();
@@ -1184,7 +1198,10 @@ impl Dispatcher {
                 continue;
             }
             match self.fetch_run_outcome(&run_id, &role).await {
-                Ok(outcome) => self.deliver_run_reply(&run_id, &role, chat_id, outcome).await,
+                Ok(outcome) => {
+                    self.deliver_run_reply(&run_id, &role, chat_id, outcome)
+                        .await;
+                }
                 // transient HTTP error: retry on the next tick
                 Err(error) => {
                     debug!(run_id = %run_id, error = %error, "run reply poll failed; will retry");
@@ -1232,13 +1249,7 @@ impl Dispatcher {
         }
     }
 
-    async fn deliver_run_reply(
-        &self,
-        run_id: &str,
-        role: &str,
-        chat_id: i64,
-        outcome: RunOutcome,
-    ) {
+    async fn deliver_run_reply(&self, run_id: &str, role: &str, chat_id: i64, outcome: RunOutcome) {
         let text = match outcome {
             RunOutcome::Completed(output) if !output.is_empty() => output,
             RunOutcome::Completed(_) => {
@@ -1394,10 +1405,16 @@ impl Dispatcher {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&media.content_b64)
                 .map_err(|_| TelegramFailure::new("Telegram media base64 decode failed", None))?;
-            let mime =
-                media.mime_type.clone().unwrap_or_else(|| "application/octet-stream".into());
+            let mime = media
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".into());
             let is_image = mime.starts_with("image/");
-            let method = if is_image { "sendPhoto" } else { "sendDocument" };
+            let method = if is_image {
+                "sendPhoto"
+            } else {
+                "sendDocument"
+            };
             let field = if is_image { "photo" } else { "document" };
             let part = reqwest::multipart::Part::bytes(bytes)
                 .file_name(media.filename.clone())
@@ -1407,7 +1424,14 @@ impl Dispatcher {
                 })?;
             let form = reqwest::multipart::Form::new()
                 .text("chat_id", chat_id.to_string())
-                .text("caption", if index == 0 { caption.clone() } else { String::new() })
+                .text(
+                    "caption",
+                    if index == 0 {
+                        caption.clone()
+                    } else {
+                        String::new()
+                    },
+                )
                 .part(field, part);
             let url = format!("{api_base}/bot{token}/{method}");
             let response = self
@@ -1791,25 +1815,6 @@ impl Dispatcher {
             })));
         }
         Ok(())
-    }
-
-    async fn task_lineage_block(&self, sender: &str, task_id: &str) -> Option<ToolOutcome> {
-        match self.store.task_assigned_to(task_id, sender).await {
-            Ok(true) => None,
-            Ok(false) => Some(tool_error(json!({
-                "ok": false,
-                "error": "task_id is not an accepted Swarm order assigned to the sending role",
-                "task_id": task_id,
-                "sender": sender,
-            }))),
-            Err(error) => {
-                error!(%sender, %task_id, error = %error, "task lineage lookup failed");
-                Some(tool_error(json!({
-                    "ok": false,
-                    "error": "task lineage is temporarily unavailable",
-                })))
-            }
-        }
     }
 
     fn control_target(&self, value: &str) -> Result<String, ToolOutcome> {
@@ -2728,11 +2733,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_requires_authorized_supervisor() -> anyhow::Result<()> {
+    async fn report_returns_to_the_exact_task_issuer() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-report"})))).await?;
 
-        // designer is not a supervisor of developer.
+        // An invented task cannot be reported to any role.
         let outcome = dispatcher
             .report(
                 "developer",
@@ -2750,7 +2755,7 @@ mod tests {
             outcome.value["error"]
                 .as_str()
                 .unwrap()
-                .contains("not a supervisor")
+                .contains("not an accepted Swarm order")
         );
 
         let unassigned = dispatcher
@@ -2788,7 +2793,24 @@ mod tests {
             .expect("assigned task id")
             .to_string();
 
-        // lead-developer supervises developer (reverse ACL lookup).
+        // A valid supervisor is still the wrong recipient when the manager
+        // issued this exact task.
+        let wrong_issuer = dispatcher
+            .report(
+                "developer",
+                ReportArgs {
+                    summary: "done".to_string(),
+                    task_id: task_id.clone(),
+                    status: "completed".to_string(),
+                    recipient: Some("lead-developer".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(wrong_issuer.is_error);
+        assert_eq!(wrong_issuer.value["issuer"], json!("manager"));
+
+        // Omitting recipient safely routes to the persisted issuer.
         let outcome = dispatcher
             .report(
                 "developer",
@@ -2796,12 +2818,13 @@ mod tests {
                     summary: "done".to_string(),
                     task_id,
                     status: "completed".to_string(),
-                    recipient: Some("lead-developer".to_string()),
+                    recipient: None,
                     idempotency_key: None,
                 },
             )
             .await;
         assert!(!outcome.is_error, "unexpected: {outcome:?}");
+        assert_eq!(outcome.value["recipient"], json!("manager"));
         assert_eq!(outcome.value["recipient_run_id"], json!("run-report"));
         assert_eq!(outcome.value["summary"], json!("done"));
 
@@ -2835,7 +2858,7 @@ mod tests {
 
         let assignment = dispatcher
             .order(
-                "manager",
+                "lead-developer",
                 OrderArgs {
                     agent: "developer".to_string(),
                     command: "Reach one tested checkpoint".to_string(),
@@ -2854,7 +2877,7 @@ mod tests {
                     summary: "Implementation reached the tested checkpoint".to_string(),
                     task_id,
                     status: "in_progress".to_string(),
-                    recipient: Some("lead-developer".to_string()),
+                    recipient: None,
                     idempotency_key: None,
                 },
             )
@@ -2962,7 +2985,7 @@ mod tests {
         .await?;
         let assignment = dispatcher
             .order(
-                "manager",
+                "lead-developer",
                 OrderArgs {
                     agent: "developer".to_string(),
                     command: "Implement the assigned work".to_string(),
@@ -2982,7 +3005,7 @@ mod tests {
                     summary: "terminal evidence".to_string(),
                     task_id,
                     status: "completed".to_string(),
-                    recipient: Some("lead-developer".to_string()),
+                    recipient: None,
                     idempotency_key: None,
                 },
             )

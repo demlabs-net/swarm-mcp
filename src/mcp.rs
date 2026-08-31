@@ -17,8 +17,8 @@ use crate::{
     config::TelegramBotMode,
     dispatch::{
         BroadcastArgs, ClearMessageQueueArgs, DisableMessagingArgs, EnableMessagingArgs,
-        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramFileArgs, TelegramReplyArgs,
-        ToolOutcome, parse_arguments, render_template,
+        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramReplyArgs, ToolOutcome,
+        parse_arguments, render_template,
     },
 };
 
@@ -144,7 +144,6 @@ impl RoleMcp {
             ));
         }
         if config.agent_roles.contains(&self.role) {
-            let supervisors = config.supervisors(&self.role);
             let peers = config
                 .agent_roles
                 .iter()
@@ -153,7 +152,7 @@ impl RoleMcp {
                 .collect::<Vec<_>>();
             tools.push(tool(
                 "report",
-                "Persist and audit progress, completion, failure, or a blocker for an authorized supervisor. Progress does not start a supervisor run; configured terminal statuses do.",
+                "Persist and audit progress, completion, failure, or a blocker. Omit recipient to route the report to the exact authority that issued this task. Progress does not start an authority run; configured terminal statuses do.",
                 object_schema(
                     &json!({
                         "summary": {
@@ -174,8 +173,7 @@ impl RoleMcp {
                         },
                         "recipient": {
                             "type": "string",
-                            "enum": supervisors,
-                            "default": config.manager_role
+                            "description": "Optional. If provided, it must equal the authority that issued this exact task. Omit for safe lineage routing."
                         },
                         "idempotency_key": idempotency_schema()
                     }),

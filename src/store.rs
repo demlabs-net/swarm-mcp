@@ -427,22 +427,31 @@ impl Store {
     }
 
     pub async fn task_assigned_to(&self, task_id: &str, role: &str) -> anyhow::Result<bool> {
-        let assigned: i64 = sqlx::query_scalar(
-            r#"SELECT EXISTS(
-                 SELECT 1
-                 FROM dispatches d
-                 JOIN dispatch_targets t ON t.dispatch_id = d.id
-                 WHERE d.id = ?
-                   AND d.kind IN ('order', 'order_all')
-                   AND d.status IN ('accepted', 'partial', 'indeterminate')
-                   AND t.target = ?
-               )"#,
+        Ok(self.task_issuer(task_id, role).await?.is_some())
+    }
+
+    /// Return the authority that issued an accepted order to `role`.
+    ///
+    /// Reports follow this persisted lineage instead of a global manager
+    /// default. This allows a delivery owner to delegate work directly while
+    /// ensuring that the terminal result returns to the exact owner of that
+    /// child task.
+    pub async fn task_issuer(&self, task_id: &str, role: &str) -> anyhow::Result<Option<String>> {
+        sqlx::query_scalar(
+            r#"SELECT d.sender
+               FROM dispatches d
+               JOIN dispatch_targets t ON t.dispatch_id = d.id
+               WHERE d.id = ?
+                 AND d.kind IN ('order', 'order_all')
+                 AND d.status IN ('accepted', 'partial', 'indeterminate')
+                 AND t.target = ?
+               LIMIT 1"#,
         )
         .bind(task_id)
         .bind(role)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(assigned != 0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -687,7 +696,12 @@ impl Store {
 
     /// Durable tracking of Telegram-dispatched Hermes runs awaiting their
     /// final answer (survives restarts; see the run-reply worker).
-    pub async fn track_run_reply(&self, run_id: &str, role: &str, chat_id: i64) -> anyhow::Result<()> {
+    pub async fn track_run_reply(
+        &self,
+        run_id: &str,
+        role: &str,
+        chat_id: i64,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO run_replies (run_id, role, chat_id, created_ms) VALUES (?, ?, ?, ?)",
         )
