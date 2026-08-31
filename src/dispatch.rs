@@ -3693,7 +3693,11 @@ mod tests {
                 }],
             )
             .await;
-        assert!(!reply.is_error, "files-only reply must work: {:?}", reply.value);
+        assert!(
+            !reply.is_error,
+            "files-only reply must work: {:?}",
+            reply.value
+        );
         let items = store.due_outbox(10).await?;
         assert!(items.iter().any(|item| item.media.len() == 1));
         testutil::remove_db_files(&path).await;
@@ -3718,7 +3722,11 @@ mod tests {
                     // снова стал due) — доставка должна продолжиться со
                     // второго файла без повтора фото.
                     if document_count.fetch_add(1, Ordering::SeqCst) == 0 {
-                        (500, json!({"ok": false, "description": "boom"}), Some("0".to_string()))
+                        (
+                            500,
+                            json!({"ok": false, "description": "boom"}),
+                            Some("0".to_string()),
+                        )
                     } else {
                         (200, json!({"ok": true}), None)
                     }
@@ -3772,7 +3780,11 @@ mod tests {
         .await?;
         assert_eq!(row.get::<String, _>("status"), "pending");
         assert_eq!(row.get::<i64, _>("attempts"), 1);
-        assert_eq!(row.get::<i64, _>("next_chunk"), 1, "только фото зачекпоинчено");
+        assert_eq!(
+            row.get::<i64, _>("next_chunk"),
+            1,
+            "только фото зачекпоинчено"
+        );
         assert_eq!(photo_calls.load(Ordering::SeqCst), 1);
         assert_eq!(document_calls.load(Ordering::SeqCst), 1);
         // Второй прогон после дефолтного backoff (2^attempts): два документа
@@ -3817,7 +3829,10 @@ mod tests {
             .execute(store.pool())
             .await?;
         dispatcher.flush_run_replies().await?;
-        assert!(store.due_run_replies().await?.is_empty(), "expired track dropped");
+        assert!(
+            store.due_run_replies().await?.is_empty(),
+            "expired track dropped"
+        );
         let items = store.due_outbox(10).await?;
         assert!(!items.iter().any(|item| item.event == "TELEGRAM_REPLY"));
         testutil::remove_db_files(&path).await;
@@ -3826,10 +3841,8 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_reply_falls_back_to_any_roles_operator_chat() -> anyhow::Result<()> {
-        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, _| {
-            (202, json!({"run_id": "run-x"}))
-        }))
-        .await?;
+        let (dispatcher, store, path) =
+            dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-x"})))).await?;
         // Диспатч на developer устанавливает чат оператора.
         dispatcher
             .telegram_inbound(TelegramInboundArgs {

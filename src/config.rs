@@ -235,12 +235,17 @@ impl Config {
         }
         let manager_targets = order_acl.get(&manager_role).cloned().unwrap_or_default();
         ensure!(
-            executor_set.is_subset(&manager_targets.iter().cloned().collect()),
-            "manager must be authorized to order every executor"
+            !manager_targets.is_empty(),
+            "manager must be authorized to order at least one executor"
         );
+        let supervised_executors = order_acl
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         ensure!(
-            global_authorities.contains(&manager_role),
-            "manager must use the ['*'] ACL grant so order_all is available"
+            executor_set.is_subset(&supervised_executors),
+            "every executor must have at least one ordering authority"
         );
 
         let raw_routes: BTreeMap<String, Vec<String>> = json_env(env, "SWARM_ACTIVITY_ROUTES")?;
@@ -1278,7 +1283,10 @@ mod tests {
         env.insert("DEVELOPER_API_KIND".into(), "openai".into());
         env.remove("DEVELOPER_AGENT_API_KEY");
         let error = load(&env).unwrap_err().to_string();
-        assert!(error.contains("DEVELOPER_AGENT_API_KEY is required"), "{error}");
+        assert!(
+            error.contains("DEVELOPER_AGENT_API_KEY is required"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1287,6 +1295,21 @@ mod tests {
         env.insert("DEVELOPER_API_KIND".into(), "penpot".into());
         let error = load(&env).unwrap_err().to_string();
         assert!(error.contains("must be hermes, openai or mcp"), "{error}");
+    }
+
+    #[test]
+    fn from_env_accepts_a_tiered_non_global_manager() {
+        let mut env = valid_env();
+        env.insert(
+            "SWARM_ORDER_ACL".into(),
+            r#"{"manager":["lead-developer"],"lead-developer":["developer"]}"#.into(),
+        );
+
+        let config = load(&env).expect("tiered authority graph must be valid");
+        assert!(!config.global_authorities.contains("manager"));
+        assert_eq!(config.order_acl["manager"], vec!["lead-developer"]);
+        assert_eq!(config.supervisors("developer"), vec!["lead-developer"]);
+        assert_eq!(config.supervisors("lead-developer"), vec!["manager"]);
     }
 
     #[test]
@@ -1325,8 +1348,8 @@ mod tests {
         );
         let error = load(&env).unwrap_err().to_string();
         assert!(
-            error.contains("manager must be authorized to order every executor"),
-            "manager must cover every executor: {error}"
+            error.contains("every executor must have at least one ordering authority"),
+            "every executor must remain reachable through an authority: {error}"
         );
 
         let mut env = valid_env();

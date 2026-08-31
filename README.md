@@ -27,7 +27,7 @@ With this configuration the catalogs are:
 
 | Caller | Tools |
 |---|---|
-| `manager` | `order`, `order_all`, `messaging_disable`, `messaging_enable`, `messaging_clear_queue` |
+| `manager` | `order`, messaging circuit-breaker controls; `order_all` only with an explicit `"*"` grant |
 | `dev-senior-0/1` | `order`, `report`, `msg_to`, `msg_all` |
 | Other executors | `report`, `msg_to`, `msg_all` |
 
