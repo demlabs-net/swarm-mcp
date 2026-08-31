@@ -140,6 +140,10 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         telegram_backlog_mode: TelegramBacklogMode::Discard,
         telegram_inbound_instructions: "execute the Telegram request".to_string(),
         telegram_inbound_template: "update {update_id} from user {user_id}: {message}".to_string(),
+        inbound_files_dir: state_db_path
+            .parent()
+            .map(|p| p.join("inbound"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/swarm-inbound")),
         manager_instructions: "You are the swarm manager.".to_string(),
         executor_instructions: "You are an executor.".to_string(),
         authority_instructions: "You may order: {targets}".to_string(),

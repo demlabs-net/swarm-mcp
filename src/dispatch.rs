@@ -3276,13 +3276,19 @@ mod tests {
     }
 
     async fn spawn_mock_telegram_with(behavior: MockBot) -> String {
+        spawn_mock_telegram_with_files(behavior, Vec::new()).await
+    }
+
+    /// Mock with inbound-file support: `/getFile` resolves to a fixed
+    /// `file_path`, and `/file/bot{token}/{path}` serves `file_bytes` raw.
+    async fn spawn_mock_telegram_with_files(behavior: MockBot, file_bytes: Vec<u8>) -> String {
         use axum::{
             Json, Router,
             body::Bytes,
             extract::{OriginalUri, State as AxumState},
             http::StatusCode,
             response::IntoResponse,
-            routing::post,
+            routing::{get, post},
         };
         let handler = move |AxumState(behavior): AxumState<MockBot>,
                             uri: OriginalUri,
@@ -3302,10 +3308,25 @@ mod tests {
             }
             response
         };
+        let file_handler = move |uri: OriginalUri| async move {
+            let bytes = file_bytes.clone();
+            let mut response = (StatusCode::OK, bytes).into_response();
+            response.headers_mut().insert(
+                reqwest::header::CONTENT_TYPE,
+                "image/png".parse().expect("mime"),
+            );
+            let _ = uri;
+            response
+        };
+        let get_file_handler = move || async move {
+            Json(json!({"ok": true, "result": {"file_id": "f1", "file_unique_id": "u1", "file_path": "photos/x.png"}}))
+        };
         let router = Router::new()
             .route("/bot{token}/sendMessage", post(handler))
             .route("/bot{token}/sendPhoto", post(handler))
             .route("/bot{token}/sendDocument", post(handler))
+            .route("/bot{token}/getFile", get(get_file_handler))
+            .route("/file/bot{token}/{*path}", get(file_handler))
             .with_state(behavior);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

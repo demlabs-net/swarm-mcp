@@ -145,6 +145,10 @@ pub struct Config {
     pub telegram_backlog_mode: TelegramBacklogMode,
     pub telegram_inbound_instructions: String,
     pub telegram_inbound_template: String,
+    /// Directory (shared with the agent containers) where inbound Telegram
+    /// file attachments are saved; the path is passed to the agent in the
+    /// dispatch message.
+    pub inbound_files_dir: PathBuf,
     pub manager_instructions: String,
     pub executor_instructions: String,
     pub authority_instructions: String,
@@ -692,6 +696,10 @@ impl Config {
                 "SWARM_TELEGRAM_INBOUND_RUN_INSTRUCTIONS",
             )?,
             telegram_inbound_template,
+            inbound_files_dir: PathBuf::from(
+                optional(env, "SWARM_INBOUND_FILES_DIR")
+                    .unwrap_or_else(|| "/opt/data/inbound".to_string()),
+            ),
             manager_instructions: required(env, "SWARM_MANAGER_MCP_INSTRUCTIONS")?,
             executor_instructions: required(env, "SWARM_EXECUTOR_MCP_INSTRUCTIONS")?,
             authority_instructions,
