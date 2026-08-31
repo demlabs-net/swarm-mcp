@@ -142,7 +142,7 @@ pub async fn activity_probe(config: Arc<Config>, base_url: &str) -> anyhow::Resu
             for non_target in config.all_roles.iter().filter(|candidate| {
                 !targets.contains(candidate)
                     && config
-                        .order_acl
+                        .dispatch_acl
                         .get(*candidate)
                         .is_some_and(|allowed| !allowed.is_empty())
             }) {
@@ -258,14 +258,14 @@ async fn read_json_resource(
 fn expected_tools(config: &Config, role: &str) -> BTreeSet<String> {
     let mut tools = BTreeSet::new();
     if config
-        .order_acl
+        .dispatch_acl
         .get(role)
         .is_some_and(|targets| !targets.is_empty())
     {
-        tools.insert("order".to_string());
+        tools.insert("dispatch_to".to_string());
     }
     if config.global_authorities.contains(role) {
-        tools.insert("order_all".to_string());
+        tools.insert("dispatch_all".to_string());
     }
     if role == config.manager_role {
         tools.extend(
@@ -277,9 +277,7 @@ fn expected_tools(config: &Config, role: &str) -> BTreeSet<String> {
             .map(str::to_string),
         );
     }
-    if config.agent_roles.iter().any(|candidate| candidate == role) {
-        tools.extend(["msg_all", "msg_to", "report"].map(str::to_string));
-    }
+    tools.extend(["msg_all", "msg_to"].map(str::to_string));
     tools.insert("telegram_reply".to_string());
     tools
 }
@@ -295,7 +293,7 @@ fn expected_resources(config: &Config, role: &str) -> BTreeSet<String> {
         resources.insert("swarm://messaging".to_string());
     }
     if config
-        .order_acl
+        .dispatch_acl
         .get(role)
         .is_some_and(|targets| !targets.is_empty())
     {
@@ -337,9 +335,11 @@ mod tests {
                 "messaging_clear_queue".to_string(),
                 "messaging_disable".to_string(),
                 "messaging_enable".to_string(),
-                "order".to_string(),
-                "order_all".to_string(),
-                "telegram_reply".to_string()
+                "dispatch_all".to_string(),
+                "dispatch_to".to_string(),
+                "telegram_reply".to_string(),
+                "msg_all".to_string(),
+                "msg_to".to_string()
             ])
         );
         let mut manager_resources = BTreeSet::from([
@@ -351,14 +351,13 @@ mod tests {
             "swarm://messaging".to_string(),
         ]);
         assert_eq!(expected_resources(&config, "manager"), manager_resources);
-        // lead-developer: authority with single-target order
+        // lead-developer: authority with single-target transport dispatch
         assert_eq!(
             expected_tools(&config, "lead-developer"),
             BTreeSet::from([
                 "msg_all".to_string(),
                 "msg_to".to_string(),
-                "order".to_string(),
-                "report".to_string(),
+                "dispatch_to".to_string(),
                 "telegram_reply".to_string()
             ])
         );
@@ -374,7 +373,6 @@ mod tests {
             BTreeSet::from([
                 "msg_all".to_string(),
                 "msg_to".to_string(),
-                "report".to_string(),
                 "telegram_reply".to_string()
             ])
         );

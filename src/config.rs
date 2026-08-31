@@ -73,12 +73,6 @@ pub enum TelegramBacklogMode {
     Process,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ManagerReportWakeMode {
-    Immediate,
-    Scheduled,
-}
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_ip: IpAddr,
@@ -92,7 +86,9 @@ pub struct Config {
     pub agent_roles: Vec<String>,
     pub all_roles: Vec<String>,
     pub descriptions: BTreeMap<String, String>,
-    pub order_acl: BTreeMap<String, Vec<String>>,
+    /// Who may initiate transport delivery to which role. This is not a task
+    /// delegation ACL; task ownership and delegation live in SLC MCP.
+    pub dispatch_acl: BTreeMap<String, Vec<String>>,
     pub global_authorities: BTreeSet<String>,
     pub activity_routes: BTreeMap<String, Vec<String>>,
     pub agents: BTreeMap<String, AgentConfig>,
@@ -119,12 +115,6 @@ pub struct Config {
     pub cleanup_interval: Duration,
     pub mcp_request_rate_limit: usize,
     pub mcp_request_rate_window: Duration,
-    pub report_statuses: Vec<String>,
-    pub report_wake_statuses: BTreeSet<String>,
-    /// Whether terminal reports addressed to the manager should start an
-    /// immediate manager run. Deployments with a reconciliation cron can
-    /// disable this to prevent report storms from starving operator traffic.
-    pub manager_report_wake_mode: ManagerReportWakeMode,
     pub telegram_enabled: bool,
     pub telegram_bot_mode: TelegramBotMode,
     pub telegram_bot_token: Option<Secret>,
@@ -153,10 +143,8 @@ pub struct Config {
     pub executor_instructions: String,
     pub authority_instructions: String,
     pub executor_run_instructions: String,
-    pub supervisor_report_instructions: String,
     pub peer_run_instructions: String,
-    pub order_template: String,
-    pub report_template: String,
+    pub dispatch_template: String,
     pub peer_template: String,
     pub log_level: String,
 }
@@ -216,9 +204,9 @@ impl Config {
             "SWARM_EXECUTOR_DESCRIPTIONS contains an empty description"
         );
 
-        let raw_acl: BTreeMap<String, Vec<String>> = json_env(env, "SWARM_ORDER_ACL")?;
+        let raw_acl: BTreeMap<String, Vec<String>> = json_env(env, "SWARM_DISPATCH_ACL")?;
         let mut global_authorities = BTreeSet::new();
-        let mut order_acl = BTreeMap::new();
+        let mut dispatch_acl = BTreeMap::new();
         for (source, raw_targets) in &raw_acl {
             ensure!(role_set.contains(source), "unknown ACL authority: {source}");
             let targets = if raw_targets.as_slice() == ["*"] {
@@ -231,25 +219,25 @@ impl Config {
             } else {
                 ensure!(
                     !raw_targets.iter().any(|target| target == "*"),
-                    "'*' must be the only target in SWARM_ORDER_ACL.{source}"
+                    "'*' must be the only target in SWARM_DISPATCH_ACL.{source}"
                 );
                 normalize_targets(source, raw_targets, &executor_set)?
             };
-            order_acl.insert(source.clone(), targets);
+            dispatch_acl.insert(source.clone(), targets);
         }
-        let manager_targets = order_acl.get(&manager_role).cloned().unwrap_or_default();
+        let manager_targets = dispatch_acl.get(&manager_role).cloned().unwrap_or_default();
         ensure!(
             !manager_targets.is_empty(),
-            "manager must be authorized to order at least one executor"
+            "manager must be authorized to dispatch to at least one executor"
         );
-        let supervised_executors = order_acl
+        let reachable_executors = dispatch_acl
             .values()
             .flatten()
             .cloned()
             .collect::<BTreeSet<_>>();
         ensure!(
-            executor_set.is_subset(&supervised_executors),
-            "every executor must have at least one ordering authority"
+            executor_set.is_subset(&reachable_executors),
+            "every executor must have at least one dispatch authority"
         );
 
         let raw_routes: BTreeMap<String, Vec<String>> = json_env(env, "SWARM_ACTIVITY_ROUTES")?;
@@ -262,7 +250,7 @@ impl Config {
             let targets = normalize_role_targets(&sender, &raw_targets, &role_set)?;
             for target in &targets {
                 ensure!(
-                    order_acl
+                    dispatch_acl
                         .get(target)
                         .is_some_and(|allowed| allowed.contains(&sender)),
                     "activity target {target} does not supervise {sender}"
@@ -424,53 +412,6 @@ impl Config {
             );
         }
 
-        let report_statuses = csv_required(env, "SWARM_REPORT_STATUSES")?
-            .into_iter()
-            .map(|status| status.to_lowercase())
-            .collect::<Vec<_>>();
-        ensure!(
-            !report_statuses.is_empty(),
-            "SWARM_REPORT_STATUSES is empty"
-        );
-        ensure!(
-            report_statuses.iter().collect::<BTreeSet<_>>().len() == report_statuses.len(),
-            "SWARM_REPORT_STATUSES contains duplicates"
-        );
-        ensure!(
-            report_statuses.iter().all(|status| {
-                !status.is_empty()
-                    && status.len() <= 32
-                    && status
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-            }),
-            "SWARM_REPORT_STATUSES contains an invalid status"
-        );
-        ensure!(
-            report_statuses.iter().any(|status| status == "completed"),
-            "SWARM_REPORT_STATUSES must contain completed because it is the report default"
-        );
-        let report_wake_statuses = csv_required(env, "SWARM_REPORT_WAKE_STATUSES")?
-            .into_iter()
-            .map(|status| status.to_lowercase())
-            .collect::<BTreeSet<_>>();
-        ensure!(
-            report_wake_statuses.contains("completed"),
-            "SWARM_REPORT_WAKE_STATUSES must contain completed"
-        );
-        ensure!(
-            report_wake_statuses
-                .iter()
-                .all(|status| report_statuses.contains(status)),
-            "SWARM_REPORT_WAKE_STATUSES must be a subset of SWARM_REPORT_STATUSES"
-        );
-        let manager_report_wake_mode = if bool_env(env, "SWARM_MANAGER_REPORT_WAKE_ENABLED", true)?
-        {
-            ManagerReportWakeMode::Immediate
-        } else {
-            ManagerReportWakeMode::Scheduled
-        };
-
         let telegram_enabled = bool_env(env, "SWARM_TELEGRAM_ENABLED", false)?;
         let telegram_bot_mode = match optional(env, "SWARM_TELEGRAM_BOT_MODE")
             .unwrap_or_else(|| "per-role".to_string())
@@ -575,25 +516,30 @@ impl Config {
             &["role", "targets"],
             &["role", "targets"],
         )?;
-        let order_template = required(env, "SWARM_ORDER_PROMPT_TEMPLATE")?;
+        let dispatch_template = required(env, "SWARM_DISPATCH_PROMPT_TEMPLATE")?;
         validate_template(
-            "SWARM_ORDER_PROMPT_TEMPLATE",
-            &order_template,
-            &["task_id", "sender", "recipient", "message"],
-            &["task_id", "sender", "message"],
-        )?;
-        let report_template = required(env, "SWARM_REPORT_PROMPT_TEMPLATE")?;
-        validate_template(
-            "SWARM_REPORT_PROMPT_TEMPLATE",
-            &report_template,
-            &["sender", "recipient", "task_id", "status", "message"],
-            &["sender", "task_id", "status", "message"],
+            "SWARM_DISPATCH_PROMPT_TEMPLATE",
+            &dispatch_template,
+            &[
+                "dispatch_id",
+                "sender",
+                "recipient",
+                "correlation_id",
+                "message",
+            ],
+            &["dispatch_id", "sender", "recipient", "message"],
         )?;
         let peer_template = required(env, "SWARM_PEER_PROMPT_TEMPLATE")?;
         validate_template(
             "SWARM_PEER_PROMPT_TEMPLATE",
             &peer_template,
-            &["message_id", "sender", "recipient", "message"],
+            &[
+                "message_id",
+                "sender",
+                "recipient",
+                "correlation_id",
+                "message",
+            ],
             &["message_id", "sender", "message"],
         )?;
         let telegram_inbound_template = required(env, "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE")?;
@@ -636,7 +582,7 @@ impl Config {
             agent_roles,
             all_roles,
             descriptions,
-            order_acl,
+            dispatch_acl,
             global_authorities,
             activity_routes,
             agents,
@@ -663,9 +609,6 @@ impl Config {
             cleanup_interval: seconds(env, "SWARM_CLEANUP_INTERVAL_SECONDS")?,
             mcp_request_rate_limit: positive(env, "SWARM_MCP_REQUEST_RATE_LIMIT")?,
             mcp_request_rate_window: seconds(env, "SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS")?,
-            report_statuses,
-            report_wake_statuses,
-            manager_report_wake_mode,
             telegram_enabled,
             telegram_bot_mode,
             telegram_bot_token,
@@ -704,10 +647,8 @@ impl Config {
             executor_instructions: required(env, "SWARM_EXECUTOR_MCP_INSTRUCTIONS")?,
             authority_instructions,
             executor_run_instructions: required(env, "SWARM_EXECUTOR_RUN_INSTRUCTIONS")?,
-            supervisor_report_instructions: required(env, "SWARM_SUPERVISOR_REPORT_INSTRUCTIONS")?,
             peer_run_instructions: required(env, "SWARM_PEER_RUN_INSTRUCTIONS")?,
-            order_template,
-            report_template,
+            dispatch_template,
             peer_template,
             log_level: required(env, "SWARM_LOG_LEVEL")?,
         };
@@ -837,11 +778,11 @@ impl Config {
         Ok(config)
     }
 
-    pub fn supervisors(&self, role: &str) -> Vec<String> {
+    pub fn dispatch_sources(&self, role: &str) -> Vec<String> {
         self.all_roles
             .iter()
             .filter(|source| {
-                self.order_acl
+                self.dispatch_acl
                     .get(*source)
                     .is_some_and(|targets| targets.iter().any(|target| target == role))
             })
@@ -1140,7 +1081,7 @@ mod tests {
             r#"{"developer":"Dev","lead-developer":"Lead"}"#.into(),
         );
         env.insert(
-            "SWARM_ORDER_ACL".into(),
+            "SWARM_DISPATCH_ACL".into(),
             r#"{"manager":["*"],"lead-developer":["developer"]}"#.into(),
         );
         env.insert(
@@ -1170,28 +1111,16 @@ mod tests {
             "http://localhost".into(),
         );
         env.insert(
-            "SWARM_REPORT_STATUSES".into(),
-            "completed,failed,in_progress".into(),
-        );
-        env.insert(
-            "SWARM_REPORT_WAKE_STATUSES".into(),
-            "completed,failed".into(),
-        );
-        env.insert(
             "SWARM_AUTHORITY_MCP_INSTRUCTIONS".into(),
-            "you order {role} {targets}".into(),
+            "you dispatch as {role} to {targets}".into(),
         );
         env.insert(
-            "SWARM_ORDER_PROMPT_TEMPLATE".into(),
-            "{task_id}|{sender}|{recipient}|{message}".into(),
-        );
-        env.insert(
-            "SWARM_REPORT_PROMPT_TEMPLATE".into(),
-            "{sender}|{recipient}|{task_id}|{status}|{message}".into(),
+            "SWARM_DISPATCH_PROMPT_TEMPLATE".into(),
+            "{dispatch_id}|{sender}|{recipient}|{correlation_id}|{message}".into(),
         );
         env.insert(
             "SWARM_PEER_PROMPT_TEMPLATE".into(),
-            "{message_id}|{sender}|{recipient}|{message}".into(),
+            "{message_id}|{sender}|{recipient}|{correlation_id}|{message}".into(),
         );
         env.insert(
             "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE".into(),
@@ -1243,7 +1172,6 @@ mod tests {
         env.insert("SWARM_MANAGER_MCP_INSTRUCTIONS".into(), "manager".into());
         env.insert("SWARM_EXECUTOR_MCP_INSTRUCTIONS".into(), "executor".into());
         env.insert("SWARM_EXECUTOR_RUN_INSTRUCTIONS".into(), "run it".into());
-        env.insert("SWARM_SUPERVISOR_REPORT_INSTRUCTIONS".into(), "read".into());
         env.insert("SWARM_PEER_RUN_INSTRUCTIONS".into(), "read".into());
         env.insert("SWARM_LOG_LEVEL".into(), "info".into());
         env
@@ -1259,9 +1187,9 @@ mod tests {
         assert_eq!(config.manager_role, "manager");
         assert_eq!(config.agent_roles, vec!["developer", "lead-developer"]);
         assert!(config.global_authorities.contains("manager"));
-        // supervisors() follows all_roles order: manager first, then executors.
+        // dispatch_sources() follows all_roles order: manager first, then executors.
         assert_eq!(
-            config.supervisors("developer"),
+            config.dispatch_sources("developer"),
             vec!["manager", "lead-developer"]
         );
     }
@@ -1309,15 +1237,15 @@ mod tests {
     fn from_env_accepts_a_tiered_non_global_manager() {
         let mut env = valid_env();
         env.insert(
-            "SWARM_ORDER_ACL".into(),
+            "SWARM_DISPATCH_ACL".into(),
             r#"{"manager":["lead-developer"],"lead-developer":["developer"]}"#.into(),
         );
 
         let config = load(&env).expect("tiered authority graph must be valid");
         assert!(!config.global_authorities.contains("manager"));
-        assert_eq!(config.order_acl["manager"], vec!["lead-developer"]);
-        assert_eq!(config.supervisors("developer"), vec!["lead-developer"]);
-        assert_eq!(config.supervisors("lead-developer"), vec!["manager"]);
+        assert_eq!(config.dispatch_acl["manager"], vec!["lead-developer"]);
+        assert_eq!(config.dispatch_sources("developer"), vec!["lead-developer"]);
+        assert_eq!(config.dispatch_sources("lead-developer"), vec!["manager"]);
     }
 
     #[test]
@@ -1351,18 +1279,18 @@ mod tests {
     fn from_env_rejects_invalid_acl_and_routes() {
         let mut env = valid_env();
         env.insert(
-            "SWARM_ORDER_ACL".into(),
+            "SWARM_DISPATCH_ACL".into(),
             r#"{"manager":["developer"],"lead-developer":["developer"]}"#.into(),
         );
         let error = load(&env).unwrap_err().to_string();
         assert!(
-            error.contains("every executor must have at least one ordering authority"),
+            error.contains("every executor must have at least one dispatch authority"),
             "every executor must remain reachable through an authority: {error}"
         );
 
         let mut env = valid_env();
         env.insert(
-            "SWARM_ORDER_ACL".into(),
+            "SWARM_DISPATCH_ACL".into(),
             r#"{"manager":["*"],"lead-developer":["designer"]}"#.into(),
         );
         assert!(load(&env).is_err(), "unknown ACL target");
@@ -1397,14 +1325,17 @@ mod tests {
     fn from_env_rejects_bad_templates_paths_and_origins() {
         let mut env = valid_env();
         env.insert(
-            "SWARM_ORDER_PROMPT_TEMPLATE".into(),
+            "SWARM_DISPATCH_PROMPT_TEMPLATE".into(),
             "{sender}|{recipient}|{message}".into(),
         );
-        assert!(load(&env).is_err(), "order template must contain task_id");
+        assert!(
+            load(&env).is_err(),
+            "dispatch template must contain dispatch_id"
+        );
 
         let mut env = valid_env();
         env.insert(
-            "SWARM_ORDER_PROMPT_TEMPLATE".into(),
+            "SWARM_DISPATCH_PROMPT_TEMPLATE".into(),
             "{unknown} {sender}".into(),
         );
         assert!(load(&env).is_err(), "unknown placeholder");
@@ -1510,25 +1441,6 @@ mod tests {
         env.insert("SWARM_MAX_MESSAGE_CHARS".into(), "100000".into());
         env.insert("SWARM_MCP_MAX_REQUEST_BODY_BYTES".into(), "65536".into());
         assert!(load(&env).is_err(), "body too small for the message limit");
-
-        // report statuses must include the default.
-        let mut env = valid_env();
-        env.insert("SWARM_REPORT_STATUSES".into(), "failed,in_progress".into());
-        assert!(load(&env).is_err(), "completed is the report default");
-
-        // wake statuses must be valid report statuses and include completion.
-        let mut env = valid_env();
-        env.insert("SWARM_REPORT_WAKE_STATUSES".into(), "failed".into());
-        assert!(
-            load(&env).is_err(),
-            "completed reports must wake a supervisor"
-        );
-        let mut env = valid_env();
-        env.insert(
-            "SWARM_REPORT_WAKE_STATUSES".into(),
-            "completed,unknown".into(),
-        );
-        assert!(load(&env).is_err(), "wake statuses must be a report subset");
 
         // the DB path must be absolute.
         let mut env = valid_env();

@@ -1,5 +1,10 @@
 # Swarm MCP deep review and roadmap
 
+> Historical audit snapshot for the retired pre-0.5 task-aware interface.
+> Names such as `order`, `report`, task lineage, and task status below describe
+> removed behavior only. The current contract is in `README.md` and
+> `AGENTS.md`: SLC MCP owns workflow; Swarm MCP is transport and wake delivery.
+
 ## Executive assessment
 
 The retired Python server was a useful functional prototype: it separated role

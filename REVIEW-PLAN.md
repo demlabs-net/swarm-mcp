@@ -1,5 +1,10 @@
 # swarm-mcp: review findings & remediation plan
 
+> Historical audit snapshot for the retired pre-0.5 task-aware interface.
+> Any `order`, `report`, assignment, lineage, or status references below are
+> non-normative history. SLC MCP now owns all workflow state; Swarm MCP carries
+> only transport deliveries and opaque correlations.
+
 Date: 2026-08-14 · Review scope: full Rust codebase (src/, ~5400 LOC) at commit `c494788` (rebased `develop`).
 Baseline: `cargo fmt` ✅ · `cargo test --locked --all-targets` ✅ (17 tests) · `cargo build --locked` ✅ ·
 `cargo clippy --locked --all-targets -- -D warnings` ❌ (fails on toolchains ≥ 1.90, see C-01).

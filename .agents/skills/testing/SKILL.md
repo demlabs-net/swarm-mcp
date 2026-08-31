@@ -20,7 +20,14 @@ Coverage gaps to fill (as of REVIEW-PLAN.md): `activity_snapshot` visibility fil
 
 ### dispatch.rs
 - Pure functions are directly testable: `render_template`, `render_order_template`, `validate_identifier`/`validate_idempotency`, `telegram_chunks`, `fingerprint`, `parse_arguments` (bad/extra/unknown fields → `ToolOutcome` error), `telegram_chunks` unicode boundaries.
-- Tool flows (`order`, `report`, `msg_to`, `telegram_inbound`, broadcasts) call `start_run` → HTTP POST to `agent.api_url`. To test them without a real swarm, spin up a local mock Hermes server with axum (see below) and build a `Dispatcher` directly from a hand-made `Config` (fields are `pub`).
+- Tool flows (`dispatch_to`, `msg_to`, `telegram_inbound`, broadcasts) call
+  `start_run` → HTTP POST to `agent.api_url`. To test them without a real
+  swarm, spin up a local mock Hermes server with axum (see below) and build a
+  `Dispatcher` directly from a hand-made `Config` (fields are `pub`).
+- Lock the domain boundary with tests: a correlation id remains opaque, the
+  transport accepts the four-field delivery object emitted by SLC, and an
+  executor can wake its SLC task issuer (including the manager) without a
+  Swarm-side task lookup.
 - `TelegramFailure`/`RunFailure` status classification (rejected vs indeterminate) is unit-testable via the store + mock server.
 
 Mock Hermes server sketch:
@@ -40,7 +47,7 @@ Then point `agent.api_url` at `format!("http://{addr}")`.
 - Assert: wrong/absent tokens → 401 + `WWW-Authenticate: Bearer`; bad Host → 403; oversize body → 413; rate limit → 429; valid activity signal → 202 with `recorded` flags.
 
 ### mcp.rs (currently zero tests)
-- `tools()`, `resources()`, `hierarchy()`, `instructions()` are pure given a `Config` + `Store` — build a `RoleMcp::new(state, role)` with a test config and assert the catalog for manager vs executor vs lead-developer (targets enum, `order_all` presence, `swarm://activity`/`swarm://executors` visibility).
+- `tools()`, `resources()`, `hierarchy()`, `instructions()` are pure given a `Config` + `Store` — build a `RoleMcp::new(state, role)` with a test config and assert the catalog for manager vs executor vs dispatch authority (targets enum, `dispatch_all` presence, `swarm://activity`/`swarm://executors` visibility, and no task/report tools).
 - `call_tool` with unknown tool → `METHOD_NOT_FOUND`.
 
 ### telegram.rs
@@ -56,7 +63,11 @@ Then point `agent.api_url` at `format!("http://{addr}")`.
 
 ## Config fixture helper
 
-A hand-built `Config` (all fields `pub`) is the fastest fixture. Use `BTreeMap::from` for `order_acl`/`agents`/`activity_routes`, small durations, `Secret::new`-style values (wrap with `Secret(String::from(...))` — the struct is `pub`), and `state_db_path` pointing at a temp file. Remember config invariants only enforced in `from_env` are NOT re-checked in struct literals — tests must construct valid states themselves.
+A hand-built `Config` (all fields `pub`) is the fastest fixture. Use
+`BTreeMap::from` for `dispatch_acl`/`agents`/`activity_routes`, small
+durations, `Secret::new` values, and `state_db_path` pointing at a temp file.
+Remember config invariants only enforced in `from_env` are NOT re-checked in
+struct literals — tests must construct valid states themselves.
 
 ## CI
 

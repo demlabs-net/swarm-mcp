@@ -11,9 +11,7 @@ use std::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::config::{
-    AgentConfig, Config, ManagerReportWakeMode, Secret, TelegramBacklogMode, TelegramBotMode,
-};
+use crate::config::{AgentConfig, Config, Secret, TelegramBacklogMode, TelegramBotMode};
 
 /// Unique temp `SQLite` path; clean up with `remove_db_files`.
 pub(crate) fn temp_db_path(name: &str) -> PathBuf {
@@ -31,8 +29,8 @@ pub(crate) async fn remove_db_files(path: &Path) {
 }
 
 /// Minimal but complete role hierarchy:
-/// - manager (global authority): orders developer and lead-developer
-/// - lead-developer: orders developer (supervisor of developer)
+/// - manager (global authority): dispatches to developer and lead-developer
+/// - lead-developer: dispatches to developer
 /// - developer: plain executor, emits activity to lead-developer
 pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
     let manager_role = "manager".to_string();
@@ -77,7 +75,7 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
                 "Lead developer executor".to_string(),
             ),
         ]),
-        order_acl: BTreeMap::from([
+        dispatch_acl: BTreeMap::from([
             (
                 "manager".to_string(),
                 vec!["developer".to_string(), "lead-developer".to_string()],
@@ -113,13 +111,6 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         cleanup_interval: Duration::from_secs(300),
         mcp_request_rate_limit: 1_000,
         mcp_request_rate_window: Duration::from_secs(60),
-        report_statuses: vec![
-            "completed".to_string(),
-            "failed".to_string(),
-            "in_progress".to_string(),
-        ],
-        report_wake_statuses: BTreeSet::from(["completed".to_string(), "failed".to_string()]),
-        manager_report_wake_mode: ManagerReportWakeMode::Immediate,
         telegram_enabled: false,
         telegram_bot_mode: TelegramBotMode::PerRole,
         telegram_bot_token: None,
@@ -140,19 +131,17 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         telegram_backlog_mode: TelegramBacklogMode::Discard,
         telegram_inbound_instructions: "execute the Telegram request".to_string(),
         telegram_inbound_template: "update {update_id} from user {user_id}: {message}".to_string(),
-        inbound_files_dir: state_db_path
-            .parent()
-            .map(|p| p.join("inbound"))
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/swarm-inbound")),
+        // Keep parallel tests isolated: sharing /tmp/inbound lets one test's
+        // cleanup remove another test's just-downloaded attachments.
+        inbound_files_dir: state_db_path.with_extension("inbound"),
         manager_instructions: "You are the swarm manager.".to_string(),
         executor_instructions: "You are an executor.".to_string(),
-        authority_instructions: "You may order: {targets}".to_string(),
-        executor_run_instructions: "Carry out the order.".to_string(),
-        supervisor_report_instructions: "Read the report.".to_string(),
+        authority_instructions: "You may dispatch to: {targets}".to_string(),
+        executor_run_instructions: "Process the delivered message.".to_string(),
         peer_run_instructions: "Read the message.".to_string(),
-        order_template: "{task_id}|{sender}|{recipient}|{message}".to_string(),
-        report_template: "{sender}|{recipient}|{task_id}|{status}|{message}".to_string(),
-        peer_template: "{message_id}|{sender}|{recipient}|{message}".to_string(),
+        dispatch_template: "{dispatch_id}|{sender}|{recipient}|{correlation_id}|{message}"
+            .to_string(),
+        peer_template: "{message_id}|{sender}|{recipient}|{correlation_id}|{message}".to_string(),
         log_level: "info".to_string(),
     }
 }

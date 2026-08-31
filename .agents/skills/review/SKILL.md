@@ -5,12 +5,23 @@ description: Deep code review checklist for the swarm-mcp codebase. Use when ask
 
 # Review swarm-mcp
 
-swarm-mcp is an authenticated, role-aware MCP control plane for an agent swarm. A change is correct only if it preserves the invariants below. Work through them in order; they are the security and correctness backbone of the project.
+swarm-mcp is an authenticated, role-aware transport and wake adapter for an
+agent swarm. SLC MCP owns every task, assignment, lineage link, task message,
+status transition, progress report, and terminal report. A change is correct
+only if it preserves that boundary and the transport invariants below.
 
 ## 1. Security invariants
 
 - **Token isolation**: each role has one `mcp_token` (config.rs `agents` map). A token must only ever expose that role's catalog. `http.rs::role_auth` gates every MCP path; `http.rs::activity_auth` maps the token back to exactly one role via `AuthenticatedRole`. Never loosen this.
-- **ACL enforcement**: `order` is allowed only for targets in `order_acl[sender]` (`dispatch.rs::order`); `order_all` only for `global_authorities`; `report` only to roles in `supervisors(sender)`; peer messages only to other executors; messaging controls only to the configured manager. The MCP JSON-Schema/catalog enumerates the same sets (`mcp.rs::tools`) — runtime checks in `Dispatcher` must stay the source of truth (defense in depth, do not rely on catalog visibility alone).
+- **ACL enforcement**: `dispatch_to` is allowed only for targets in
+  `dispatch_acl[sender]`; `dispatch_all` only for `global_authorities`;
+  `msg_to`/`msg_all` may wake any other configured role; messaging controls
+  apply only to executors and are available only to the configured manager.
+  Runtime checks in `Dispatcher` remain the source of truth.
+- **Domain boundary**: never resolve an SLC id, infer an issuer/assignee,
+  enforce a task transition, store a report body as task truth, or derive a
+  wake from task status. `correlation_id` and message text are opaque transport
+  input. An SLC `delivery` object may be forwarded unchanged.
 - **Secrets**: `Secret` redacts `Debug`. Bot tokens are embedded in Telegram request URLs — reqwest errors are mapped with `map_err(|_| ...)` and must never propagate the original error or URL (see `dispatch.rs::send_telegram`, `telegram.rs`). Keep it that way.
 - **Host/Origin guard**: `validate_host_and_origin` middleware is global. Note `host_allowed` semantics: a configured host without a port matches ANY port (tested in `http.rs`). Origins are compared as scheme+host+port tuples; `"null"` is allowed only if explicitly configured.
 - **Body limits**: `DefaultBodyLimit` plus per-request streaming caps (`start_run`, `validate_telegram_response`, `telegram_payload`). Never read unbounded bodies.
@@ -23,7 +34,7 @@ States: `pending` → `accepted | partial | failed | indeterminate` (recovery pa
 - Every tool flow that starts downstream work: validate → `reserve_or_replay` → `start_run` → `finish`/`fail_*`. `finish` persists result + optional Telegram audit atomically (`store.rs::finish_dispatch`). Manager messaging controls do not start downstream work; their state change and queue cancellation must remain one SQLite transaction under the write gate.
 - Idempotency: same `(sender, kind, idempotency_key)` + fingerprint → replay `Existing`; different fingerprint → `Conflict`; unfinished → `Pending`. A definitively `failed` dispatch releases its key and a retry re-executes; `accepted`, `partial`, and `indeterminate` remain replayable because downstream side effects may exist. Do not change this silently (see REVIEW-PLAN.md).
 - `indeterminate` means "downstream may have accepted" — recovery must never turn it back into `pending`.
-- Broadcasts (`order_all`, `msg_all`, `telegram_inbound`) aggregate per-target results into `accepted/partial/failed/indeterminate`; `partial` results must be durable and replayable.
+- Broadcasts (`dispatch_all`, `msg_all`, `telegram_inbound`) aggregate per-target results into `accepted/partial/failed/indeterminate`; `partial` results must be durable and replayable.
 
 ## 3. Store & migrations
 
@@ -42,8 +53,11 @@ States: `pending` → `accepted | partial | failed | indeterminate` (recovery pa
 ## 5. MCP catalog consistency
 
 - `mcp.rs::tools()`/`resources()` must stay in sync with `probe.rs::expected_tools()`/`expected_resources()` — `probe` fails the pipeline check if they diverge.
-- Tool schemas enumerate allowed values (`enum` from ACL/peers) and `additionalProperties: false`; `parse_arguments` uses `deny_unknown_fields`.
-- `swarm://hierarchy`, `swarm://operations`, `swarm://outbox` are visible to every role; `swarm://activity` only to ordering authorities; `swarm://executors` and `swarm://messaging` only to the manager. Visibility is enforced at the store query level (`recent_operations`, `recent_outbox`, `activity_snapshot` filter by caller) — keep enforcement in the store, not only in the handler.
+- Tool schemas enumerate allowed targets from ACL/peers. Generic delivery
+  tools intentionally allow and ignore extra envelope fields so transport
+  adapters and small models remain forward-compatible; security decisions use
+  only the parsed, validated fields.
+- `swarm://hierarchy`, `swarm://operations`, `swarm://outbox` are visible to every role; `swarm://activity` only to dispatch authorities; `swarm://executors` and `swarm://messaging` only to the manager. Visibility is enforced at the store query level (`recent_operations`, `recent_outbox`, `activity_snapshot` filter by caller) — keep enforcement in the store, not only in the handler.
 
 ## 6. Concurrency, lifecycle & observability
 

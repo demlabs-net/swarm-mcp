@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{ApiKind, Config, ManagerReportWakeMode, TelegramBotMode},
+    config::{ApiKind, Config, TelegramBotMode},
     store::{AuditMessage, MediaPayload, OutboxItem, Reservation, Store},
 };
 
@@ -95,10 +95,6 @@ impl RunFailure {
         }
     }
 
-    fn is_retryable(&self) -> bool {
-        self.retry_after_seconds.is_some()
-    }
-
     fn status(&self) -> &'static str {
         if self.indeterminate {
             "indeterminate"
@@ -145,7 +141,7 @@ impl std::fmt::Display for TelegramFailure {
     }
 }
 
-/// Shared aggregation of per-target broadcast outcomes (`order_all`, `msg_all`,
+/// Shared aggregation of per-target broadcast outcomes (`dispatch_all`, `msg_all`,
 /// Telegram inbound). A broadcast is `accepted` only when every target run was
 /// accepted; `indeterminate` when nothing was accepted and at least one target
 /// may have been reached; `partial` when some but not all runs were accepted.
@@ -214,38 +210,36 @@ impl BroadcastSummary {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OrderArgs {
+pub struct DispatchArgs {
+    #[serde(rename = "recipient", alias = "agent")]
     pub agent: String,
-    pub command: String,
+    pub message: String,
+    /// Opaque domain reference, such as an SLC task id. Swarm records and
+    /// forwards it without validation against any task store.
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct BroadcastArgs {
-    pub command: String,
-    pub idempotency_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ReportArgs {
-    pub summary: String,
-    pub task_id: String,
-    #[serde(default = "completed_status")]
-    pub status: String,
-    pub recipient: Option<String>,
+    pub message: String,
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MessageArgs {
+    #[serde(rename = "recipient", alias = "agent")]
     pub agent: String,
     pub message: String,
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MessageAllArgs {
     pub message: String,
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -301,10 +295,6 @@ pub struct TelegramInboundArgs {
     pub chat_id: i64,
 }
 
-fn completed_status() -> String {
-    "completed".to_string()
-}
-
 fn default_true() -> bool {
     true
 }
@@ -332,19 +322,19 @@ impl Dispatcher {
         })
     }
 
-    pub async fn order(&self, sender: &str, args: OrderArgs) -> ToolOutcome {
+    pub async fn dispatch_to(&self, sender: &str, args: DispatchArgs) -> ToolOutcome {
         let _messaging_guard = self.messaging_gate.read().await;
         let target = args.agent.trim().to_lowercase();
         let allowed = self
             .config
-            .order_acl
+            .dispatch_acl
             .get(sender)
             .cloned()
             .unwrap_or_default();
         if !allowed.contains(&target) {
             return tool_error(json!({
                 "ok": false,
-                "error": format!("{sender} is not authorized to order '{target}'"),
+                "error": format!("{sender} is not authorized to dispatch to '{target}'"),
                 "allowed": allowed,
             }));
         }
@@ -354,25 +344,33 @@ impl Dispatcher {
         {
             return outcome;
         }
-        let command = match self.clean_text(&args.command, "command") {
+        let message = match self.clean_text(&args.message, "message") {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
+        };
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
         };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        let task_id = format!("task_{}", Uuid::new_v4().simple());
+        let dispatch_id = format!("dispatch_{}", Uuid::new_v4().simple());
         let targets = vec![target.clone()];
         let fingerprint = fingerprint(&json!({
             "target": target,
-            "command": normalize_dispatch_text(&command),
+            "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
         }));
         if let Some(outcome) = self
             .reserve_or_replay(
-                &task_id,
+                &dispatch_id,
                 sender,
-                "order",
+                "dispatch_to",
                 &targets,
                 idempotency_key.as_deref(),
                 &fingerprint,
@@ -381,51 +379,67 @@ impl Dispatcher {
         {
             return outcome;
         }
-        let message = match render_order_template(
-            &self.config.order_template,
-            &task_id,
+        let body = match render_dispatch_template(
+            &self.config.dispatch_template,
+            &dispatch_id,
             sender,
             &target,
-            &command,
+            correlation_id.as_deref(),
+            &message,
         ) {
             Ok(value) => value,
             Err(error) => {
                 return self
-                    .fail_dispatch(&task_id, error, sender, "ORDER_FAILED", &target, &command)
+                    .fail_dispatch(
+                        &dispatch_id,
+                        error,
+                        sender,
+                        "DISPATCH_FAILED",
+                        &target,
+                        &message,
+                    )
                     .await;
             }
         };
         match self
-            .dispatch_role(&target, &message, &self.config.executor_run_instructions)
+            .dispatch_role(&target, &body, &self.config.executor_run_instructions)
             .await
         {
             Ok(handle) => {
                 let (key, value) = handle.key_value();
                 let mut result = json!({
                     "ok": true,
-                    "task_id": task_id,
-                    "authority": sender,
-                    "agent": target,
+                    "dispatch_id": dispatch_id,
+                    "sender": sender,
+                    "recipient": target,
+                    "correlation_id": correlation_id,
                 });
                 result[key] = json!(value);
                 let audit = self.audit(
                     sender,
-                    "ORDER",
+                    "DISPATCH",
                     &target,
-                    &format!("{task_id}\n{command}"),
+                    &format!("{dispatch_id}\n{message}"),
                     &mut result,
                 );
-                self.finish(&task_id, "accepted", &result, audit, false)
+                self.finish(&dispatch_id, "accepted", &result, audit, false)
                     .await
             }
             Err(error) => {
-                self.fail_run(&task_id, error, sender, "ORDER_FAILED", &target, &command)
-                    .await
+                self.fail_run(
+                    &dispatch_id,
+                    error,
+                    sender,
+                    "DISPATCH_FAILED",
+                    &target,
+                    &message,
+                )
+                .await
             }
         }
     }
 
-    pub async fn order_all(&self, sender: &str, args: BroadcastArgs) -> ToolOutcome {
+    pub async fn dispatch_all(&self, sender: &str, args: BroadcastArgs) -> ToolOutcome {
         let _messaging_guard = self.messaging_gate.read().await;
         if !self.config.global_authorities.contains(sender) {
             return tool_error(json!({
@@ -433,18 +447,25 @@ impl Dispatcher {
                 "error": format!("{sender} has no broadcast authority"),
             }));
         }
-        let command = match self.clean_text(&args.command, "command") {
+        let message = match self.clean_text(&args.message, "message") {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
+        };
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
         };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        let task_id = format!("task_{}", Uuid::new_v4().simple());
+        let dispatch_id = format!("dispatch_{}", Uuid::new_v4().simple());
         let targets = self
             .config
-            .order_acl
+            .dispatch_acl
             .get(sender)
             .cloned()
             .unwrap_or_default();
@@ -453,13 +474,14 @@ impl Dispatcher {
         }
         let fingerprint = fingerprint(&json!({
             "targets": targets,
-            "command": normalize_dispatch_text(&command),
+            "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
         }));
         if let Some(outcome) = self
             .reserve_or_replay(
-                &task_id,
+                &dispatch_id,
                 sender,
-                "order_all",
+                "dispatch_all",
                 &targets,
                 idempotency_key.as_deref(),
                 &fingerprint,
@@ -469,12 +491,13 @@ impl Dispatcher {
             return outcome;
         }
         let requests = targets.iter().map(|target| async {
-            let result = match render_order_template(
-                &self.config.order_template,
-                &task_id,
+            let result = match render_dispatch_template(
+                &self.config.dispatch_template,
+                &dispatch_id,
                 sender,
                 target,
-                &command,
+                correlation_id.as_deref(),
+                &message,
             ) {
                 Ok(message) => {
                     self.dispatch_role(target, &message, &self.config.executor_run_instructions)
@@ -492,240 +515,19 @@ impl Dispatcher {
         let status = summary.status(targets.len());
         let mut result = json!({
             "ok": ok,
-            "task_id": task_id,
-            "authority": sender,
+            "dispatch_id": dispatch_id,
+            "sender": sender,
+            "correlation_id": correlation_id,
             "results": summary.results,
         });
         let audit = self.audit(
             sender,
-            "ORDER_ALL",
+            "DISPATCH_ALL",
             &targets.join(", "),
-            &format!("{task_id}\n{command}"),
+            &format!("{dispatch_id}\n{message}"),
             &mut result,
         );
-        self.finish(&task_id, status, &result, audit, !ok).await
-    }
-
-    pub async fn report(&self, sender: &str, args: ReportArgs) -> ToolOutcome {
-        let _messaging_guard = self.messaging_gate.read().await;
-        if let Some(outcome) = self.messaging_block(sender, &[]).await {
-            return outcome;
-        }
-        let summary = match self.clean_text(&args.summary, "summary") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let task_id = match validate_identifier(&args.task_id, "task_id") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let status = args.status.trim().to_lowercase();
-        if !self.config.report_statuses.contains(&status) {
-            return tool_error(json!({
-                "ok": false,
-                "error": "unsupported report status",
-                "allowed": self.config.report_statuses,
-            }));
-        }
-        let issuer = match self.store.task_issuer(&task_id, sender).await {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                return tool_error(json!({
-                    "ok": false,
-                    "error": "task_id is not an accepted Swarm order assigned to the sending role",
-                    "task_id": task_id,
-                    "sender": sender,
-                }));
-            }
-            Err(error) => {
-                error!(%sender, %task_id, error = %error, "task lineage lookup failed");
-                return tool_error(json!({
-                    "ok": false,
-                    "error": "task lineage is temporarily unavailable",
-                }));
-            }
-        };
-        let recipient = args
-            .recipient
-            .as_deref()
-            .unwrap_or(&issuer)
-            .trim()
-            .to_lowercase();
-        if recipient != issuer {
-            return tool_error(json!({
-                "ok": false,
-                "error": "reports must return to the authority that issued the task",
-                "issuer": issuer,
-                "recipient": recipient,
-                "task_id": task_id,
-            }));
-        }
-        if let Some(outcome) = self
-            .messaging_block(sender, std::slice::from_ref(&recipient))
-            .await
-        {
-            return outcome;
-        }
-        let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let dispatch_id = format!("report_{}", Uuid::new_v4().simple());
-        let targets = vec![recipient.clone()];
-        let fingerprint = fingerprint(&json!({
-            "recipient": recipient,
-            "task_id": task_id,
-            "status": status,
-            "summary": normalize_dispatch_text(&summary),
-        }));
-        if let Some(outcome) = self
-            .reserve_or_replay(
-                &dispatch_id,
-                sender,
-                "report",
-                &targets,
-                idempotency_key.as_deref(),
-                &fingerprint,
-            )
-            .await
-        {
-            return outcome;
-        }
-        if !self.config.report_wake_statuses.contains(&status) {
-            let mut result = json!({
-                "ok": true,
-                "report_id": dispatch_id,
-                "recipient": recipient,
-                "task_id": task_id,
-                "status": status,
-                "summary": summary,
-                "supervisor_woken": false,
-            });
-            let audit = self.audit(
-                sender,
-                "REPORT",
-                &recipient,
-                &format!("{task_id} [{status}]\n{summary}"),
-                &mut result,
-            );
-            return self
-                .finish(&dispatch_id, "accepted", &result, audit, false)
-                .await;
-        }
-        if recipient == self.config.manager_role
-            && self.config.manager_report_wake_mode == ManagerReportWakeMode::Scheduled
-        {
-            let mut result = json!({
-                "ok": true,
-                "report_id": dispatch_id,
-                "recipient": recipient,
-                "task_id": task_id,
-                "status": status,
-                "summary": summary,
-                "supervisor_woken": false,
-                "wake_deferred": true,
-                "wake_policy": "scheduled_reconciliation",
-            });
-            let audit = self.audit(
-                sender,
-                "REPORT",
-                &recipient,
-                &format!("{task_id} [{status}]\n{summary}"),
-                &mut result,
-            );
-            return self
-                .finish(&dispatch_id, "accepted", &result, audit, false)
-                .await;
-        }
-        let message = match render_template(
-            &self.config.report_template,
-            &BTreeMap::from([
-                ("sender", sender),
-                ("recipient", recipient.as_str()),
-                ("task_id", task_id.as_str()),
-                ("status", status.as_str()),
-                ("message", summary.as_str()),
-            ]),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return self
-                    .fail_dispatch(
-                        &dispatch_id,
-                        error,
-                        sender,
-                        "REPORT_FAILED",
-                        &recipient,
-                        &summary,
-                    )
-                    .await;
-            }
-        };
-        match self
-            .dispatch_role(
-                &recipient,
-                &message,
-                &self.config.supervisor_report_instructions,
-            )
-            .await
-        {
-            Ok(handle) => {
-                let (key, value) = handle.key_value();
-                let mut result = json!({
-                    "ok": true,
-                    "report_id": dispatch_id,
-                    "recipient": recipient,
-                    "task_id": task_id,
-                    "status": status,
-                    "summary": summary,
-                    "supervisor_woken": true,
-                });
-                result[format!("recipient_{key}")] = json!(value);
-                let audit = self.audit(
-                    sender,
-                    "REPORT",
-                    &recipient,
-                    &format!("{task_id} [{status}]\n{summary}"),
-                    &mut result,
-                );
-                self.finish(&dispatch_id, "accepted", &result, audit, false)
-                    .await
-            }
-            Err(error) if error.is_retryable() => {
-                let mut result = json!({
-                    "ok": true,
-                    "report_id": dispatch_id,
-                    "recipient": recipient,
-                    "task_id": task_id,
-                    "status": status,
-                    "summary": summary,
-                    "supervisor_woken": false,
-                    "wake_deferred": true,
-                    "wake_policy": "supervisor_busy",
-                    "retry_after_seconds": error.retry_after_seconds,
-                });
-                let audit = self.audit(
-                    sender,
-                    "REPORT",
-                    &recipient,
-                    &format!("{task_id} [{status}]\n{summary}"),
-                    &mut result,
-                );
-                self.finish(&dispatch_id, "accepted", &result, audit, false)
-                    .await
-            }
-            Err(error) => {
-                self.fail_run(
-                    &dispatch_id,
-                    error,
-                    sender,
-                    "REPORT_FAILED",
-                    &recipient,
-                    &summary,
-                )
-                .await
-            }
-        }
+        self.finish(&dispatch_id, status, &result, audit, !ok).await
     }
 
     pub async fn message(&self, sender: &str, args: MessageArgs) -> ToolOutcome {
@@ -733,7 +535,7 @@ impl Dispatcher {
         let target = args.agent.trim().to_lowercase();
         let allowed = self
             .config
-            .agent_roles
+            .all_roles
             .iter()
             .filter(|role| role.as_str() != sender)
             .cloned()
@@ -741,7 +543,7 @@ impl Dispatcher {
         if !allowed.contains(&target) {
             return tool_error(json!({
                 "ok": false,
-                "error": "target must be another executor",
+                "error": "recipient must be another configured role",
                 "allowed": allowed,
             }));
         }
@@ -755,6 +557,13 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
+        };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -764,6 +573,7 @@ impl Dispatcher {
         let fingerprint = fingerprint(&json!({
             "target": target,
             "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
         }));
         if let Some(outcome) = self
             .reserve_or_replay(
@@ -784,6 +594,7 @@ impl Dispatcher {
                 ("message_id", message_id.as_str()),
                 ("sender", sender),
                 ("recipient", target.as_str()),
+                ("correlation_id", correlation_id.as_deref().unwrap_or("")),
                 ("message", message.as_str()),
             ]),
         ) {
@@ -803,7 +614,8 @@ impl Dispatcher {
                 let mut result = json!({
                     "ok": true,
                     "message_id": message_id,
-                    "agent": target,
+                    "recipient": target,
+                    "correlation_id": correlation_id,
                 });
                 result[key] = json!(value);
                 let audit = self.audit(
@@ -829,6 +641,13 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
+        };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -836,7 +655,7 @@ impl Dispatcher {
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let targets = self
             .config
-            .agent_roles
+            .all_roles
             .iter()
             .filter(|role| role.as_str() != sender)
             .cloned()
@@ -844,7 +663,7 @@ impl Dispatcher {
         if targets.is_empty() {
             return tool_error(json!({
                 "ok": false,
-                "error": "no peer executors to message",
+                "error": "no other roles to message",
             }));
         }
         if let Some(outcome) = self.messaging_block(sender, &targets).await {
@@ -853,6 +672,7 @@ impl Dispatcher {
         let fingerprint = fingerprint(&json!({
             "targets": targets,
             "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
         }));
         if let Some(outcome) = self
             .reserve_or_replay(
@@ -874,6 +694,7 @@ impl Dispatcher {
                     ("message_id", message_id.as_str()),
                     ("sender", sender),
                     ("recipient", target.as_str()),
+                    ("correlation_id", correlation_id.as_deref().unwrap_or("")),
                     ("message", message.as_str()),
                 ]),
             );
@@ -895,6 +716,7 @@ impl Dispatcher {
         let mut result = json!({
             "ok": ok,
             "message_id": message_id,
+            "correlation_id": correlation_id,
             "results": summary.results,
         });
         let audit = self.audit(
@@ -2171,19 +1993,21 @@ pub(crate) fn render_template(
     Ok(rendered)
 }
 
-fn render_order_template(
+fn render_dispatch_template(
     template: &str,
-    task_id: &str,
+    dispatch_id: &str,
     sender: &str,
     recipient: &str,
+    correlation_id: Option<&str>,
     message: &str,
 ) -> anyhow::Result<String> {
     render_template(
         template,
         &BTreeMap::from([
-            ("task_id", task_id),
+            ("dispatch_id", dispatch_id),
             ("sender", sender),
             ("recipient", recipient),
+            ("correlation_id", correlation_id.unwrap_or("")),
             ("message", message),
         ]),
     )
@@ -2333,17 +2157,18 @@ mod tests {
     }
 
     #[test]
-    fn order_template_uses_the_actual_recipient() {
+    fn dispatch_template_uses_the_actual_recipient() {
         assert_eq!(
-            render_order_template(
-                "{task_id}|{sender}|{recipient}|{message}",
-                "task_1",
+            render_dispatch_template(
+                "{dispatch_id}|{sender}|{recipient}|{message}",
+                "dispatch_1",
                 "manager",
                 "designer",
+                None,
                 "make a mockup",
             )
             .unwrap(),
-            "task_1|manager|designer|make a mockup"
+            "dispatch_1|manager|designer|make a mockup"
         );
     }
 
@@ -2369,7 +2194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_accepts_and_persists_run() -> anyhow::Result<()> {
+    async fn dispatch_accepts_and_persists_run() -> anyhow::Result<()> {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen_clone = seen.clone();
         let behavior: testutil::MockHermes = Arc::new(move |bearer, body| {
@@ -2382,25 +2207,26 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "  do the thing  ".to_string(),
+                    message: "  do the thing  ".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         assert!(!outcome.is_error, "unexpected: {outcome:?}");
         assert_eq!(outcome.value["run_id"], json!("run-1"));
-        let task_id = outcome.value["task_id"]
+        let dispatch_id = outcome.value["dispatch_id"]
             .as_str()
-            .expect("task id")
+            .expect("dispatch id")
             .to_string();
-        assert!(task_id.starts_with("task_"));
+        assert!(dispatch_id.starts_with("dispatch_"));
 
         let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
-            .bind(&task_id)
+            .bind(&dispatch_id)
             .fetch_one(store.pool())
             .await?;
         assert_eq!(status, "accepted");
@@ -2426,17 +2252,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_denies_unauthorized_targets() -> anyhow::Result<()> {
+    async fn dispatch_denies_unauthorized_targets() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run"})))).await?;
 
-        // developer has no order ACL entry at all.
+        // developer has no dispatch ACL entry at all.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "developer",
-                OrderArgs {
+                DispatchArgs {
                     agent: "lead-developer".to_string(),
-                    command: "x".to_string(),
+                    message: "x".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2449,13 +2276,14 @@ mod tests {
                 .contains("not authorized")
         );
 
-        // manager cannot order itself.
+        // manager cannot dispatch to itself.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "manager".to_string(),
-                    command: "x".to_string(),
+                    message: "x".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2529,37 +2357,24 @@ mod tests {
             .await;
         assert!(unauthorized_clear.is_error);
 
-        let blocked_order = dispatcher
-            .order(
+        let blocked_dispatch = dispatcher
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "must not start".to_string(),
+                    message: "must not start".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
-        assert_eq!(blocked_order.value["disabled_agents"], json!(["developer"]));
         assert_eq!(
-            blocked_order.value["action_required"],
-            json!("stop_current_run_and_escalate_to_human")
+            blocked_dispatch.value["disabled_agents"],
+            json!(["developer"])
         );
-
-        let blocked_report = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "must not leave".to_string(),
-                    task_id: "task-blocked".to_string(),
-                    status: "completed".to_string(),
-                    recipient: Some("manager".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
         assert_eq!(
-            blocked_report.value["error"],
-            json!("messaging is disabled for the sending role")
+            blocked_dispatch.value["action_required"],
+            json!("stop_current_run_and_escalate_to_human")
         );
 
         let blocked_peer = dispatcher
@@ -2568,6 +2383,7 @@ mod tests {
                 MessageArgs {
                     agent: "developer".to_string(),
                     message: "must not arrive".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2591,11 +2407,12 @@ mod tests {
             .await;
         assert!(!enabled.is_error, "unexpected: {enabled:?}");
         let accepted = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "resume".to_string(),
+                    message: "resume".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2702,7 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_all_aggregates_partial_results() -> anyhow::Result<()> {
+    async fn dispatch_all_aggregates_partial_results() -> anyhow::Result<()> {
         let behavior: testutil::MockHermes = Arc::new(|bearer, _| {
             if bearer.ends_with("api-key-developer") {
                 (202, json!({"run_id": "run-dev"}))
@@ -2714,10 +2531,11 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
         let outcome = dispatcher
-            .order_all(
+            .dispatch_all(
                 "manager",
                 BroadcastArgs {
-                    command: "sync".to_string(),
+                    message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2737,7 +2555,7 @@ mod tests {
             json!(true)
         );
 
-        let dispatch_id = outcome.value["task_id"].as_str().expect("task id");
+        let dispatch_id = outcome.value["dispatch_id"].as_str().expect("dispatch id");
         let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
             .bind(dispatch_id)
             .fetch_one(store.pool())
@@ -2748,305 +2566,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_returns_to_the_exact_task_issuer() -> anyhow::Result<()> {
-        let (dispatcher, _store, path) =
-            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-report"})))).await?;
-
-        // An invented task cannot be reported to any role.
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "done".to_string(),
-                    task_id: "t1".to_string(),
-                    status: "completed".to_string(),
-                    recipient: Some("designer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(outcome.is_error);
-        assert!(
-            outcome.value["error"]
-                .as_str()
-                .unwrap()
-                .contains("not an accepted Swarm order")
-        );
-
-        let unassigned = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "invented lineage".to_string(),
-                    task_id: "task-not-assigned".to_string(),
-                    status: "completed".to_string(),
-                    recipient: Some("lead-developer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(unassigned.is_error);
-        assert!(
-            unassigned.value["error"]
-                .as_str()
-                .unwrap()
-                .contains("not an accepted Swarm order")
-        );
-
-        let assignment = dispatcher
-            .order(
-                "manager",
-                OrderArgs {
-                    agent: "developer".to_string(),
-                    command: "Implement the assigned work".to_string(),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-
-        // A valid supervisor is still the wrong recipient when the manager
-        // issued this exact task.
-        let wrong_issuer = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "done".to_string(),
-                    task_id: task_id.clone(),
-                    status: "completed".to_string(),
-                    recipient: Some("lead-developer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(wrong_issuer.is_error);
-        assert_eq!(wrong_issuer.value["issuer"], json!("manager"));
-
-        // Omitting recipient safely routes to the persisted issuer.
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "done".to_string(),
-                    task_id,
-                    status: "completed".to_string(),
-                    recipient: None,
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(!outcome.is_error, "unexpected: {outcome:?}");
-        assert_eq!(outcome.value["recipient"], json!("manager"));
-        assert_eq!(outcome.value["recipient_run_id"], json!("run-report"));
-        assert_eq!(outcome.value["summary"], json!("done"));
-
-        // unknown status is rejected.
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "done".to_string(),
-                    task_id: "t1".to_string(),
-                    status: "weird".to_string(),
-                    recipient: Some("lead-developer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(outcome.is_error);
-        testutil::remove_db_files(&path).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn progress_report_is_persisted_without_waking_supervisor() -> anyhow::Result<()> {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls_clone = calls.clone();
-        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
-            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            (202, json!({"run_id": "unexpected"}))
-        }))
-        .await?;
-
-        let assignment = dispatcher
-            .order(
-                "lead-developer",
-                OrderArgs {
-                    agent: "developer".to_string(),
-                    command: "Reach one tested checkpoint".to_string(),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "Implementation reached the tested checkpoint".to_string(),
-                    task_id,
-                    status: "in_progress".to_string(),
-                    recipient: None,
-                    idempotency_key: None,
-                },
-            )
-            .await;
-
-        assert!(!outcome.is_error, "unexpected: {outcome:?}");
-        assert_eq!(outcome.value["supervisor_woken"], json!(false));
-        assert!(outcome.value.get("recipient_run_id").is_none());
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the assignment starts one run; progress must not start another"
-        );
-        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
-            .bind(outcome.value["report_id"].as_str().expect("report id"))
-            .fetch_one(store.pool())
-            .await?;
-        assert_eq!(status, "accepted");
-
-        testutil::remove_db_files(&path).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn manager_terminal_report_can_be_reconciled_without_consuming_a_run()
-    -> anyhow::Result<()> {
-        let path = testutil::temp_db_path("dispatch-manager-report-reconcile");
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls_clone = calls.clone();
-        let mock = testutil::spawn_mock_hermes(Arc::new(move |_, _| {
-            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            (202, json!({"run_id": "run-assignment"}))
-        }))
-        .await;
-        let mut config = testutil::fixture_config(&path);
-        config.manager_report_wake_mode = ManagerReportWakeMode::Scheduled;
-        for agent in config.agents.values_mut() {
-            agent.api_url = Some(mock.parse()?);
-        }
-        let config = Arc::new(config);
-        let store = Store::connect(&config).await?;
-        let dispatcher = Dispatcher::new(config, store.clone())?;
-
-        let assignment = dispatcher
-            .order(
-                "manager",
-                OrderArgs {
-                    agent: "developer".to_string(),
-                    command: "Implement the assigned work".to_string(),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "terminal evidence".to_string(),
-                    task_id,
-                    status: "completed".to_string(),
-                    recipient: Some("manager".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-
-        assert!(!outcome.is_error, "unexpected: {outcome:?}");
-        assert_eq!(outcome.value["supervisor_woken"], json!(false));
-        assert_eq!(outcome.value["wake_deferred"], json!(true));
-        assert_eq!(
-            outcome.value["wake_policy"],
-            json!("scheduled_reconciliation")
-        );
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "only the original assignment may start a run"
-        );
-        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
-            .bind(outcome.value["report_id"].as_str().expect("report id"))
-            .fetch_one(store.pool())
-            .await?;
-        assert_eq!(status, "accepted");
-
-        testutil::remove_db_files(&path).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn terminal_report_is_accepted_when_supervisor_is_temporarily_busy() -> anyhow::Result<()>
-    {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls_clone = calls.clone();
-        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
-            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                (202, json!({"run_id": "run-assignment"}))
-            } else {
-                (429, json!({"error": "busy"}))
-            }
-        }))
-        .await?;
-        let assignment = dispatcher
-            .order(
-                "lead-developer",
-                OrderArgs {
-                    agent: "developer".to_string(),
-                    command: "Implement the assigned work".to_string(),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "terminal evidence".to_string(),
-                    task_id,
-                    status: "completed".to_string(),
-                    recipient: None,
-                    idempotency_key: None,
-                },
-            )
-            .await;
-
-        assert!(!outcome.is_error, "unexpected: {outcome:?}");
-        assert_eq!(outcome.value["supervisor_woken"], json!(false));
-        assert_eq!(outcome.value["wake_deferred"], json!(true));
-        assert_eq!(outcome.value["wake_policy"], json!("supervisor_busy"));
-        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
-            .bind(outcome.value["report_id"].as_str().expect("report id"))
-            .fetch_one(store.pool())
-            .await?;
-        assert_eq!(status, "accepted");
-
-        testutil::remove_db_files(&path).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn message_all_without_peers_is_rejected() -> anyhow::Result<()> {
+    async fn executor_can_wake_manager_after_writing_slc_event() -> anyhow::Result<()> {
         let path = testutil::temp_db_path("dispatch-no-peers");
         let mut config = testutil::fixture_config(&path);
         config.agent_roles = vec!["developer".to_string()];
         config.all_roles = vec!["manager".to_string(), "developer".to_string()];
-        config.order_acl = BTreeMap::from([("manager".to_string(), vec!["developer".to_string()])]);
+        config.dispatch_acl =
+            BTreeMap::from([("manager".to_string(), vec!["developer".to_string()])]);
         config.global_authorities = BTreeSet::from(["manager".to_string()]);
         config.activity_routes = BTreeMap::new();
         config
@@ -3065,30 +2591,30 @@ mod tests {
         let store = Store::connect(&config).await?;
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
 
-        // developer has no peers: sending to nobody must not report success.
+        // Task reports live in SLC, but an executor must still be able to wake
+        // the manager through the transport after writing a terminal event.
         let outcome = dispatcher
-            .message_all(
+            .message(
                 "developer",
-                MessageAllArgs {
-                    message: "hi".to_string(),
-                    idempotency_key: None,
+                MessageArgs {
+                    agent: "manager".to_string(),
+                    message: "SLC task task_example has a terminal event".to_string(),
+                    correlation_id: Some("task_example".to_string()),
+                    idempotency_key: Some("event_example".to_string()),
                 },
             )
             .await;
-        assert!(outcome.is_error);
-        assert!(
-            outcome.value["error"]
-                .as_str()
-                .unwrap()
-                .contains("no peer executors")
-        );
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.value);
+        assert_eq!(outcome.value["ok"], json!(true));
+        assert_eq!(outcome.value["recipient"], json!("manager"));
+        assert_eq!(outcome.value["correlation_id"], json!("task_example"));
         testutil::remove_db_files(&path).await;
         Ok(())
     }
 
     #[tokio::test]
-    async fn msg_to_without_task_id_is_a_plain_handoff() -> anyhow::Result<()> {
-        let path = testutil::temp_db_path("dispatch-msg-no-task");
+    async fn msg_to_without_dispatch_id_is_a_plain_handoff() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-msg-no-correlation");
         let mut config = testutil::fixture_config(&path);
         let mock =
             testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
@@ -3099,21 +2625,22 @@ mod tests {
         let store = Store::connect(&config).await?;
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
 
-        // developer → lead-developer, no task_id: must be accepted as a
-        // plain coordination message (no order lineage exists for sender).
+        // developer → lead-developer, no dispatch_id: must be accepted as a
+        // plain coordination message (no domain correlation is required).
         let outcome = dispatcher
             .message(
                 "developer",
                 MessageArgs {
                     agent: "lead-developer".to_string(),
                     message: "Перезвони клиенту: Иван, +79139849832, хочет сайт".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         assert!(!outcome.is_error, "unexpected error: {}", outcome.value);
         assert_eq!(outcome.value["ok"], json!(true));
-        assert_eq!(outcome.value["agent"], json!("lead-developer"));
+        assert_eq!(outcome.value["recipient"], json!("lead-developer"));
 
         // Same again — idempotency replay must not flip it to an error.
         let replay = dispatcher
@@ -3122,6 +2649,7 @@ mod tests {
                 MessageArgs {
                     agent: "lead-developer".to_string(),
                     message: "Перезвони клиенту: Иван, +79139849832, хочет сайт".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3148,29 +2676,31 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
         let first = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "retry me".to_string(),
+                    message: "retry me".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("key-retry".to_string()),
                 },
             )
             .await;
         assert!(first.is_error);
         let first_status: String =
-            sqlx::query_scalar("SELECT status FROM dispatches WHERE sender='manager' AND kind='order' AND idempotency_key='key-retry'")
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE sender='manager' AND kind='dispatch_to' AND idempotency_key='key-retry'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(first_status, "failed");
 
         // Retry with the SAME key re-executes: the failed dispatch released the key.
         let second = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "retry me".to_string(),
+                    message: "retry me".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("key-retry".to_string()),
                 },
             )
@@ -3178,21 +2708,22 @@ mod tests {
         assert!(!second.is_error, "retry must re-execute: {second:?}");
         assert_eq!(second.value["run_id"], json!("run-ok"));
         assert!(second.value.get("deduplicated").is_none());
-        let second_id = second.value["task_id"].as_str().expect("task id");
+        let second_id = second.value["dispatch_id"].as_str().expect("dispatch id");
 
         // A further call with the same key replays the accepted result.
         let third = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "retry me".to_string(),
+                    message: "retry me".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("key-retry".to_string()),
                 },
             )
             .await;
         assert_eq!(third.value["deduplicated"], json!(true));
-        assert_eq!(third.value["task_id"], json!(second_id));
+        assert_eq!(third.value["dispatch_id"], json!(second_id));
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -3208,21 +2739,23 @@ mod tests {
         let (dispatcher, _store, path) = dispatcher_with_mock(behavior).await?;
 
         let first = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "Implement the bounded task".to_string(),
+                    message: "Implement the bounded task".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         let replay = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "  Implement   the bounded task\n".to_string(),
+                    message: "  Implement   the bounded task\n".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3231,7 +2764,7 @@ mod tests {
         assert!(!first.is_error, "unexpected: {first:?}");
         assert!(!replay.is_error, "unexpected: {replay:?}");
         assert_eq!(replay.value["deduplicated"], json!(true));
-        assert_eq!(replay.value["task_id"], first.value["task_id"]);
+        assert_eq!(replay.value["dispatch_id"], first.value["dispatch_id"]);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         testutil::remove_db_files(&path).await;
@@ -3319,7 +2852,9 @@ mod tests {
             response
         };
         let get_file_handler = move || async move {
-            Json(json!({"ok": true, "result": {"file_id": "f1", "file_unique_id": "u1", "file_path": "photos/x.png"}}))
+            Json(
+                json!({"ok": true, "result": {"file_id": "f1", "file_unique_id": "u1", "file_path": "photos/x.png"}}),
+            )
         };
         let router = Router::new()
             .route("/bot{token}/sendMessage", post(handler))
@@ -3346,11 +2881,12 @@ mod tests {
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-msg"})))).await?;
 
         let _assignment = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "Coordinate one implementation detail".to_string(),
+                    message: "Coordinate one implementation detail".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3362,6 +2898,7 @@ mod tests {
                 MessageArgs {
                     agent: "lead-developer".to_string(),
                     message: " ping ".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3380,7 +2917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_rejects_non_peer_targets() -> anyhow::Result<()> {
+    async fn message_rejects_self_and_unknown_recipients() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run"})))).await?;
         let outcome = dispatcher
@@ -3389,6 +2926,7 @@ mod tests {
                 MessageArgs {
                     agent: "developer".to_string(),
                     message: "self".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3398,8 +2936,9 @@ mod tests {
             .message(
                 "developer",
                 MessageArgs {
-                    agent: "manager".to_string(),
-                    message: "not a peer".to_string(),
+                    agent: "unknown-role".to_string(),
+                    message: "not configured".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3421,11 +2960,12 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
         let _assignment = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "Coordinate the assigned task".to_string(),
+                    message: "Coordinate the assigned task".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3437,6 +2977,7 @@ mod tests {
                 "developer",
                 MessageAllArgs {
                     message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3458,14 +2999,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_all_all_server_failures_are_indeterminate() -> anyhow::Result<()> {
+    async fn dispatch_all_all_server_failures_are_indeterminate() -> anyhow::Result<()> {
         let (dispatcher, store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (500, json!({"error": "boom"})))).await?;
         let outcome = dispatcher
-            .order_all(
+            .dispatch_all(
                 "manager",
                 BroadcastArgs {
-                    command: "sync".to_string(),
+                    message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3476,7 +3018,7 @@ mod tests {
             outcome.value["results"]["developer"]["status"],
             json!("indeterminate")
         );
-        let dispatch_id = outcome.value["task_id"].as_str().expect("task id");
+        let dispatch_id = outcome.value["dispatch_id"].as_str().expect("dispatch id");
         let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
             .bind(dispatch_id)
             .fetch_one(store.pool())
@@ -4080,13 +3622,14 @@ mod tests {
             dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-flush"}))))
                 .await?;
 
-        // An accepted order queues an audit message in the outbox.
+        // An accepted transport dispatch queues an audit message in the outbox.
         dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "audit me".to_string(),
+                    message: "audit me".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -4120,11 +3663,12 @@ mod tests {
         )
         .await?;
         dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "audit after resume".to_string(),
+                    message: "audit after resume".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -4148,7 +3692,7 @@ mod tests {
         dispatcher.flush_outbox().await?;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let held_status: String =
-            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='ORDER'")
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='DISPATCH'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(held_status, "pending");
@@ -4166,7 +3710,7 @@ mod tests {
         dispatcher.flush_outbox().await?;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let resumed_status: String =
-            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='ORDER'")
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='DISPATCH'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(resumed_status, "delivered");
@@ -4183,11 +3727,12 @@ mod tests {
         )
         .await?;
         dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "audit once".to_string(),
+                    message: "audit once".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -4196,7 +3741,7 @@ mod tests {
         dispatcher.flush_outbox().await?;
 
         let (status, attempts): (String, i64) =
-            sqlx::query_as("SELECT status, attempts FROM telegram_outbox WHERE event='ORDER'")
+            sqlx::query_as("SELECT status, attempts FROM telegram_outbox WHERE event='DISPATCH'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(status, "dead");
@@ -4224,11 +3769,12 @@ mod tests {
         .await?;
         for command in ["first audit", "second audit"] {
             dispatcher
-                .order(
+                .dispatch_to(
                     "manager",
-                    OrderArgs {
+                    DispatchArgs {
                         agent: "developer".to_string(),
-                        command: command.to_string(),
+                        message: command.to_string(),
+                        correlation_id: None,
                         idempotency_key: None,
                     },
                 )
@@ -4262,9 +3808,9 @@ mod tests {
         OutboxItem {
             id: "audit_x".to_string(),
             sender: "manager".to_string(),
-            event: "ORDER".to_string(),
+            event: "DISPATCH".to_string(),
             recipients: "developer".to_string(),
-            text: "task_1\nmake a mockup".repeat(300),
+            text: "dispatch_1\nmake a mockup".repeat(300),
             attempts: 0,
             next_chunk: 0,
             chat_id: None,
@@ -4331,7 +3877,7 @@ mod tests {
         // The chunk checkpoint needs a real pending outbox row.
         sqlx::query(
             "INSERT INTO telegram_outbox(id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms)
-             VALUES ('audit_x','manager','ORDER','developer',?,'pending',0,0,0,0)",
+             VALUES ('audit_x','manager','DISPATCH','developer',?,'pending',0,0,0,0)",
         )
         .bind(&item.text)
         .execute(store.pool())
@@ -4343,7 +3889,7 @@ mod tests {
             bodies[0].clone()
         };
         let expected_chunks = telegram_chunks(
-            "[ORDER] manager -> developer",
+            "[DISPATCH] manager -> developer",
             &item.text,
             dispatcher.config.telegram_message_limit,
         );
@@ -4389,17 +3935,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_rejects_invalid_arguments_and_oversized_text() -> anyhow::Result<()> {
+    async fn dispatch_rejects_invalid_arguments_and_oversized_text() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await?;
 
         // idempotency keys must match the identifier alphabet.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "x".to_string(),
+                    message: "x".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("bad key with spaces!".to_string()),
                 },
             )
@@ -4408,22 +3955,24 @@ mod tests {
 
         // commands are trimmed and bounded.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "   ".to_string(),
+                    message: "   ".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         assert!(outcome.is_error);
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "x".repeat(20_000),
+                    message: "x".repeat(20_000),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -4439,7 +3988,8 @@ mod tests {
         let mut config = testutil::fixture_config(&path);
         // The fixture bypasses startup template validation, so a broken template
         // reaches render time and must fail the dispatch durably.
-        config.order_template = "{task_id}|{sender}|{recipient}|{message}|{unknown}".to_string();
+        config.dispatch_template =
+            "{dispatch_id}|{sender}|{recipient}|{message}|{unknown}".to_string();
         let mock =
             testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
         for agent in config.agents.values_mut() {
@@ -4450,11 +4000,12 @@ mod tests {
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
 
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "do it".to_string(),
+                    message: "do it".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -4471,14 +4022,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_all_requires_global_authority() -> anyhow::Result<()> {
+    async fn dispatch_all_requires_global_authority() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await?;
         let outcome = dispatcher
-            .order_all(
+            .dispatch_all(
                 "developer",
                 BroadcastArgs {
-                    command: "sync".to_string(),
+                    message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )

@@ -16,6 +16,9 @@ use tracing::{error, info, warn};
 use crate::{AppState, config::TelegramBacklogMode, dispatch::TelegramInboundArgs};
 
 const MAX_TELEGRAM_RESPONSE_BYTES: usize = 1024 * 1024;
+static FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+type AttachmentTarget<'a> = (&'a str, Option<i64>, Option<String>, Option<String>);
 
 #[derive(Debug, Deserialize)]
 struct TelegramUpdate {
@@ -44,7 +47,8 @@ struct TelegramMessage {
 #[derive(Debug, Deserialize)]
 struct TelegramPhotoSize {
     file_id: String,
-    file_unique_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
     width: i64,
     height: i64,
     #[serde(default)]
@@ -54,7 +58,8 @@ struct TelegramPhotoSize {
 #[derive(Debug, Deserialize)]
 struct TelegramDocument {
     file_id: String,
-    file_unique_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
     #[serde(default)]
     file_name: Option<String>,
     #[serde(default)]
@@ -401,7 +406,7 @@ impl TelegramGateway {
     /// диспатча. Сообщения с одними файлами (без текста) тоже обрабатываются.
     async fn download_attachments(&self, message: &TelegramMessage) -> Vec<String> {
         let mut notes = Vec::new();
-        let mut targets: Vec<(&str, Option<i64>, Option<String>, Option<String>)> = Vec::new();
+        let mut targets: Vec<AttachmentTarget<'_>> = Vec::new();
         // Самое крупное фото (если несколько — берём максимальное).
         if let Some(photo) = message.photo.iter().max_by_key(|p| p.width * p.height) {
             targets.push((
@@ -430,13 +435,14 @@ impl TelegramGateway {
                     let saved = save_inbound_file(&dir, name.as_deref(), &bytes).await;
                     match saved {
                         Ok(path) => {
-                            let size_kb = size.unwrap_or_else(|| bytes.len() as i64) / 1024;
+                            let downloaded_size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+                            let size_kb = size.unwrap_or(downloaded_size) / 1024;
                             notes.push(format!(
                                 "\n📎 Вложение: {} ({}), {} КБ — путь: {}",
-                                path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "file".into()),
+                                path.file_name().map_or_else(
+                                    || "file".into(),
+                                    |n| n.to_string_lossy().to_string()
+                                ),
                                 mime.as_deref().unwrap_or("application/octet-stream"),
                                 size_kb,
                                 path.display()
@@ -519,11 +525,20 @@ async fn save_inbound_file(
     let safe: String = name
         .unwrap_or("file")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(80)
         .collect();
-    let safe = if safe.trim().is_empty() { "file".to_string() } else { safe };
-    static FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let safe = if safe.trim().is_empty() {
+        "file".to_string()
+    } else {
+        safe
+    };
     let sequence = FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!(
         "{}_{sequence}_{safe}",
@@ -843,7 +858,9 @@ mod tests {
             response
         };
         let get_file_handler = move || async move {
-            Json(json!({"ok": true, "result": {"file_id": "f1", "file_unique_id": "u1", "file_path": "photos/x.png"}}))
+            Json(
+                json!({"ok": true, "result": {"file_id": "f1", "file_unique_id": "u1", "file_path": "photos/x.png"}}),
+            )
         };
         let router = Router::new()
             .route("/bot{token}/getUpdates", post(handler))
@@ -895,20 +912,6 @@ mod tests {
         gateway_with_mocks_and_hermes(
             backlog,
             bot,
-            Arc::new(|_, _| (202, json!({"run_id": "run-1"}))),
-        )
-        .await
-    }
-
-    async fn gateway_with_mocks_and_files(
-        backlog: TelegramBacklogMode,
-        bot: MockBot,
-        file_bytes: Vec<u8>,
-    ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
-        gateway_with_mocks_and_files_hermes(
-            backlog,
-            bot,
-            file_bytes,
             Arc::new(|_, _| (202, json!({"run_id": "run-1"}))),
         )
         .await
@@ -1235,32 +1238,40 @@ mod tests {
         gateway.poll_once().await?;
         assert_eq!(store.telegram_update_offset().await?, Some(6));
         // Диспатч ушёл: сообщение содержит подпись и заметки о двух вложениях.
-        let row: String = sqlx::query_scalar(
-            "SELECT result_json FROM dispatches WHERE id = 'telegram_5'",
-        )
-        .fetch_one(store.pool())
-        .await?;
+        let row: String =
+            sqlx::query_scalar("SELECT result_json FROM dispatches WHERE id = 'telegram_5'")
+                .fetch_one(store.pool())
+                .await?;
         let value: serde_json::Value = serde_json::from_str(&row)?;
         assert!(
             value["results"]["manager"]["run_id"].as_str().is_some(),
             "простой текст с вложением уходит менеджеру: {value}"
         );
         // Сам диспатч (тело запроса к Hermes) несёт подпись и пути к файлам.
-        let bodies = hermes_bodies.lock().expect("bodies");
-        assert_eq!(bodies.len(), 1);
-        assert!(
-            bodies[0].contains("Вот логотип"),
-            "подпись фото передана: {}",
-            bodies[0]
-        );
-        assert!(bodies[0].contains("📎 Вложение:"), "заметки о вложениях: {}", bodies[0]);
-        assert!(bodies[0].contains("logo.png"), "имя документа: {}", bodies[0]);
-        assert!(
-            bodies[0].contains(inbound_dir.to_str().unwrap()),
-            "путь для агента должен указывать на общую папку: {}",
-            bodies[0]
-        );
-        drop(bodies);
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("Вот логотип"),
+                "подпись фото передана: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("📎 Вложение:"),
+                "заметки о вложениях: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("logo.png"),
+                "имя документа: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains(inbound_dir.to_str().unwrap()),
+                "путь для агента должен указывать на общую папку: {}",
+                bodies[0]
+            );
+        }
         let files = std::fs::read_dir(&inbound_dir)?;
         let mut names = Vec::new();
         for entry in files.flatten() {
@@ -1276,9 +1287,9 @@ mod tests {
             "самое крупное фото: {names:?}"
         );
         // Содержимое файла совпадает с тем, что отдал Bot API.
-        let saved = std::fs::read(inbound_dir.join(
-            names.iter().find(|n| n.ends_with("logo.png")).unwrap(),
-        ))?;
+        let saved = std::fs::read(
+            inbound_dir.join(names.iter().find(|n| n.ends_with("logo.png")).unwrap()),
+        )?;
         assert_eq!(saved, b"\x89PNG-fake-bytes");
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&inbound_dir);
@@ -1300,16 +1311,12 @@ mod tests {
         let stale = inbound_dir.join("stale.png");
         std::fs::write(&stale, b"old")?;
         // Ставим mtime на 25 часов назад (cleanup — старше суток).
-        let times = std::fs::FileTimes::new().set_modified(
-            std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60),
-        );
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60));
         std::fs::File::open(&stale)?.set_times(times)?;
         // Обработанное сообщение запускает cleanup входящих файлов.
         gateway.poll_once().await?;
-        assert!(
-            !stale.exists(),
-            "файл старше суток удалён"
-        );
+        assert!(!stale.exists(), "файл старше суток удалён");
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&inbound_dir);
         Ok(())

@@ -426,34 +426,6 @@ impl Store {
         }))
     }
 
-    pub async fn task_assigned_to(&self, task_id: &str, role: &str) -> anyhow::Result<bool> {
-        Ok(self.task_issuer(task_id, role).await?.is_some())
-    }
-
-    /// Return the authority that issued an accepted order to `role`.
-    ///
-    /// Reports follow this persisted lineage instead of a global manager
-    /// default. This allows a delivery owner to delegate work directly while
-    /// ensuring that the terminal result returns to the exact owner of that
-    /// child task.
-    pub async fn task_issuer(&self, task_id: &str, role: &str) -> anyhow::Result<Option<String>> {
-        sqlx::query_scalar(
-            r#"SELECT d.sender
-               FROM dispatches d
-               JOIN dispatch_targets t ON t.dispatch_id = d.id
-               WHERE d.id = ?
-                 AND d.kind IN ('order', 'order_all')
-                 AND d.status IN ('accepted', 'partial', 'indeterminate')
-                 AND t.target = ?
-               LIMIT 1"#,
-        )
-        .bind(task_id)
-        .bind(role)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn reserve_dispatch(
         &self,
@@ -811,11 +783,6 @@ impl Store {
             let mut result: Option<Value> = row
                 .try_get::<Option<String>, _>("result_json")?
                 .and_then(|raw| serde_json::from_str(&raw).ok());
-            if kind == "report"
-                && let Some(value) = result.as_mut()
-            {
-                self.hydrate_legacy_report_summary(value).await?;
-            }
             let is_sender = row.get::<String, _>("sender") == role;
             if !is_sender {
                 targets.retain(|target| target == role);
@@ -833,29 +800,6 @@ impl Store {
             }));
         }
         Ok(json!({"caller": role, "operations": operations}))
-    }
-
-    async fn hydrate_legacy_report_summary(&self, result: &mut Value) -> anyhow::Result<()> {
-        if result.get("summary").and_then(Value::as_str).is_some() {
-            return Ok(());
-        }
-        let Some(outbox_id) = result
-            .get("telegram")
-            .and_then(|telegram| telegram.get("outbox_id"))
-            .and_then(Value::as_str)
-        else {
-            return Ok(());
-        };
-        let audit_text = sqlx::query_scalar::<_, String>(
-            "SELECT text FROM telegram_outbox WHERE id = ? AND event IN ('REPORT', 'REPORT_FAILED')",
-        )
-        .bind(outbox_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        if let Some((_, summary)) = audit_text.as_deref().and_then(|text| text.split_once('\n')) {
-            result["summary"] = json!(summary);
-        }
-        Ok(())
     }
 
     pub async fn recent_outbox(
@@ -1546,9 +1490,9 @@ mod tests {
         assert!(matches!(
             store
                 .reserve_dispatch(
-                    "task_1",
+                    "dispatch_1",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     Some("stable-key"),
                     "fingerprint",
@@ -1559,14 +1503,14 @@ mod tests {
             Reservation::Reserved
         ));
         store
-            .finish_dispatch("task_1", "accepted", &json!({"ok": true}), None)
+            .finish_dispatch("dispatch_1", "accepted", &json!({"ok": true}), None)
             .await?;
         assert!(matches!(
             store
                 .reserve_dispatch(
-                    "task_2",
+                    "dispatch_2",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     Some("stable-key"),
                     "fingerprint",
@@ -1579,9 +1523,9 @@ mod tests {
         assert!(matches!(
             store
                 .reserve_dispatch(
-                    "task_3",
+                    "dispatch_3",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     None,
                     "different",
@@ -1595,7 +1539,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO dispatches
              (id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
-             VALUES ('broadcast_1','manager','order_all','fp','partial',?,1,1)",
+             VALUES ('broadcast_1','manager','dispatch_all','fp','partial',?,1,1)",
         )
         .bind(
             json!({
@@ -1905,7 +1849,7 @@ mod tests {
                 .reserve_dispatch(
                     "t_1",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     Some("stable-key"),
                     "fingerprint",
@@ -1923,7 +1867,7 @@ mod tests {
                 .reserve_dispatch(
                     "t_2",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     Some("stable-key"),
                     "fingerprint",
@@ -1943,7 +1887,7 @@ mod tests {
                 .reserve_dispatch(
                     "t_3",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     Some("stable-key"),
                     "fingerprint",
@@ -1960,7 +1904,7 @@ mod tests {
                 .reserve_dispatch(
                     "t_4",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     Some("stable-key"),
                     "other-fingerprint",
@@ -1990,7 +1934,7 @@ mod tests {
                 .reserve_dispatch(
                     "g_1",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     None,
                     "fingerprint",
@@ -2024,7 +1968,7 @@ mod tests {
                 .reserve_dispatch(
                     "g_2",
                     "manager",
-                    "order",
+                    "dispatch_to",
                     &targets,
                     None,
                     "fingerprint",
@@ -2129,7 +2073,7 @@ mod tests {
             .reserve_dispatch(
                 "o_1",
                 "manager",
-                "order",
+                "dispatch_to",
                 &["developer".to_string()],
                 None,
                 "fingerprint",
@@ -2218,7 +2162,7 @@ mod tests {
         .await?;
         sqlx::query(
             "INSERT INTO dispatches(id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
-             VALUES ('old_d','manager','order','fp','accepted',NULL,?,?)",
+             VALUES ('old_d','manager','dispatch_to','fp','accepted',NULL,?,?)",
         )
         .bind(old)
         .bind(old)
@@ -2235,7 +2179,7 @@ mod tests {
         .await?;
         sqlx::query(
             "INSERT INTO dispatches(id,sender,kind,fingerprint,status,created_ms,updated_ms)
-             VALUES ('stale_p','manager','order','fp','pending',?,?)",
+             VALUES ('stale_p','manager','dispatch_to','fp','pending',?,?)",
         )
         .bind(old)
         .bind(old)
@@ -2243,7 +2187,7 @@ mod tests {
         .await?;
         sqlx::query(
             "INSERT INTO dispatches(id,sender,kind,fingerprint,status,created_ms,updated_ms)
-             VALUES ('fresh_p','manager','order','fp','pending',?,?)",
+             VALUES ('fresh_p','manager','dispatch_to','fp','pending',?,?)",
         )
         .bind(now)
         .bind(now)
@@ -2291,7 +2235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_outbox_orders_by_created_and_honors_limit() -> anyhow::Result<()> {
+    async fn due_outbox_deliveries_are_created_in_order_and_honor_limit() -> anyhow::Result<()> {
         let path = std::env::temp_dir().join(format!(
             "swarm-mcp-due-outbox-test-{}.db",
             Uuid::new_v4().simple()
@@ -2336,7 +2280,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO dispatches
              (id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
-             VALUES ('broadcast_s','manager','order_all','fp','partial',?,2,2)",
+             VALUES ('broadcast_s','manager','dispatch_all','fp','partial',?,2,2)",
         )
         .bind(
             json!({
@@ -2382,66 +2326,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_operations_restores_legacy_report_summary_without_leaking() -> anyhow::Result<()>
-    {
-        let path = std::env::temp_dir().join(format!(
-            "swarm-mcp-report-summary-test-{}.db",
-            Uuid::new_v4().simple()
-        ));
-        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
-        sqlx::query(
-            "INSERT INTO dispatches
-             (id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
-             VALUES ('report_legacy','lead-developer','report','fp','accepted',?,2,2)",
-        )
-        .bind(
-            json!({
-                "ok": true,
-                "task_id": "task_parent",
-                "status": "blocked",
-                "telegram": {"outbox_id": "audit_legacy"}
-            })
-            .to_string(),
-        )
-        .execute(store.pool())
-        .await?;
-        sqlx::query(
-            "INSERT INTO dispatch_targets(dispatch_id,target) VALUES ('report_legacy','manager')",
-        )
-        .execute(store.pool())
-        .await?;
-        sqlx::query(
-            "INSERT INTO telegram_outbox
-             (id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms)
-             VALUES ('audit_legacy','lead-developer','REPORT','manager',?,
-                     'delivered',0,0,2,2)",
-        )
-        .bind("task_parent [blocked]\nExact corrective context and artifact path")
-        .execute(store.pool())
-        .await?;
-
-        let manager_view = store.recent_operations("manager", 10).await?;
-        assert_eq!(
-            manager_view["operations"][0]["result"]["summary"],
-            json!("Exact corrective context and artifact path")
-        );
-        let sender_view = store.recent_operations("lead-developer", 10).await?;
-        assert_eq!(
-            sender_view["operations"][0]["result"]["summary"],
-            json!("Exact corrective context and artifact path")
-        );
-        assert_eq!(
-            store.recent_operations("developer", 10).await?["operations"],
-            json!([]),
-            "an unrelated role must not see the report or its restored body"
-        );
-
-        store.pool.close().await;
-        remove_sqlite_files(&path).await;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn parallel_reservations_share_one_rate_slot() -> anyhow::Result<()> {
         let path = std::env::temp_dir().join(format!(
             "swarm-mcp-parallel-reserve-test-{}.db",
@@ -2453,7 +2337,7 @@ mod tests {
             store.reserve_dispatch(
                 "p_1",
                 "manager",
-                "order",
+                "dispatch_to",
                 &targets,
                 None,
                 "fp",
@@ -2463,7 +2347,7 @@ mod tests {
             store.reserve_dispatch(
                 "p_2",
                 "manager",
-                "order",
+                "dispatch_to",
                 &targets,
                 None,
                 "fp",
@@ -2583,7 +2467,7 @@ mod tests {
             .reserve_dispatch(
                 "ind_1",
                 "manager",
-                "order",
+                "dispatch_to",
                 &["developer".to_string()],
                 None,
                 "fp",
@@ -2621,7 +2505,7 @@ mod tests {
             .reserve_dispatch(
                 "o_t",
                 "manager",
-                "order",
+                "dispatch_to",
                 &["developer".to_string()],
                 None,
                 "fp",

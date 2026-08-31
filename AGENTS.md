@@ -1,7 +1,8 @@
 # swarm-mcp
 
-Authenticated, role-aware MCP communication and authorization plane for the
-Hermes agent swarm. Rust 0.2 (axum + rmcp Streamable HTTP + SQLx/SQLite).
+Authenticated, role-aware MCP transport and wake adapter for the Hermes agent
+swarm. Task identity, assignment, lineage, conversations, status, and reports
+belong exclusively to SLC MCP. Rust (axum + rmcp Streamable HTTP + SQLx/SQLite).
 
 ## Local verification (must be green before pushing)
 
@@ -26,6 +27,8 @@ CI mirrors this in three sequential stages: `tests` → `quality` → `rustsec`
 
 - One bearer token per role; runtime ACL checks in the dispatcher are the source
   of truth (JSON Schema enums are defense in depth, not the check).
+- Treat every `correlation_id` and delivery payload as opaque. Never add task
+  lookup, assignment, status, report, or lineage semantics to this repository.
 - Every mutation: durable reservation → downstream call → durable result.
   Idempotency keys replay `accepted`/`partial`/`indeterminate`; `failed`
   dispatches release the key (retry re-executes).
