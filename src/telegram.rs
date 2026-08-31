@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -458,10 +458,13 @@ impl TelegramGateway {
     }
 
     async fn download_file(&self, file_id: &str) -> anyhow::Result<Vec<u8>> {
+        // Явные таймауты на каждый запрос: клиент гейтвея ограничен
+        // (poll_timeout + 10s), а скачивание вложения может быть дольше.
         let get_url = format!("{}/getFile?file_id={}", self.bot_url, file_id);
         let payload: Value = self
             .client
             .get(&get_url)
+            .timeout(Duration::from_secs(30))
             .send()
             .await?
             .error_for_status()?
@@ -480,6 +483,7 @@ impl TelegramGateway {
         let bytes = self
             .client
             .get(&file_url)
+            .timeout(Duration::from_secs(120))
             .send()
             .await?
             .error_for_status()?
@@ -519,8 +523,10 @@ async fn save_inbound_file(
         .take(80)
         .collect();
     let safe = if safe.trim().is_empty() { "file".to_string() } else { safe };
+    static FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let sequence = FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!(
-        "{}_{safe}",
+        "{}_{sequence}_{safe}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -899,12 +905,24 @@ mod tests {
         bot: MockBot,
         file_bytes: Vec<u8>,
     ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
+        gateway_with_mocks_and_files_hermes(
+            backlog,
+            bot,
+            file_bytes,
+            Arc::new(|_, _| (202, json!({"run_id": "run-1"}))),
+        )
+        .await
+    }
+
+    async fn gateway_with_mocks_and_files_hermes(
+        backlog: TelegramBacklogMode,
+        bot: MockBot,
+        file_bytes: Vec<u8>,
+        hermes_behavior: testutil::MockHermes,
+    ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
         let path = testutil::temp_db_path("telegram-files");
         let telegram_base = spawn_mock_telegram_with_files(bot, file_bytes).await;
-        let hermes_base = testutil::spawn_mock_hermes(Arc::new(|_, _| {
-            (202, json!({"run_id": "run-1"}))
-        }))
-        .await;
+        let hermes_base = testutil::spawn_mock_hermes(hermes_behavior).await;
         let mut config = testutil::fixture_config(&path);
         config.telegram_enabled = true;
         config.telegram_bot_mode = TelegramBotMode::Shared;
@@ -1196,12 +1214,17 @@ mod tests {
             "file_id": "doc1", "file_unique_id": "ud",
             "file_name": "logo.png", "mime_type": "image/png", "file_size": 2048
         });
-        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
         let updates = json!([update]);
-        let (gateway, store, path) = gateway_with_mocks_and_files(
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
             TelegramBacklogMode::Process,
             Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
             b"\x89PNG-fake-bytes".to_vec(),
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
         )
         .await?;
         // Каталог входящих файлов — рядом с тестовой БД; чистим перед
@@ -1222,6 +1245,22 @@ mod tests {
             value["results"]["manager"]["run_id"].as_str().is_some(),
             "простой текст с вложением уходит менеджеру: {value}"
         );
+        // Сам диспатч (тело запроса к Hermes) несёт подпись и пути к файлам.
+        let bodies = hermes_bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].contains("Вот логотип"),
+            "подпись фото передана: {}",
+            bodies[0]
+        );
+        assert!(bodies[0].contains("📎 Вложение:"), "заметки о вложениях: {}", bodies[0]);
+        assert!(bodies[0].contains("logo.png"), "имя документа: {}", bodies[0]);
+        assert!(
+            bodies[0].contains(inbound_dir.to_str().unwrap()),
+            "путь для агента должен указывать на общую папку: {}",
+            bodies[0]
+        );
+        drop(bodies);
         let files = std::fs::read_dir(&inbound_dir)?;
         let mut names = Vec::new();
         for entry in files.flatten() {
@@ -1235,6 +1274,41 @@ mod tests {
         assert!(
             names.iter().any(|n| n.contains("photo_800x400.jpg")),
             "самое крупное фото: {names:?}"
+        );
+        // Содержимое файла совпадает с тем, что отдал Bot API.
+        let saved = std::fs::read(inbound_dir.join(
+            names.iter().find(|n| n.ends_with("logo.png")).unwrap(),
+        ))?;
+        assert_eq!(saved, b"\x89PNG-fake-bytes");
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_file_cleanup_removes_old_attachments() -> anyhow::Result<()> {
+        let update = allowed_update();
+        let updates = json!([update]);
+        let (gateway, _store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.inbound_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        let stale = inbound_dir.join("stale.png");
+        std::fs::write(&stale, b"old")?;
+        // Ставим mtime на 25 часов назад (cleanup — старше суток).
+        let times = std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60),
+        );
+        std::fs::File::open(&stale)?.set_times(times)?;
+        // Обработанное сообщение запускает cleanup входящих файлов.
+        gateway.poll_once().await?;
+        assert!(
+            !stale.exists(),
+            "файл старше суток удалён"
         );
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&inbound_dir);
