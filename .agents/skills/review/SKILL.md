@@ -32,14 +32,22 @@ only if it preserves that boundary and the transport invariants below.
 States: `pending` → `accepted | partial | failed | indeterminate` (recovery path `pending` → `indeterminate`).
 
 - Every tool flow that starts downstream work: validate → `reserve_or_replay` → `start_run` → `finish`/`fail_*`. `finish` persists result + optional Telegram audit atomically (`store.rs::finish_dispatch`). Manager messaging controls do not start downstream work; their state change and queue cancellation must remain one SQLite transaction under the write gate.
+- A definitive Hermes HTTP 429 is the one exception to immediate start: persist
+  the opaque wake in `delivery_outbox`, finish the operation as accepted with
+  `queued=true`, and let the delivery worker retry only the per-recipient FIFO
+  head. The per-role delivery gate must prevent a newer request from overtaking
+  an existing head. Never inspect SLC or derive task order here.
 - Idempotency: same `(sender, kind, idempotency_key)` + fingerprint → replay `Existing`; different fingerprint → `Conflict`; unfinished → `Pending`. A definitively `failed` dispatch releases its key and a retry re-executes; `accepted`, `partial`, and `indeterminate` remain replayable because downstream side effects may exist. Do not change this silently (see REVIEW-PLAN.md).
 - `indeterminate` means "downstream may have accepted" — recovery must never turn it back into `pending`.
 - Broadcasts (`dispatch_all`, `msg_all`, `telegram_inbound`) aggregate per-target results into `accepted/partial/failed/indeterminate`; `partial` results must be durable and replayable.
 
 ## 3. Store & migrations
 
-- `store.rs::migrate` is transactional, uses `PRAGMA user_version` (`SCHEMA_VERSION = 4`), refuses newer schemas, and migrates legacy Python tables (`*_python_legacy`) by rename+import. Any schema change: bump `SCHEMA_VERSION`, add a statement to `SCHEMA` or an idempotent `ALTER`/`has_column` guard, and keep it idempotent for fresh and existing DBs.
-- `role_messaging` is fail-open only for an absent row (the normal pre-control default). Store read errors fail closed in dispatch. Disable/clear must cancel undelivered audits involving the role in either direction; enabling must never revive `cancelled` rows. With `clear_queue=false`, preserved rows must be excluded from due batches while either endpoint is disabled and become eligible only after re-enable.
+- `store.rs::migrate` is transactional, uses `PRAGMA user_version` (`SCHEMA_VERSION = 6`), refuses newer schemas, and migrates legacy Python tables (`*_python_legacy`) by rename+import. Any schema change: bump `SCHEMA_VERSION`, add a statement to `SCHEMA` or an idempotent `ALTER`/`has_column` guard, and keep it idempotent for fresh and existing DBs.
+- `role_messaging` is fail-open only for an absent row (the normal pre-control default). Store read errors fail closed in dispatch. Disable/clear must cancel undelivered Telegram audits and role wakes involving the role in either direction; enabling must never revive `cancelled` rows. With `clear_queue=false`, preserved rows must be excluded from due batches while either endpoint is disabled and become eligible only after re-enable.
+- `delivery_outbox.sequence` is the recipient FIFO order; wall-clock time and
+  UUID lexical order must never choose the head. At most one due head per
+  recipient may be returned in a worker snapshot.
 - Activity ordering: `activity_state` updates only if `excluded.occurred_ms >` current (or equal with higher `event_rank`) — preserves deterministic turn order.
 - `reservation_lock` (global mutex) serializes `reserve_dispatch` for rate-limit + idempotency atomicity — do not remove without replacing the atomicity argument.
 
@@ -62,7 +70,9 @@ States: `pending` → `accepted | partial | failed | indeterminate` (recovery pa
 ## 6. Concurrency, lifecycle & observability
 
 - In-flight dispatches bounded by `Semaphore` (`max_inflight_dispatches`); acquiring the permit has a timeout.
-- Shutdown: `CancellationToken` shared by MCP services, outbox worker, Telegram inbound worker, and cleanup task; `serve()` awaits all workers after cancel.
+- Shutdown: `CancellationToken` shared by MCP services, Telegram outbox worker,
+  role-delivery worker, Telegram inbound worker, and cleanup task; `serve()`
+  awaits all workers after cancel.
 - Logging is structured JSON (`tracing_subscriber`); use `error!`/`warn!`/`info!` with fields, never `println!`/`eprintln!` in the server.
 - Dead code watchlist: `AppState::pool()` is used only by tests.
 

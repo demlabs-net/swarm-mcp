@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{RwLock, Semaphore},
+    sync::{Mutex, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{ApiKind, Config, TelegramBotMode},
-    store::{AuditMessage, MediaPayload, OutboxItem, Reservation, Store},
+    store::{AuditMessage, DeliveryQueueItem, MediaPayload, OutboxItem, Reservation, Store},
 };
 
 #[derive(Clone)]
@@ -28,6 +28,7 @@ pub struct Dispatcher {
     telegram_client: Client,
     inflight: Arc<Semaphore>,
     messaging_gate: Arc<RwLock<()>>,
+    delivery_gates: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 enum RunOutcome {
@@ -45,14 +46,23 @@ enum RunOutcome {
 pub enum DispatchHandle {
     Run(String),
     Initiated,
+    Queued { queue_id: String, position: i64 },
 }
 
 impl DispatchHandle {
-    /// `("run_id", id)` or `("initiated", "true")` for JSON results.
+    /// Primary identifier for JSON results.
     fn key_value(&self) -> (&'static str, String) {
         match self {
             DispatchHandle::Run(run_id) => ("run_id", run_id.clone()),
             DispatchHandle::Initiated => ("initiated", "true".to_string()),
+            DispatchHandle::Queued { queue_id, .. } => ("queue_id", queue_id.clone()),
+        }
+    }
+
+    fn decorate_result(&self, result: &mut Value) {
+        if let DispatchHandle::Queued { position, .. } = self {
+            result["queued"] = json!(true);
+            result["queue_position"] = json!(position);
         }
     }
 }
@@ -171,7 +181,9 @@ impl BroadcastSummary {
             Ok(handle) => {
                 self.succeeded += 1;
                 let (key, value) = handle.key_value();
-                self.results.insert(target, json!({ (key): value }));
+                let mut result = json!({ (key): value });
+                handle.decorate_result(&mut result);
+                self.results.insert(target, result);
             }
             Err(error) => {
                 warn!(%target, error = %error, "{}", self.label);
@@ -315,6 +327,7 @@ impl Dispatcher {
         Ok(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight_dispatches)),
             messaging_gate: Arc::new(RwLock::new(())),
+            delivery_gates: Arc::new(Mutex::new(BTreeMap::new())),
             config,
             store,
             hermes_client,
@@ -402,7 +415,14 @@ impl Dispatcher {
             }
         };
         match self
-            .dispatch_role(&target, &body, &self.config.executor_run_instructions)
+            .dispatch_role_or_queue(
+                &dispatch_id,
+                sender,
+                "dispatch_to",
+                &target,
+                &body,
+                &self.config.executor_run_instructions,
+            )
             .await
         {
             Ok(handle) => {
@@ -415,6 +435,7 @@ impl Dispatcher {
                     "correlation_id": correlation_id,
                 });
                 result[key] = json!(value);
+                handle.decorate_result(&mut result);
                 let audit = self.audit(
                     sender,
                     "DISPATCH",
@@ -500,8 +521,15 @@ impl Dispatcher {
                 &message,
             ) {
                 Ok(message) => {
-                    self.dispatch_role(target, &message, &self.config.executor_run_instructions)
-                        .await
+                    self.dispatch_role_or_queue(
+                        &dispatch_id,
+                        sender,
+                        "dispatch_all",
+                        target,
+                        &message,
+                        &self.config.executor_run_instructions,
+                    )
+                    .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
             };
@@ -606,7 +634,14 @@ impl Dispatcher {
             }
         };
         match self
-            .dispatch_role(&target, &body, &self.config.peer_run_instructions)
+            .dispatch_role_or_queue(
+                &message_id,
+                sender,
+                "msg_to",
+                &target,
+                &body,
+                &self.config.peer_run_instructions,
+            )
             .await
         {
             Ok(handle) => {
@@ -618,6 +653,7 @@ impl Dispatcher {
                     "correlation_id": correlation_id,
                 });
                 result[key] = json!(value);
+                handle.decorate_result(&mut result);
                 let audit = self.audit(
                     sender,
                     "MSG",
@@ -700,8 +736,15 @@ impl Dispatcher {
             );
             let result = match body {
                 Ok(body) => {
-                    self.dispatch_role(target, &body, &self.config.peer_run_instructions)
-                        .await
+                    self.dispatch_role_or_queue(
+                        &message_id,
+                        sender,
+                        "msg_all",
+                        target,
+                        &body,
+                        &self.config.peer_run_instructions,
+                    )
+                    .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
             };
@@ -992,6 +1035,88 @@ impl Dispatcher {
                 }
             }
         })
+    }
+
+    pub fn spawn_delivery_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(dispatcher.config.outbox_poll_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = dispatcher.flush_delivery_queue().await {
+                            error!(error = %error, "role delivery queue flush failed");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn flush_delivery_queue(&self) -> anyhow::Result<()> {
+        for item in self
+            .store
+            .due_deliveries(self.config.outbox_batch_size)
+            .await?
+        {
+            let _messaging_guard = self.messaging_gate.read().await;
+            let role_gate = self.role_delivery_gate(&item.recipient).await;
+            let _role_guard = role_gate.lock().await;
+            if !self.store.delivery_eligible(&item.id).await? {
+                continue;
+            }
+            match self
+                .dispatch_role(&item.recipient, &item.body, &item.instructions)
+                .await
+            {
+                Ok(handle) => {
+                    let run_id = match &handle {
+                        DispatchHandle::Run(run_id) => Some(run_id.as_str()),
+                        DispatchHandle::Initiated => None,
+                        DispatchHandle::Queued { .. } => unreachable!(
+                            "delivery worker uses direct dispatch and cannot recursively queue"
+                        ),
+                    };
+                    self.store.mark_delivery_delivered(&item.id, run_id).await?;
+                    info!(
+                        queue_id = %item.id,
+                        dispatch_id = %item.dispatch_id,
+                        recipient = %item.recipient,
+                        "queued role delivery accepted"
+                    );
+                }
+                Err(error) if error.retry_after_seconds.is_some() => {
+                    let retry_after = error.retry_after_seconds.unwrap_or(1);
+                    let exponent = u32::try_from(item.attempts.clamp(0, 5)).unwrap_or(5);
+                    let backoff = 2_u64.saturating_pow(exponent).clamp(1, 30);
+                    let delay = retry_after.max(backoff).min(60);
+                    self.store
+                        .defer_delivery(&item.id, Duration::from_secs(delay), &error.to_string())
+                        .await?;
+                    debug!(
+                        queue_id = %item.id,
+                        recipient = %item.recipient,
+                        retry_after_seconds = delay,
+                        "role remains busy; delivery stays queued"
+                    );
+                }
+                Err(error) => {
+                    self.store
+                        .mark_delivery_dead(&item.id, &error.to_string())
+                        .await?;
+                    warn!(
+                        queue_id = %item.id,
+                        dispatch_id = %item.dispatch_id,
+                        recipient = %item.recipient,
+                        error = %error,
+                        "queued role delivery requires recovery"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Polls Telegram-dispatched runs and delivers their final answer to the
@@ -1288,6 +1413,106 @@ impl Dispatcher {
                 })?;
         }
         Ok(())
+    }
+
+    /// Attempt immediate delivery, then persist a transport-only FIFO wake on
+    /// a definitive busy response. The queue contains no task authority or
+    /// status; SLC remains the source of truth for whether work is runnable.
+    async fn dispatch_role_or_queue(
+        &self,
+        operation_id: &str,
+        sender: &str,
+        kind: &str,
+        role: &str,
+        message: &str,
+        instructions: &str,
+    ) -> Result<DispatchHandle, RunFailure> {
+        let role_gate = self.role_delivery_gate(role).await;
+        let _role_guard = role_gate.lock().await;
+        if self
+            .store
+            .has_pending_delivery(role)
+            .await
+            .map_err(|error| {
+                RunFailure::rejected(anyhow!(
+                    "cannot inspect the durable delivery queue for {role}: {error}"
+                ))
+            })?
+        {
+            return self
+                .queue_role_delivery(
+                    operation_id,
+                    sender,
+                    kind,
+                    role,
+                    message,
+                    instructions,
+                    Duration::from_secs(1),
+                    "queued behind an earlier recipient delivery",
+                )
+                .await;
+        }
+        match self.dispatch_role(role, message, instructions).await {
+            Ok(handle) => Ok(handle),
+            Err(error) if error.retry_after_seconds.is_some() => {
+                let retry_after_seconds = error.retry_after_seconds.unwrap_or(1);
+                self.queue_role_delivery(
+                    operation_id,
+                    sender,
+                    kind,
+                    role,
+                    message,
+                    instructions,
+                    Duration::from_secs(retry_after_seconds),
+                    &error.to_string(),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn role_delivery_gate(&self, role: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.delivery_gates.lock().await;
+        gates
+            .entry(role.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn queue_role_delivery(
+        &self,
+        operation_id: &str,
+        sender: &str,
+        kind: &str,
+        role: &str,
+        message: &str,
+        instructions: &str,
+        retry_after: Duration,
+        error: &str,
+    ) -> Result<DispatchHandle, RunFailure> {
+        let queue_id = format!("delivery_{operation_id}_{role}");
+        let item = DeliveryQueueItem {
+            id: queue_id.clone(),
+            dispatch_id: operation_id.to_string(),
+            sender: sender.to_string(),
+            kind: kind.to_string(),
+            recipient: role.to_string(),
+            body: message.to_string(),
+            instructions: instructions.to_string(),
+            attempts: 0,
+        };
+        let position = self
+            .store
+            .enqueue_delivery(&item, retry_after, error)
+            .await
+            .map_err(|queue_error| {
+                RunFailure::rejected(anyhow!(
+                    "{role} is busy and durable delivery enqueue failed: {queue_error}"
+                ))
+            })?;
+        Ok(DispatchHandle::Queued { queue_id, position })
     }
 
     /// Dispatch a message to a role: Hermes `api_server` run (current
@@ -2724,6 +2949,91 @@ mod tests {
             .await;
         assert_eq!(third.value["deduplicated"], json!(true));
         assert_eq!(third.value["dispatch_id"], json!(second_id));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_hermes_dispatch_is_accepted_into_durable_fifo() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let behavior: testutil::MockHermes = Arc::new(move |_, _| {
+            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (429, json!({"error": "role busy"}))
+            } else {
+                (202, json!({"run_id": "run-after-busy"}))
+            }
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        let args = DispatchArgs {
+            agent: "developer".to_string(),
+            message: "SLC task task_fifo is ready".to_string(),
+            correlation_id: Some("task_fifo".to_string()),
+            idempotency_key: Some("fifo-wake".to_string()),
+        };
+        let outcome = dispatcher.dispatch_to("manager", args).await;
+        assert!(!outcome.is_error, "busy is queueable: {}", outcome.value);
+        assert_eq!(outcome.value["queued"], json!(true));
+        assert_eq!(outcome.value["queue_position"], json!(1));
+        let queue_id = outcome.value["queue_id"].as_str().unwrap().to_string();
+        let status: String = sqlx::query_scalar("SELECT status FROM delivery_outbox WHERE id=?")
+            .bind(&queue_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "pending");
+
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0 WHERE id=?")
+            .bind(&queue_id)
+            .execute(store.pool())
+            .await?;
+        dispatcher.flush_delivery_queue().await?;
+        let delivered: (String, Option<String>) =
+            sqlx::query_as("SELECT status, run_id FROM delivery_outbox WHERE id=?")
+                .bind(&queue_id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(delivered.1.as_deref(), Some("run-after-busy"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_delivery_queue_exposes_only_one_fifo_head_per_role() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (429, json!({"error": "role busy"}))
+        }))
+        .await?;
+        for index in 1..=2 {
+            let outcome = dispatcher
+                .dispatch_to(
+                    "manager",
+                    DispatchArgs {
+                        agent: "developer".to_string(),
+                        message: format!("wake {index}"),
+                        correlation_id: Some(format!("task_fifo_{index}")),
+                        idempotency_key: Some(format!("fifo-wake-{index}")),
+                    },
+                )
+                .await;
+            assert!(!outcome.is_error);
+            assert_eq!(outcome.value["queue_position"], json!(index));
+        }
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0")
+            .execute(store.pool())
+            .await?;
+        let due = store.due_deliveries(10).await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, "dispatch_to");
+        assert_eq!(due[0].recipient, "developer");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a later wake must queue behind the first without overtaking it"
+        );
         testutil::remove_db_files(&path).await;
         Ok(())
     }

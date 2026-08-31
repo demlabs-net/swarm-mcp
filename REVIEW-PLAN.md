@@ -460,3 +460,27 @@ row claim. The production topology remains a single active Swarm MCP replica.
 Verification: **116 lib + 5 bin tests**; `fmt` ✅; `clippy -D warnings` ✅;
 release build ✅; line coverage **93.67%** (CI gate 90%) ✅; RustSec audit of
 272 locked dependencies (**0 vulnerabilities**) ✅.
+
+---
+
+# Iteration 12 (2026-09-01) — busy-recipient transport FIFO
+
+Scope: preserve one writer per Hermes profile while accepting wakes that arrive
+during its active run. Task readiness and FIFO ownership stay in SLC; Swarm
+stores opaque delivery retries only.
+
+- Schema v6 adds `delivery_outbox` with a monotonic sequence and
+  pending/delivered/dead/cancelled transport states.
+- Per-recipient gates and due-head queries prevent overtaking; a caller sees
+  `queued=true` as a durable accepted result instead of retrying HTTP 429.
+- Circuit-breaker controls cover the new outbox in both directions and preserve
+  held rows when `clear_queue=false`.
+- A cancellable delivery worker is started and awaited with the existing
+  server workers.
+- Regression coverage exercises busy acceptance, FIFO head isolation,
+  no-overtake behavior, delivery completion, circuit-breaker cancellation, and
+  pause/resume. Suite: **140 lib + 5 bin tests**.
+
+Remaining accepted limit: downstream acceptance cannot be exactly-once across
+a process/database failure until Hermes supports an idempotency key on
+`POST /v1/runs`.

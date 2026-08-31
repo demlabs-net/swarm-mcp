@@ -44,7 +44,7 @@ impl RoleMcp {
         if !targets.is_empty() {
             tools.push(tool(
                 "dispatch_to",
-                "Deliver a transport message to one authorized role. This does not create, own, mutate, or validate a task; create the task/event in SLC MCP first and pass its returned content-free delivery envelope when a wake is needed.",
+                "Deliver a transport message to one authorized role. This does not create, own, mutate, queue, or validate a task; SLC MCP owns the task FIFO. If the role's single-writer Hermes slot is busy, Swarm accepts this content-free wake into its durable transport FIFO and delivers it later.",
                 object_schema(
                     &json!({
                         "recipient": {
@@ -87,7 +87,7 @@ impl RoleMcp {
             let agents = config.agent_roles.clone();
             tools.push(control_tool(
                 "messaging_disable",
-                "Immediately block an executor from sending or receiving Swarm transport and optionally cancel undelivered Telegram audits involving it.",
+                "Immediately block an executor from sending or receiving Swarm transport and optionally cancel undelivered role wakes and Telegram audits involving it.",
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": agents},
@@ -95,7 +95,7 @@ impl RoleMcp {
                         "clear_queue": {
                             "type": "boolean",
                             "default": true,
-                            "description": "Cancel pending and dead Telegram audit items sent by or addressed to this role."
+                            "description": "Cancel pending/dead role deliveries and Telegram audit items sent by or addressed to this role."
                         }
                     }),
                     &["agent"],
@@ -126,7 +126,7 @@ impl RoleMcp {
             ));
             tools.push(control_tool(
                 "messaging_clear_queue",
-                "Cancel undelivered Telegram audit items sent by or addressed to one executor without deleting delivered audit history.",
+                "Cancel undelivered role wakes and Telegram audit items sent by or addressed to one executor without deleting delivered history.",
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": config.agent_roles},
@@ -151,7 +151,7 @@ impl RoleMcp {
         if !peers.is_empty() {
             tools.push(tool(
                 "msg_to",
-                "Deliver a direct wake to another role. Swarm stores delivery metadata only; for task communication pass the content-free delivery envelope returned by SLC MCP.",
+                "Deliver a direct wake to another role. Swarm stores transport metadata only and durably queues the wake if that role is busy; for task communication pass only a runnable content-free delivery envelope returned by SLC MCP.",
                 object_schema(
                     &json!({
                         "recipient": {"type": "string", "enum": peers},
@@ -302,6 +302,8 @@ impl RoleMcp {
             },
             "safeguards": {
                 "durable_operations": true,
+                "busy_recipient_delivery_fifo": true,
+                "delivery_fifo_scope": "recipient",
                 "idempotency_keys": true,
                 "rate_limit": config.rate_limit,
                 "rate_window_seconds": config.rate_window.as_secs(),
@@ -344,13 +346,13 @@ impl RoleMcp {
         }
         pieces.push(
             format!(
-                "Swarm MCP is transport only. Create and mutate tasks, statuses, task reports, lineage, and task messages in SLC MCP. Then use dispatch_to/msg_to only when an immediate wake or delivery is needed and pass the SLC id as opaque correlation_id. Use a unique, stable idempotency_key for delivery retries; never recycle it for another logical delivery. A definitively failed delivery releases its key, while accepted, partial, and indeterminate results replay. Content-identical deliveries are suppressed for {} seconds. Delivery records are retained for {} days; read swarm://operations before retrying.",
+                "Swarm MCP is transport only. SLC MCP owns task FIFO position, readiness, status, lineage, reports, and task messages. Call dispatch_to/msg_to only for an SLC envelope with wake_recommended=true and pass its task id as opaque correlation_id. A busy Hermes profile (HTTP 429 from max_concurrent_runs) is accepted into a durable per-recipient transport FIFO; queued=true is success, so do not retry or create another task. Use one stable idempotency_key per logical delivery. Content-identical deliveries are suppressed for {} seconds. Delivery records are retained for {} days; read swarm://operations for queued/delivered/dead transport state.",
                 config.duplicate_window.as_secs(), config.operation_retention_days
             )
         );
         if self.role == config.manager_role {
             pieces.push(format!(
-                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered Telegram audits sent by or addressed to that executor. A delivery rejected by this breaker is a terminal stop condition for the current run: do not call messaging_enable merely to make delivery succeed. Re-enable only in a later turn after an explicit human resume request, verified remediation, a fresh swarm://messaging read, and the {}-second cooldown. messaging_enable never replays cancelled items.",
+                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered role wakes and Telegram audits sent by or addressed to that executor. A delivery rejected by this breaker is a terminal stop condition for the current run: do not call messaging_enable merely to make delivery succeed. Re-enable only in a later turn after an explicit human resume request, verified remediation, a fresh swarm://messaging read, and the {}-second cooldown. messaging_enable never replays cancelled items.",
                 config.messaging_reenable_cooldown.as_secs()
             ));
         }
@@ -743,10 +745,14 @@ mod tests {
             json!(false)
         );
         assert_eq!(
+            hierarchy["safeguards"]["busy_recipient_delivery_fifo"],
+            json!(true)
+        );
+        assert_eq!(
             hierarchy["tools"],
             json!(["dispatch_to", "msg_all", "msg_to", "telegram_reply"])
         );
-        assert!(mcp.instructions().contains("releases its key"));
+        assert!(mcp.instructions().contains("queued=true is success"));
         testutil::remove_db_files(&path).await;
         Ok(())
     }

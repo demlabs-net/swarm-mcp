@@ -32,12 +32,18 @@ CI mirrors this in three sequential stages: `tests` → `quality` → `rustsec`
 - Every mutation: durable reservation → downstream call → durable result.
   Idempotency keys replay `accepted`/`partial`/`indeterminate`; `failed`
   dispatches release the key (retry re-executes).
-- Telegram outbox is at-least-once; chunked at `SWARM_TELEGRAM_MESSAGE_LIMIT`.
+- A definitive Hermes busy response is not a task failure: the opaque wake is
+  persisted in the per-recipient `delivery_outbox`, later deliveries cannot
+  overtake its head, and the tool result is durably `accepted` with
+  `queued=true`. Task readiness/order remains exclusively in SLC.
+- Telegram and busy-recipient delivery outboxes are at-least-once;
+  Telegram is chunked at `SWARM_TELEGRAM_MESSAGE_LIMIT`.
 - No panics in request paths; `Secret` Debug stays redacted; bot tokens never
   reach logs (reqwest errors are mapped away).
 - The DB is SQLite (WAL). Do not add a second engine unless it is feature-gated
   and optional — the SQL is deliberately sqlite-specific.
-- Keep README.md / REVIEW.md / REVIEW-PLAN.md in sync with behavior.
+- Keep README.md / REVIEW.md / REVIEW-PLAN.md and the local review/testing
+  skills in sync with behavior.
 
 ## Ops
 

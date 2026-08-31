@@ -235,3 +235,25 @@ and multiple active server replicas require a distributed outbox claim.
 - Activity reads and probes never start an agent or send Telegram.
 - `/ready` fails when SQLite is unavailable.
 - The service runs as non-root with a read-only root filesystem.
+
+## Transport FIFO review (2026-09-01, v0.6.0)
+
+Hermes correctly keeps `max_concurrent_runs=1` per role profile, but a second
+wake previously surfaced that protection as a caller-visible HTTP 429. Version
+0.6.0 keeps task ordering in SLC and adds only a transport retry boundary:
+
+- a definitive Hermes 429 persists the opaque wake in SQLite and finishes the
+  original transport operation as accepted with `queued=true`;
+- one integer sequence orders each recipient FIFO, and an in-process
+  per-recipient gate prevents newer calls from overtaking an existing head;
+- the worker retries only one head per recipient, honors `Retry-After`, and
+  records `delivered` or `dead` without interpreting correlation IDs;
+- messaging disable/clear pauses or cancels both Telegram audits and queued
+  wakes, with eligibility rechecked under the messaging gate;
+- shutdown awaits the new worker, and `swarm://operations`/`messaging` expose
+  transport status without payload bodies or task state.
+
+Accepted limitation: like the existing Telegram outbox, a process/SQLite
+failure after downstream acceptance but before the delivered update can repeat
+the last wake. True exactly-once delivery still requires Hermes-side
+idempotency. The single-active-Swarm-MCP topology remains mandatory.

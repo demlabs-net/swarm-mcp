@@ -40,6 +40,15 @@ in SLC MCP.
 task lineage lookup, status transition, or terminal-report wake policy in this
 service.
 
+When a Hermes destination returns HTTP 429 because its single-writer run slot
+is occupied, the delivery is accepted into a durable per-recipient transport
+FIFO. The tool returns `queued=true`, a `queue_id`, and `queue_position`; this
+is a successful transport outcome and must not be retried. Later deliveries to
+that recipient join the FIFO without attempting to overtake its head. A worker
+retries the head after `Retry-After` and records `delivered` or `dead` state in
+`swarm://operations`. This queue contains wake payloads only and never decides
+task readiness or order; that remains SLC's responsibility.
+
 Single-recipient tools accept `recipient`, `correlation_id`, `idempotency_key`,
 and `message`, so the content-free four-field `delivery` object returned by SLC
 workflow calls can be passed directly. Unknown future envelope metadata is
@@ -71,7 +80,7 @@ from SLC rather than treating the transport payload as authoritative.
 ## Delivery and persistence
 
 SQLite stores only transport concerns: reservations, idempotency, rate limits,
-delivery targets/results, Telegram outbox state, circuit breakers, inbound
+delivery targets/results, busy-recipient wake outbox, Telegram outbox state, circuit breakers, inbound
 offsets, and passive runtime activity. It does not store task issuer,
 assignee, status, report body, or lineage.
 
@@ -81,8 +90,8 @@ replay; definitive failures release the key for a real retry. A separate
 content-duplicate window suppresses accidental repeated delivery.
 
 Messaging circuit breakers block both directions through this adapter and can
-hold or cancel undelivered Telegram audit records. They do not pause or mutate
-the corresponding SLC task.
+hold or cancel undelivered role wakes and Telegram audit records. They do not
+pause or mutate the corresponding SLC task.
 
 ## Shared Telegram gateway
 

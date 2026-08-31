@@ -111,6 +111,9 @@ async fn serve_with_shutdown(
     let outbox = state
         .dispatcher
         .spawn_outbox_worker(cancellation.child_token());
+    let delivery_queue = state
+        .dispatcher
+        .spawn_delivery_worker(cancellation.child_token());
     let run_replies = state
         .dispatcher
         .spawn_run_reply_worker(cancellation.child_token());
@@ -154,6 +157,7 @@ async fn serve_with_shutdown(
         .await;
     cancellation.cancel();
     let _ = outbox.await;
+    let _ = delivery_queue.await;
     let _ = run_replies.await;
     if let Some(worker) = telegram_inbound {
         let _ = worker.await;

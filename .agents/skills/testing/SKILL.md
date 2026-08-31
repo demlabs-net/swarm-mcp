@@ -5,7 +5,9 @@ description: How to write tests for the swarm-mcp Rust codebase. Use when adding
 
 # Testing swarm-mcp
 
-Tests live in `#[cfg(test)] mod tests` inside each module. `Cargo.toml` has no `[dev-dependencies]` — the main dependencies already provide what is needed (`tokio` macros, `sqlx`, `uuid`, `serde_json`). All tests must run offline.
+Tests live in `#[cfg(test)] mod tests` inside each module. The main dependencies
+provide most fixtures (`tokio`, `sqlx`, `uuid`, `serde_json`); `tower` is the
+small router-test dev dependency. All tests must run offline.
 
 ## Patterns by module
 
@@ -18,6 +20,11 @@ Tests live in `#[cfg(test)] mod tests` inside each module. `Cargo.toml` has no `
 
 Coverage gaps to fill (as of REVIEW-PLAN.md): `activity_snapshot` visibility filtering, `cleanup` retention, `recover_stale_pending`, `mark_outbox_failed` backoff/dead transition, `due_outbox` ordering, `finish_dispatch` audit insertion, `recent_operations` sender view.
 
+For `delivery_outbox`, assert insertion order through its integer `sequence`,
+only one due FIFO head per recipient, pause/resume under
+`clear_queue=false`, cancellation in both directions, and no direct Hermes
+call for a later delivery while an earlier head is pending.
+
 ### dispatch.rs
 - Pure functions are directly testable: `render_template`, `render_order_template`, `validate_identifier`/`validate_idempotency`, `telegram_chunks`, `fingerprint`, `parse_arguments` (bad/extra/unknown fields → `ToolOutcome` error), `telegram_chunks` unicode boundaries.
 - Tool flows (`dispatch_to`, `msg_to`, `telegram_inbound`, broadcasts) call
@@ -29,6 +36,9 @@ Coverage gaps to fill (as of REVIEW-PLAN.md): `activity_snapshot` visibility fil
   executor can wake its SLC task issuer (including the manager) without a
   Swarm-side task lookup.
 - `TelegramFailure`/`RunFailure` status classification (rejected vs indeterminate) is unit-testable via the store + mock server.
+- Busy-Hermes tests return 429 once, assert the tool returns accepted
+  `queued=true`, then flush the worker into a 202 response. A second wake for
+  the same recipient must join the queue without another mock-server call.
 
 Mock Hermes server sketch:
 ```rust
@@ -71,4 +81,6 @@ struct literals — tests must construct valid states themselves.
 
 ## CI
 
-`cargo test --locked --all-targets` runs the whole suite (17 tests as of REVIEW-PLAN.md). Keep runtime of the suite under a few seconds; store tests are already fast because they use a real temp SQLite file, not in-memory pools.
+`cargo test --locked --all-targets` currently runs 145 tests. Keep runtime of
+the suite under a few seconds after compilation; store tests use real temporary
+SQLite files and loopback mock servers only.
