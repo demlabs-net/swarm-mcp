@@ -29,7 +29,7 @@ in SLC MCP.
 
 | Caller | Transport tools |
 |---|---|
-| Any role | `msg_to`, `msg_all`, `telegram_reply` |
+| Any role | `msg_to`, `msg_all`, `cancel_delivery`, `telegram_reply` |
 | Role with delivery targets | `dispatch_to` |
 | Global transport authority | `dispatch_all` |
 | Manager | messaging circuit-breaker controls |
@@ -50,6 +50,13 @@ retries the head after `Retry-After` and records `delivered` or `dead` state in
 including due time and FIFO-head ownership. This queue contains opaque
 transport payloads only and never decides task readiness or order; that remains
 SLC's responsibility.
+
+If an undelivered wake becomes obsolete, its original sender or the manager can
+call `cancel_delivery` with the exact `queue_id`. Cancellation is linearized
+against the delivery worker, advances only that recipient's transport FIFO,
+and rejects an item that already started a Hermes run. It never accepts a task
+ID or changes SLC state; broad role queue clearing remains an emergency circuit
+operation, not ordinary scheduling.
 
 Single-recipient tools accept `recipient`, `correlation_id`, `idempotency_key`,
 and `message`, so the content-free four-field `delivery` object returned by SLC

@@ -256,7 +256,7 @@ async fn read_json_resource(
 }
 
 fn expected_tools(config: &Config, role: &str) -> BTreeSet<String> {
-    let mut tools = BTreeSet::new();
+    let mut tools = BTreeSet::from(["cancel_delivery".to_string()]);
     if config
         .dispatch_acl
         .get(role)
@@ -332,6 +332,7 @@ mod tests {
         assert_eq!(
             expected_tools(&config, "manager"),
             BTreeSet::from([
+                "cancel_delivery".to_string(),
                 "messaging_clear_queue".to_string(),
                 "messaging_disable".to_string(),
                 "messaging_enable".to_string(),
@@ -355,6 +356,7 @@ mod tests {
         assert_eq!(
             expected_tools(&config, "lead-developer"),
             BTreeSet::from([
+                "cancel_delivery".to_string(),
                 "msg_all".to_string(),
                 "msg_to".to_string(),
                 "dispatch_to".to_string(),
@@ -371,6 +373,7 @@ mod tests {
         assert_eq!(
             expected_tools(&config, "developer"),
             BTreeSet::from([
+                "cancel_delivery".to_string(),
                 "msg_all".to_string(),
                 "msg_to".to_string(),
                 "telegram_reply".to_string()

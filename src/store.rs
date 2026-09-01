@@ -861,6 +861,108 @@ impl Store {
         Ok(pending > 0)
     }
 
+    /// Cancel one undelivered transport item without touching any task state.
+    /// The original sender owns its queue item; the configured manager may
+    /// perform incident recovery across roles.  Delivery and cancellation are
+    /// serialized by the dispatcher's messaging gate before this transaction.
+    pub async fn cancel_delivery(
+        &self,
+        id: &str,
+        actor: &str,
+        manager_role: &str,
+        reason: &str,
+    ) -> anyhow::Result<Value> {
+        let now = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"SELECT dispatch_id, sender, recipient, status
+               FROM delivery_outbox WHERE id=?"#,
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("delivery queue item not found"))?;
+        let dispatch_id: String = row.get("dispatch_id");
+        let sender: String = row.get("sender");
+        let recipient: String = row.get("recipient");
+        let previous_status: String = row.get("status");
+        ensure!(
+            actor == sender || actor == manager_role,
+            "only the original sender or swarm manager can cancel this delivery"
+        );
+
+        let already_cancelled = previous_status == "cancelled";
+        if !already_cancelled {
+            ensure!(
+                matches!(previous_status.as_str(), "pending" | "dead"),
+                "delivery is {previous_status} and can no longer be cancelled"
+            );
+            let cancellation = format!(
+                "cancelled by {actor} at {}: {reason}",
+                millis_to_rfc3339(now)
+            );
+            let updated = sqlx::query(
+                r#"UPDATE delivery_outbox
+                   SET status='cancelled', last_error=?
+                   WHERE id=? AND status IN ('pending','dead')"#,
+            )
+            .bind(cancellation)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            ensure!(
+                updated == 1,
+                "delivery changed while cancellation was applied"
+            );
+        }
+
+        let next = sqlx::query(
+            r#"SELECT id FROM delivery_outbox
+               WHERE recipient=? AND status='pending'
+               ORDER BY sequence LIMIT 1"#,
+        )
+        .bind(&recipient)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let next_queue_id = next.as_ref().map(|row| row.get::<String, _>("id"));
+        if let Some(next_queue_id) = next_queue_id.as_deref() {
+            // Removing a FIFO head is an explicit scheduling change. Make the
+            // next item immediately eligible; a still-busy Hermes role will
+            // return 429 and be deferred through the normal bounded backoff.
+            sqlx::query(
+                "UPDATE delivery_outbox SET next_attempt_ms=? WHERE id=? AND next_attempt_ms>?",
+            )
+            .bind(now)
+            .bind(next_queue_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let remaining_pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE recipient=? AND status='pending'",
+        )
+        .bind(&recipient)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(json!({
+            "ok": true,
+            "queue_id": id,
+            "dispatch_id": dispatch_id,
+            "sender": sender,
+            "recipient": recipient,
+            "previous_status": previous_status,
+            "status": "cancelled",
+            "already_cancelled": already_cancelled,
+            "cancelled_by": actor,
+            "cancelled_at": millis_to_rfc3339(now),
+            "next_queue_id": next_queue_id,
+            "remaining_pending": remaining_pending,
+        }))
+    }
+
     /// At most one due FIFO head is returned for each recipient. A role-level
     /// Hermes `max_concurrent_runs=1` remains the final single-writer guard.
     pub async fn due_deliveries(&self, limit: i64) -> anyhow::Result<Vec<DeliveryQueueItem>> {

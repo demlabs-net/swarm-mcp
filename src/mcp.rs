@@ -16,9 +16,9 @@ use crate::{
     AppState,
     config::TelegramBotMode,
     dispatch::{
-        BroadcastArgs, ClearMessageQueueArgs, DisableMessagingArgs, DispatchArgs,
-        EnableMessagingArgs, MessageAllArgs, MessageArgs, TelegramReplyArgs, ToolOutcome,
-        parse_arguments, render_template,
+        BroadcastArgs, CancelDeliveryArgs, ClearMessageQueueArgs, DisableMessagingArgs,
+        DispatchArgs, EnableMessagingArgs, MessageAllArgs, MessageArgs, TelegramReplyArgs,
+        ToolOutcome, parse_arguments, render_template,
     },
 };
 
@@ -36,6 +36,27 @@ impl RoleMcp {
     fn tools(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
         let config = &self.state.config;
+        tools.push(tool(
+            "cancel_delivery",
+            "Cancel one pending/dead Swarm transport FIFO item by queue_id. This never cancels or mutates an SLC task. Only the original sender or swarm manager may cancel; a delivered item is immutable.",
+            object_schema(
+                &json!({
+                    "queue_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 160,
+                        "description": "Exact Swarm queue_id returned by a queued delivery or read from swarm://operations."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": "Why this undelivered transport wake is no longer eligible."
+                    }
+                }),
+                &["queue_id", "reason"],
+            ),
+        ));
         let targets = config
             .dispatch_acl
             .get(&self.role)
@@ -346,7 +367,7 @@ impl RoleMcp {
         }
         pieces.push(
             format!(
-                "Swarm MCP is transport only. SLC MCP owns task FIFO position, readiness, status, lineage, reports, and task messages. Call dispatch_to/msg_to only for an SLC envelope with wake_recommended=true and pass its task id as opaque correlation_id. A busy Hermes profile (HTTP 429 from max_concurrent_runs) is accepted into a durable per-recipient transport FIFO; queued=true is success, so do not retry or create another task. Use one stable idempotency_key per logical delivery. Content-identical deliveries are suppressed for {} seconds. Delivery records are retained for {} days; read swarm://operations for queued/delivered/dead transport state.",
+                "Swarm MCP is transport only. SLC MCP owns task FIFO position, readiness, status, lineage, reports, and task messages. Call dispatch_to/msg_to only for an SLC envelope with wake_recommended=true and pass its task id as opaque correlation_id; never send readiness, availability, preflight, or status probes because each delivery starts a real run. A busy Hermes profile (HTTP 429 from max_concurrent_runs) is accepted into a durable per-recipient transport FIFO; queued=true is success, so do not retry or create another task. If an undelivered wake becomes obsolete, its original sender (or the manager) may cancel only its exact queue_id with cancel_delivery; this never changes the SLC task. Use one stable idempotency_key per logical delivery. Content-identical deliveries are suppressed for {} seconds. Delivery records are retained for {} days; read swarm://operations for queued/delivered/dead/cancelled transport state.",
                 config.duplicate_window.as_secs(), config.operation_retention_days
             )
         );
@@ -400,6 +421,15 @@ impl ServerHandler for RoleMcp {
             ));
         }
         let outcome = match request.name.as_ref() {
+            "cancel_delivery" => match parse_arguments::<CancelDeliveryArgs>(request.arguments) {
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .cancel_delivery(&self.role, args)
+                        .await
+                }
+                Err(outcome) => outcome,
+            },
             "dispatch_to" => match parse_arguments::<DispatchArgs>(request.arguments) {
                 Ok(args) => self.state.dispatcher.dispatch_to(&self.role, args).await,
                 Err(outcome) => outcome,
@@ -662,6 +692,7 @@ mod tests {
         assert_eq!(
             tool_names(&mcp),
             vec![
+                "cancel_delivery",
                 "dispatch_all",
                 "dispatch_to",
                 "messaging_clear_queue",
@@ -706,7 +737,7 @@ mod tests {
         let (mcp, path) = role_mcp("developer").await?;
         assert_eq!(
             tool_names(&mcp),
-            vec!["msg_all", "msg_to", "telegram_reply"]
+            vec!["cancel_delivery", "msg_all", "msg_to", "telegram_reply"]
         );
         let resources = resource_uris(&mcp);
         assert!(!resources.contains(&"swarm://executors".to_string()));
@@ -720,7 +751,13 @@ mod tests {
         let (mcp, path) = role_mcp("lead-developer").await?;
         assert_eq!(
             tool_names(&mcp),
-            vec!["dispatch_to", "msg_all", "msg_to", "telegram_reply"]
+            vec![
+                "cancel_delivery",
+                "dispatch_to",
+                "msg_all",
+                "msg_to",
+                "telegram_reply"
+            ]
         );
         let resources = resource_uris(&mcp);
         assert!(resources.contains(&"swarm://activity".to_string()));
@@ -750,7 +787,13 @@ mod tests {
         );
         assert_eq!(
             hierarchy["tools"],
-            json!(["dispatch_to", "msg_all", "msg_to", "telegram_reply"])
+            json!([
+                "cancel_delivery",
+                "dispatch_to",
+                "msg_all",
+                "msg_to",
+                "telegram_reply"
+            ])
         );
         assert!(mcp.instructions().contains("queued=true is success"));
         testutil::remove_db_files(&path).await;
@@ -876,6 +919,7 @@ mod tests {
         assert_eq!(
             value["tools"],
             json!([
+                "cancel_delivery",
                 "dispatch_all",
                 "dispatch_to",
                 "messaging_clear_queue",

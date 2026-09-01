@@ -256,6 +256,12 @@ pub struct MessageAllArgs {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CancelDeliveryArgs {
+    pub queue_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DisableMessagingArgs {
     pub agent: String,
     #[serde(default)]
@@ -457,6 +463,38 @@ impl Dispatcher {
                 )
                 .await
             }
+        }
+    }
+
+    /// Cancel one queued transport wake. This deliberately accepts only the
+    /// Swarm queue id and never interprets an SLC task/correlation id.
+    pub async fn cancel_delivery(&self, sender: &str, args: CancelDeliveryArgs) -> ToolOutcome {
+        let queue_id = match validate_identifier(&args.queue_id, "queue_id") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        let reason = match Self::clean_control_reason(&args.reason) {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        // The delivery worker takes the read side before selecting and
+        // dispatching an item. The write side makes cancellation linearizable:
+        // it either wins before POST /v1/runs or observes a delivered item.
+        let _messaging_guard = self.messaging_gate.write().await;
+        match self
+            .store
+            .cancel_delivery(&queue_id, sender, &self.config.manager_role, &reason)
+            .await
+        {
+            Ok(value) => ToolOutcome {
+                value,
+                is_error: false,
+            },
+            Err(error) => tool_error(json!({
+                "ok": false,
+                "queue_id": queue_id,
+                "error": error.to_string(),
+            })),
         }
     }
 
@@ -3034,6 +3072,154 @@ mod tests {
             1,
             "a later wake must queue behind the first without overtaking it"
         );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_delivery_can_be_cancelled_without_touching_later_fifo_work()
+    -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
+            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (429, json!({"error": "role busy"}))
+            } else {
+                (202, json!({"run_id": "run-valid-tail"}))
+            }
+        }))
+        .await?;
+        let first = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "obsolete wake".to_string(),
+                    correlation_id: Some("obsolete_slc_item".to_string()),
+                    idempotency_key: Some("obsolete-wake".to_string()),
+                },
+            )
+            .await;
+        let second = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "valid wake".to_string(),
+                    correlation_id: Some("valid_slc_item".to_string()),
+                    idempotency_key: Some("valid-wake".to_string()),
+                },
+            )
+            .await;
+        let first_id = first.value["queue_id"].as_str().unwrap().to_string();
+        let second_id = second.value["queue_id"].as_str().unwrap().to_string();
+        assert_eq!(second.value["queue_position"], json!(2));
+
+        let unauthorized = dispatcher
+            .cancel_delivery(
+                "developer",
+                CancelDeliveryArgs {
+                    queue_id: first_id.clone(),
+                    reason: "recipient cannot discard inbound work".to_string(),
+                },
+            )
+            .await;
+        assert!(unauthorized.is_error);
+        assert!(
+            unauthorized.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("original sender or swarm manager")
+        );
+
+        let cancelled = dispatcher
+            .cancel_delivery(
+                "manager",
+                CancelDeliveryArgs {
+                    queue_id: first_id.clone(),
+                    reason: "canonical SLC work was cancelled before execution".to_string(),
+                },
+            )
+            .await;
+        assert!(!cancelled.is_error, "{}", cancelled.value);
+        assert_eq!(cancelled.value["status"], json!("cancelled"));
+        assert_eq!(cancelled.value["next_queue_id"], json!(second_id));
+        assert_eq!(cancelled.value["remaining_pending"], json!(1));
+
+        let replay = dispatcher
+            .cancel_delivery(
+                "manager",
+                CancelDeliveryArgs {
+                    queue_id: first_id,
+                    reason: "idempotent operator retry".to_string(),
+                },
+            )
+            .await;
+        assert!(!replay.is_error);
+        assert_eq!(replay.value["already_cancelled"], json!(true));
+
+        let due = store.due_deliveries(10).await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, second_id);
+        dispatcher.flush_delivery_queue().await?;
+        let delivered: (String, Option<String>) =
+            sqlx::query_as("SELECT status, run_id FROM delivery_outbox WHERE id=?")
+                .bind(&second_id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(delivered.1.as_deref(), Some("run-valid-tail"));
+
+        let too_late = dispatcher
+            .cancel_delivery(
+                "manager",
+                CancelDeliveryArgs {
+                    queue_id: second_id,
+                    reason: "cannot retract an accepted Hermes run".to_string(),
+                },
+            )
+            .await;
+        assert!(too_late.is_error);
+        assert!(
+            too_late.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("can no longer be cancelled")
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_manager_sender_can_cancel_only_its_own_queued_delivery() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (429, json!({"error": "role busy"})))).await?;
+        let queued = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "manager".to_string(),
+                    message: "eligible SLC wake".to_string(),
+                    correlation_id: Some("sender_owned_item".to_string()),
+                    idempotency_key: Some("sender-owned-wake".to_string()),
+                },
+            )
+            .await;
+        assert!(!queued.is_error);
+        let queue_id = queued.value["queue_id"].as_str().unwrap().to_string();
+
+        let cancelled = dispatcher
+            .cancel_delivery(
+                "developer",
+                CancelDeliveryArgs {
+                    queue_id,
+                    reason: "the originating SLC event is no longer runnable".to_string(),
+                },
+            )
+            .await;
+        assert!(!cancelled.is_error, "{}", cancelled.value);
+        assert_eq!(cancelled.value["sender"], json!("developer"));
+        assert_eq!(cancelled.value["status"], json!("cancelled"));
         testutil::remove_db_files(&path).await;
         Ok(())
     }

@@ -267,3 +267,23 @@ Accepted limitation: like the existing Telegram outbox, a process/SQLite
 failure after downstream acceptance but before the delivered update can repeat
 the last wake. True exactly-once delivery still requires Hermes-side
 idempotency. The single-active-Swarm-MCP topology remains mandatory.
+
+## Per-item transport cancellation review (2026-09-01, v0.6.2)
+
+Live review exposed two gaps around the FIFO without moving any task semantics
+back into Swarm:
+
+- a sender could use a readiness/preflight `msg_to`, which starts a real Hermes
+  run before the SLC task exists and consumes the role's only run slot;
+- cancelling a queued/ready SLC task could leave its already-enqueued opaque
+  wake ahead of valid transport work, while the only existing cleanup control
+  cancelled every item for the role.
+
+Version 0.6.2 adds sender/manager-authorized `cancel_delivery(queue_id,
+reason)`. The operation is serialized against the delivery worker, accepts
+only pending/dead transport rows, is idempotent for an already-cancelled row,
+rejects a delivery that already started a Hermes run, and makes only the next
+item for that recipient immediately eligible. It never accepts a task ID,
+looks up SLC, or changes task readiness/status. Tool instructions and
+source-controlled role guidance now prohibit transport-based readiness,
+availability, preflight, and status probes.
