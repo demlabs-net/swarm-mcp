@@ -1555,10 +1555,22 @@ impl Store {
             .bind(now.saturating_sub(rate_window_ms))
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM dispatches WHERE status != 'pending' AND updated_ms < ?")
-            .bind(now.saturating_sub(operation_retention_days.saturating_mul(86_400_000)))
-            .execute(&self.pool)
-            .await?;
+        // `delivery_outbox` rows reference their originating dispatch with
+        // ON DELETE CASCADE. A role may legitimately remain disabled or
+        // unavailable longer than operation retention, so never age out the
+        // parent while an opaque wake is still pending; doing so would
+        // silently drop accepted FIFO work.
+        sqlx::query(
+            r#"DELETE FROM dispatches
+               WHERE status != 'pending' AND updated_ms < ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM delivery_outbox q
+                   WHERE q.dispatch_id = dispatches.id AND q.status = 'pending'
+                 )"#,
+        )
+        .bind(now.saturating_sub(operation_retention_days.saturating_mul(86_400_000)))
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "DELETE FROM telegram_outbox WHERE status IN ('delivered','dead','cancelled') AND created_ms < ?",
         )
@@ -2841,6 +2853,23 @@ mod tests {
         .execute(store.pool())
         .await?;
         sqlx::query(
+            "INSERT INTO dispatches(id,sender,kind,fingerprint,status,result_json,created_ms,updated_ms)
+             VALUES ('old_queued_d','manager','dispatch_to','queued-fp','accepted',NULL,?,?)",
+        )
+        .bind(old)
+        .bind(old)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO delivery_outbox
+             (id,dispatch_id,sender,kind,recipient,body,instructions,status,attempts,next_attempt_ms,last_error,created_ms)
+             VALUES ('old_pending_delivery','old_queued_d','manager','dispatch_to','developer','wake','read SLC','pending',0,?,'role disabled',?)",
+        )
+        .bind(old)
+        .bind(old)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
             "INSERT INTO telegram_outbox(id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms,delivered_ms)
              VALUES ('old_o','manager','ORDER','developer','x','delivered',1,0,?,?,?)",
         )
@@ -2885,6 +2914,17 @@ mod tests {
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(old_dispatch, 0, "old dispatch purged");
+        let queued_dispatch: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dispatches WHERE id='old_queued_d'")
+                .fetch_one(store.pool())
+                .await?;
+        let pending_delivery: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE id='old_pending_delivery'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(queued_dispatch, 1, "pending delivery retains its parent");
+        assert_eq!(pending_delivery, 1, "pending delivery survives retention");
         let old_outbox: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox WHERE id='old_o'")
                 .fetch_one(store.pool())
@@ -2900,6 +2940,30 @@ mod tests {
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(fresh_status, "pending", "fresh pending untouched");
+
+        store
+            .mark_delivery_delivered("old_pending_delivery", Some("run-after-outage"))
+            .await?;
+        store
+            .cleanup(
+                30,
+                30,
+                30,
+                Duration::from_secs(60),
+                Duration::from_secs(3600),
+            )
+            .await?;
+        let released_dispatch: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dispatches WHERE id='old_queued_d'")
+                .fetch_one(store.pool())
+                .await?;
+        let released_delivery: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE id='old_pending_delivery'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(released_dispatch, 0, "terminal queue parent may be purged");
+        assert_eq!(released_delivery, 0, "terminal delivery follows its parent");
 
         store.pool.close().await;
         remove_sqlite_files(&path).await;
