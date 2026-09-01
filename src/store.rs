@@ -67,8 +67,9 @@ pub struct OutboxItem {
     pub media: Vec<MediaPayload>,
 }
 
-/// One content-free role wake waiting for the destination Hermes profile to
-/// release its single-writer run slot. This is transport state, not task state.
+/// One opaque role delivery waiting for the destination Hermes profile to
+/// release its single-writer run slot. This is transport state, not task state;
+/// task authority and lifecycle remain in SLC.
 #[derive(Clone, Debug)]
 pub struct DeliveryQueueItem {
     pub id: String,
@@ -283,18 +284,116 @@ impl Store {
 
     async fn recover_pending_dispatches(&self) -> anyhow::Result<()> {
         let now = Utc::now().timestamp_millis();
-        let result = json!({
-            "ok": false,
-            "error": "server restarted before dispatch completion was persisted",
-            "recovery_required": true,
-        });
-        sqlx::query(
-            "UPDATE dispatches SET status='indeterminate', result_json=?, updated_ms=? WHERE status='pending'",
+        let mut tx = self.pool.begin().await?;
+        let pending = sqlx::query(
+            "SELECT id, sender, kind FROM dispatches WHERE status='pending' ORDER BY created_ms",
         )
-        .bind(serde_json::to_string(&result)?)
-        .bind(now)
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        for dispatch in pending {
+            let dispatch_id: String = dispatch.get("id");
+            let kind: String = dispatch.get("kind");
+            let target_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM dispatch_targets WHERE dispatch_id=?")
+                    .bind(&dispatch_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let deliveries = sqlx::query(
+                r#"SELECT q.id, q.recipient, q.status, q.attempts, q.sequence,
+                          CASE WHEN q.status='pending' THEN (
+                            SELECT COUNT(*) FROM delivery_outbox earlier
+                            WHERE earlier.recipient=q.recipient
+                              AND earlier.status='pending'
+                              AND earlier.sequence <= q.sequence
+                          ) END AS queue_position
+                   FROM delivery_outbox q WHERE q.dispatch_id=? ORDER BY q.sequence"#,
+            )
+            .bind(&dispatch_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let (status, result) = if deliveries.is_empty() {
+                (
+                    "indeterminate",
+                    json!({
+                        "ok": false,
+                        "dispatch_id": dispatch_id,
+                        "error": "server restarted before dispatch completion was persisted",
+                        "recovery_required": true,
+                    }),
+                )
+            } else {
+                let recovery_required = target_count
+                    != i64::try_from(deliveries.len()).unwrap_or(i64::MAX)
+                    || deliveries.iter().any(|delivery| {
+                        !matches!(
+                            delivery.get::<String, _>("status").as_str(),
+                            "pending" | "delivered"
+                        )
+                    });
+                let queued_after_restart = deliveries
+                    .iter()
+                    .any(|delivery| delivery.get::<String, _>("status") == "pending");
+                let fully_delivered = !recovery_required
+                    && deliveries
+                        .iter()
+                        .all(|delivery| delivery.get::<String, _>("status") == "delivered");
+                let single_delivery = (deliveries.len() == 1).then(|| {
+                    let delivery = &deliveries[0];
+                    (
+                        delivery.get::<String, _>("id"),
+                        delivery.get::<String, _>("recipient"),
+                        delivery.get::<Option<i64>, _>("queue_position"),
+                    )
+                });
+                let queued = deliveries
+                    .into_iter()
+                    .map(|delivery| {
+                        json!({
+                            "queue_id": delivery.get::<String, _>("id"),
+                            "recipient": delivery.get::<String, _>("recipient"),
+                            "status": delivery.get::<String, _>("status"),
+                            "attempts": delivery.get::<i64, _>("attempts"),
+                            "sequence": delivery.get::<i64, _>("sequence"),
+                            "queue_position": delivery.get::<Option<i64>, _>("queue_position"),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut recovered = json!({
+                    "ok": !recovery_required,
+                    "sender": dispatch.get::<String, _>("sender"),
+                    "kind": kind,
+                    "queued": queued_after_restart,
+                    "fully_delivered": fully_delivered,
+                    "recovered_after_restart": true,
+                    "recovery_required": recovery_required,
+                    "deliveries": queued,
+                });
+                let id_field = if matches!(kind.as_str(), "msg_to" | "msg_all") {
+                    "message_id"
+                } else {
+                    "dispatch_id"
+                };
+                recovered[id_field] = json!(dispatch_id);
+                if let Some((queue_id, recipient, queue_position)) = single_delivery {
+                    recovered["recipient"] = json!(recipient);
+                    recovered["queue_id"] = json!(queue_id);
+                    if let Some(queue_position) = queue_position {
+                        recovered["queue_position"] = json!(queue_position);
+                    }
+                }
+                ("accepted", recovered)
+            };
+            sqlx::query(
+                "UPDATE dispatches SET status=?, result_json=?, updated_ms=? WHERE id=? AND status='pending'",
+            )
+            .bind(status)
+            .bind(serde_json::to_string(&result)?)
+            .bind(now)
+            .bind(&dispatch_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -688,6 +787,16 @@ impl Store {
     ) -> anyhow::Result<i64> {
         let now = Utc::now().timestamp_millis();
         let retry_ms = i64::try_from(retry_after.as_millis()).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+        let dispatch_status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE id=?")
+                .bind(&item.dispatch_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        ensure!(
+            dispatch_status == "pending",
+            "delivery may be queued only while its operation is pending"
+        );
         sqlx::query(
             r#"INSERT OR IGNORE INTO delivery_outbox
                (id, dispatch_id, sender, kind, recipient, body, instructions,
@@ -704,21 +813,42 @@ impl Store {
         .bind(now.saturating_add(retry_ms.max(1_000)))
         .bind(error)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        let persisted = sqlx::query(
+            r#"SELECT sequence, dispatch_id, sender, kind, recipient, body,
+                      instructions, status
+               FROM delivery_outbox WHERE id=?"#,
+        )
+        .bind(&item.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        ensure!(
+            persisted.get::<String, _>("dispatch_id") == item.dispatch_id
+                && persisted.get::<String, _>("sender") == item.sender
+                && persisted.get::<String, _>("kind") == item.kind
+                && persisted.get::<String, _>("recipient") == item.recipient
+                && persisted.get::<String, _>("body") == item.body
+                && persisted.get::<String, _>("instructions") == item.instructions,
+            "delivery queue id already exists with a different payload"
+        );
+        ensure!(
+            persisted.get::<String, _>("status") == "pending",
+            "delivery queue id already reached a terminal state"
+        );
+        let sequence: i64 = persisted.get("sequence");
         let position: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM delivery_outbox
                WHERE recipient = ? AND status = 'pending'
-                 AND sequence <= COALESCE(
-                   (SELECT sequence FROM delivery_outbox WHERE id = ?),
-                   sequence
-                 )"#,
+                 AND sequence <= ?"#,
         )
         .bind(&item.recipient)
-        .bind(&item.id)
-        .fetch_one(&self.pool)
+        .bind(sequence)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(position.max(1))
+        tx.commit().await?;
+        ensure!(position >= 1, "queued delivery has no FIFO position");
+        Ok(position)
     }
 
     pub async fn has_pending_delivery(&self, recipient: &str) -> anyhow::Result<bool> {
@@ -772,9 +902,16 @@ impl Store {
     }
 
     pub async fn delivery_eligible(&self, id: &str) -> anyhow::Result<bool> {
+        let now = Utc::now().timestamp_millis();
         let eligible: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM delivery_outbox q
-               WHERE q.id = ? AND q.status = 'pending'
+               WHERE q.id = ? AND q.status = 'pending' AND q.next_attempt_ms <= ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM delivery_outbox earlier
+                   WHERE earlier.recipient = q.recipient
+                     AND earlier.status = 'pending'
+                     AND earlier.sequence < q.sequence
+                 )
                  AND NOT EXISTS (
                    SELECT 1 FROM role_messaging r
                    WHERE r.enabled = 0
@@ -782,6 +919,7 @@ impl Store {
                  )"#,
         )
         .bind(id)
+        .bind(now)
         .fetch_one(&self.pool)
         .await?;
         Ok(eligible == 1)
@@ -1926,6 +2064,189 @@ mod tests {
         let executor_outbox = store.recent_outbox("developer", "manager", 10).await?;
         assert!(executor_outbox.get("inbound_update_offset").is_none());
         assert!(executor_outbox.get("inbound_last_poll_at").is_none());
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_a_durable_queued_dispatch_as_accepted() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-delivery-recovery-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        store
+            .reserve_dispatch(
+                "recover_dispatch",
+                "manager",
+                "dispatch_to",
+                &["developer".to_string()],
+                Some("recover-key"),
+                "recover-fingerprint",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .enqueue_delivery(
+                &DeliveryQueueItem {
+                    id: "delivery_recover_dispatch_developer".to_string(),
+                    dispatch_id: "recover_dispatch".to_string(),
+                    sender: "manager".to_string(),
+                    kind: "dispatch_to".to_string(),
+                    recipient: "developer".to_string(),
+                    body: "opaque wake".to_string(),
+                    instructions: "read SLC".to_string(),
+                    attempts: 0,
+                },
+                Duration::from_secs(1),
+                "role busy",
+            )
+            .await?;
+        store.pool.close().await;
+
+        let recovered = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let (status, result_json): (String, String) =
+            sqlx::query_as("SELECT status,result_json FROM dispatches WHERE id='recover_dispatch'")
+                .fetch_one(recovered.pool())
+                .await?;
+        assert_eq!(status, "accepted");
+        let result: Value = serde_json::from_str(&result_json)?;
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["queued"], json!(true));
+        assert_eq!(result["recovered_after_restart"], json!(true));
+        assert_eq!(
+            result["queue_id"],
+            json!("delivery_recover_dispatch_developer")
+        );
+        assert_eq!(result["queue_position"], json!(1));
+        assert_eq!(result["recipient"], json!("developer"));
+        assert_eq!(result["deliveries"][0]["status"], json!("pending"));
+
+        recovered.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_marks_partial_queue_persistence_as_recovery_required() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-partial-delivery-recovery-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        store
+            .reserve_dispatch(
+                "partial_recover_dispatch",
+                "manager",
+                "dispatch_to",
+                &["developer".to_string(), "tester".to_string()],
+                Some("partial-recover-key"),
+                "partial-recover-fingerprint",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .enqueue_delivery(
+                &DeliveryQueueItem {
+                    id: "delivery_partial_recover_developer".to_string(),
+                    dispatch_id: "partial_recover_dispatch".to_string(),
+                    sender: "manager".to_string(),
+                    kind: "dispatch_to".to_string(),
+                    recipient: "developer".to_string(),
+                    body: "opaque wake".to_string(),
+                    instructions: "read SLC".to_string(),
+                    attempts: 0,
+                },
+                Duration::from_secs(1),
+                "role busy",
+            )
+            .await?;
+        store.pool.close().await;
+
+        let recovered = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let (status, result_json): (String, String) = sqlx::query_as(
+            "SELECT status,result_json FROM dispatches WHERE id='partial_recover_dispatch'",
+        )
+        .fetch_one(recovered.pool())
+        .await?;
+        assert_eq!(
+            status, "accepted",
+            "the same idempotency key must not redispatch"
+        );
+        let result: Value = serde_json::from_str(&result_json)?;
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["recovery_required"], json!(true));
+        assert_eq!(result["queued"], json!(true));
+        assert_eq!(result["dispatch_id"], json!("partial_recover_dispatch"));
+
+        recovered.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivery_revalidation_requires_due_fifo_head() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-delivery-eligibility-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        for index in 1..=2 {
+            let dispatch_id = format!("eligibility_dispatch_{index}");
+            store
+                .reserve_dispatch(
+                    &dispatch_id,
+                    "manager",
+                    "dispatch_to",
+                    &["developer".to_string()],
+                    Some(&format!("eligibility-key-{index}")),
+                    &format!("eligibility-fingerprint-{index}"),
+                    100,
+                    Duration::from_secs(60),
+                )
+                .await?;
+            store
+                .enqueue_delivery(
+                    &DeliveryQueueItem {
+                        id: format!("eligibility_delivery_{index}"),
+                        dispatch_id,
+                        sender: "manager".to_string(),
+                        kind: "dispatch_to".to_string(),
+                        recipient: "developer".to_string(),
+                        body: format!("wake {index}"),
+                        instructions: "read SLC".to_string(),
+                        attempts: 0,
+                    },
+                    Duration::from_secs(1),
+                    "role busy",
+                )
+                .await?;
+        }
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0")
+            .execute(store.pool())
+            .await?;
+        assert!(store.delivery_eligible("eligibility_delivery_1").await?);
+        assert!(!store.delivery_eligible("eligibility_delivery_2").await?);
+
+        sqlx::query(
+            "UPDATE delivery_outbox SET next_attempt_ms=? WHERE id='eligibility_delivery_1'",
+        )
+        .bind(Utc::now().timestamp_millis() + 60_000)
+        .execute(store.pool())
+        .await?;
+        assert!(!store.delivery_eligible("eligibility_delivery_1").await?);
+        assert!(!store.delivery_eligible("eligibility_delivery_2").await?);
+
+        sqlx::query(
+            "UPDATE delivery_outbox SET status='delivered' WHERE id='eligibility_delivery_1'",
+        )
+        .execute(store.pool())
+        .await?;
+        assert!(store.delivery_eligible("eligibility_delivery_2").await?);
 
         store.pool.close().await;
         remove_sqlite_files(&path).await;

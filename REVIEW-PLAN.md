@@ -484,3 +484,15 @@ stores opaque delivery retries only.
 Remaining accepted limit: downstream acceptance cannot be exactly-once across
 a process/database failure until Hermes supports an idempotency key on
 `POST /v1/runs`.
+
+# Iteration 13 (2026-09-01) — FIFO crash and stale-snapshot hardening
+
+- Queue-backed operations left pending by a process stop are recovered as
+  accepted from durable outbox evidence; only operations without such evidence
+  remain indeterminate. Partial/dead/cancelled evidence is non-retryable but
+  explicitly returns `ok=false,recovery_required=true`.
+- Delivery enqueue validates duplicate queue IDs and payload identity inside
+  one transaction.
+- Last-moment eligibility now requires the row to be due and still be the
+  oldest pending row for its recipient.
+- Regression coverage exercises restart recovery and stale/head eligibility.

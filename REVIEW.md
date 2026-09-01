@@ -88,8 +88,10 @@ Host/Origin/body guard ──► exact role MCP catalog
 SQLite is deliberately kept for a single-container deployment. Existing
 Python `activity_events` and `activity_state` tables are detected, renamed to
 `*_python_legacy`, and imported into the ordered Rust schema. A startup pass
-marks operations left `pending` by a previous process as `indeterminate`: the
-server will not blindly redeliver a side effect whose outcome is unknown.
+recovers a `pending` operation as accepted when its durable delivery-outbox row
+proves the wake was queued. Pending operations without that evidence become
+`indeterminate`: the server will not blindly redeliver a side effect whose
+outcome is unknown.
 
 ## Known limits that cannot be solved inside this server alone
 
@@ -236,11 +238,11 @@ and multiple active server replicas require a distributed outbox claim.
 - `/ready` fails when SQLite is unavailable.
 - The service runs as non-root with a read-only root filesystem.
 
-## Transport FIFO review (2026-09-01, v0.6.0)
+## Transport FIFO review (2026-09-01, v0.6.1)
 
 Hermes correctly keeps `max_concurrent_runs=1` per role profile, but a second
 wake previously surfaced that protection as a caller-visible HTTP 429. Version
-0.6.0 keeps task ordering in SLC and adds only a transport retry boundary:
+0.6.1 keeps task ordering in SLC and adds only a transport retry boundary:
 
 - a definitive Hermes 429 persists the opaque wake in SQLite and finishes the
   original transport operation as accepted with `queued=true`;
@@ -250,6 +252,14 @@ wake previously surfaced that protection as a caller-visible HTTP 429. Version
   records `delivered` or `dead` without interpreting correlation IDs;
 - messaging disable/clear pauses or cancels both Telegram audits and queued
   wakes, with eligibility rechecked under the messaging gate;
+- final eligibility also rechecks due time and FIFO-head ownership, so a stale
+  worker snapshot cannot overtake after another worker changes the row;
+- enqueue verifies an existing queue ID has the identical still-pending
+  payload, and restart recovery finalizes queue-backed pending operations as
+  accepted, reconstructing the single-recipient queue ID/position rather than
+  exposing a retryable-looking indeterminate result;
+  incomplete or dead/cancelled multi-target evidence is finalized with
+  `ok=false,recovery_required=true` instead of being reported as success;
 - shutdown awaits the new worker, and `swarm://operations`/`messaging` expose
   transport status without payload bodies or task state.
 

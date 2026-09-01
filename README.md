@@ -46,8 +46,10 @@ FIFO. The tool returns `queued=true`, a `queue_id`, and `queue_position`; this
 is a successful transport outcome and must not be retried. Later deliveries to
 that recipient join the FIFO without attempting to overtake its head. A worker
 retries the head after `Retry-After` and records `delivered` or `dead` state in
-`swarm://operations`. This queue contains wake payloads only and never decides
-task readiness or order; that remains SLC's responsibility.
+`swarm://operations`. Eligibility is rechecked immediately before delivery,
+including due time and FIFO-head ownership. This queue contains opaque
+transport payloads only and never decides task readiness or order; that remains
+SLC's responsibility.
 
 Single-recipient tools accept `recipient`, `correlation_id`, `idempotency_key`,
 and `message`, so the content-free four-field `delivery` object returned by SLC
@@ -86,7 +88,14 @@ assignee, status, report body, or lineage.
 
 Retries use a caller-owned `idempotency_key`. Reusing a key with different
 delivery arguments is rejected. Accepted, partial, and indeterminate outcomes
-replay; definitive failures release the key for a real retry. A separate
+replay; definitive failures release the key for a real retry. A queued wake is
+persisted before its operation result. If the process stops between those two
+writes, startup recognizes the durable queue row and recovers the operation as
+accepted with the original single-recipient queue ID/position instead of
+inviting a duplicate wake. If queue rows cover only part
+of a multi-target operation or contain a dead/cancelled outcome, the same
+idempotency key remains finalized but replays `ok=false` with
+`recovery_required=true`; it is never silently presented as complete. A separate
 content-duplicate window suppresses accidental repeated delivery.
 
 Messaging circuit breakers block both directions through this adapter and can
