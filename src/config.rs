@@ -149,6 +149,21 @@ pub struct Config {
     pub log_level: String,
 }
 
+/// Parse `{PREFIX}_API_KIND` (hermes | openai | mcp). Shared by the mcp-only
+/// pre-pass (ACL/coverage) and the per-role agent parsing so the two never
+/// disagree on a role's kind.
+fn agent_api_kind(env: &dyn Fn(&str) -> Option<String>, prefix: &str) -> anyhow::Result<ApiKind> {
+    Ok(match optional(env, &format!("{prefix}_API_KIND"))
+        .as_deref()
+        .unwrap_or("hermes")
+    {
+        "hermes" => ApiKind::Hermes,
+        "openai" => ApiKind::OpenAi,
+        "mcp" => ApiKind::Mcp,
+        other => bail!("{prefix}_API_KIND must be hermes, openai or mcp, got {other}"),
+    })
+}
+
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_env_with(&system_env)
@@ -194,6 +209,19 @@ impl Config {
         let role_set = all_roles.iter().cloned().collect::<BTreeSet<_>>();
         let executor_set = agent_roles.iter().cloned().collect::<BTreeSet<_>>();
 
+        // Роли с `{PREFIX}_API_KIND=mcp` — внешние/облачные системы (например,
+        // голосовые агенты Yandex Realtime): они сами инициируют сообщения
+        // через swarm MCP, endpoint для доставки у них нет, поэтому они НЕ
+        // могут быть адресатами диспатчей/msg_to и не требуют authority.
+        let mcp_only_executors = agent_roles
+            .iter()
+            .filter(|role| {
+                let prefix = role.to_uppercase().replace('-', "_");
+                matches!(agent_api_kind(env, &prefix), Ok(ApiKind::Mcp))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
         let descriptions: BTreeMap<String, String> = json_env(env, "SWARM_EXECUTOR_DESCRIPTIONS")?;
         ensure!(
             descriptions.keys().cloned().collect::<BTreeSet<_>>() == executor_set,
@@ -213,7 +241,7 @@ impl Config {
                 global_authorities.insert(source.clone());
                 agent_roles
                     .iter()
-                    .filter(|role| *role != source)
+                    .filter(|role| *role != source && !mcp_only_executors.contains(*role))
                     .cloned()
                     .collect::<Vec<_>>()
             } else {
@@ -221,7 +249,18 @@ impl Config {
                     !raw_targets.iter().any(|target| target == "*"),
                     "'*' must be the only target in SWARM_DISPATCH_ACL.{source}"
                 );
-                normalize_targets(source, raw_targets, &executor_set)?
+                let targets = normalize_targets(source, raw_targets, &executor_set)?;
+                let mcp_only_hits = targets
+                    .iter()
+                    .filter(|target| mcp_only_executors.contains(*target))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                ensure!(
+                    mcp_only_hits.is_empty(),
+                    "SWARM_DISPATCH_ACL.{source} must not target mcp-only role(s): {}",
+                    mcp_only_hits.join(", ")
+                );
+                targets
             };
             dispatch_acl.insert(source.clone(), targets);
         }
@@ -235,8 +274,15 @@ impl Config {
             .flatten()
             .cloned()
             .collect::<BTreeSet<_>>();
+        // Покрытие authority требуется только доставляемым исполнителям:
+        // mcp-only роли (облачные, endpoint отсутствует) по определению не
+        // принимают диспатчи и могут не иметь authority.
+        let deliverable_executors = executor_set
+            .difference(&mcp_only_executors)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         ensure!(
-            executor_set.is_subset(&reachable_executors),
+            deliverable_executors.is_subset(&reachable_executors),
             "every executor must have at least one dispatch authority"
         );
 
@@ -302,15 +348,7 @@ impl Config {
             // Сторонние системы: {PREFIX}_API_KIND=openai — инициация через
             // OpenAI-совместимый endpoint; =mcp — роль доступна только через
             // swarm MCP и сама инициирует взаимодействие (endpoint не нужен).
-            let api_kind = match optional(env, &format!("{prefix}_API_KIND"))
-                .as_deref()
-                .unwrap_or("hermes")
-            {
-                "hermes" => ApiKind::Hermes,
-                "openai" => ApiKind::OpenAi,
-                "mcp" => ApiKind::Mcp,
-                other => bail!("{prefix}_API_KIND must be hermes, openai or mcp, got {other}"),
-            };
+            let api_kind = agent_api_kind(env, &prefix)?;
             let api_url = match optional(env, &format!("{prefix}_API_URL")) {
                 Some(value) => Some(parse_http_url(&format!("{prefix}_API_URL"), &value)?),
                 None => None,
@@ -1200,11 +1238,23 @@ mod tests {
         env.insert("DEVELOPER_API_KIND".into(), "mcp".into());
         env.remove("DEVELOPER_API_URL");
         env.remove("DEVELOPER_AGENT_API_KEY");
+        // lead-developer явно адресовал developer в фикстуре — mcp-only роли
+        // не могут быть целями диспатча, поэтому убираем это адресование
+        // (и activity-маршрут developer, требующий supervision от lead).
+        env.insert(
+            "SWARM_DISPATCH_ACL".into(),
+            r#"{"manager":["*"],"lead-developer":[]}"#.into(),
+        );
+        env.insert("SWARM_ACTIVITY_ROUTES".into(), "{}".into());
         let config = load(&env).unwrap();
         let developer = &config.agents["developer"];
         assert_eq!(developer.api_kind, ApiKind::Mcp);
         assert!(developer.api_url.is_none());
         assert!(developer.api_key.is_none());
+        // mcp-only роль не попадает в адресаты authority (даже при "*")
+        // и не требуется в покрытии — конфиг валиден без authority для неё.
+        assert!(!config.dispatch_acl["manager"].contains(&"developer".to_string()));
+        assert!(!config.dispatch_acl["lead-developer"].contains(&"developer".to_string()));
     }
 
     #[test]

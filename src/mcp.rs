@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     AppState,
-    config::TelegramBotMode,
+    config::{ApiKind, TelegramBotMode},
     dispatch::{
         BroadcastArgs, CancelDeliveryArgs, ClearMessageQueueArgs, DisableMessagingArgs,
         DispatchArgs, EnableMessagingArgs, MessageAllArgs, MessageArgs, TelegramReplyArgs,
@@ -163,10 +163,19 @@ impl RoleMcp {
             ));
         }
 
+        // Адресаты msg_to/msg_all — все роли, КРОМЕ mcp-only: облачные роли
+        // (например, голосовые агенты Yandex Realtime) не имеют endpoint'а и
+        // не могут принимать доставку; они сами инициируют сообщения.
         let peers = config
             .all_roles
             .iter()
             .filter(|role| *role != &self.role)
+            .filter(|role| {
+                !config
+                    .agents
+                    .get(*role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !peers.is_empty() {
@@ -312,6 +321,10 @@ impl RoleMcp {
                 } else {
                     config.descriptions.get(role).map_or("", String::as_str)
                 },
+                "mcp_only": config
+                    .agents
+                    .get(role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp),
                 "may_dispatch": config.dispatch_acl.get(role).cloned().unwrap_or_default(),
             })).collect::<Vec<_>>(),
             "caller_may_dispatch": targets,

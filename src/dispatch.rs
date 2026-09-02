@@ -449,6 +449,13 @@ impl Dispatcher {
                 });
                 result[key] = json!(value);
                 handle.decorate_result(&mut result);
+                // Ответ исполнителя (вывод run'а) доставляем в исходный
+                // Telegram-чат отправителя: у dispatch_to (в отличие от
+                // telegram_inbound) нет собственного chat_id, поэтому берём
+                // последний известный чат роли-отправителя.
+                if let DispatchHandle::Run(run_id) = &handle {
+                    self.track_reply_for_sender(sender, run_id, &target).await;
+                }
                 let audit = self.audit(
                     sender,
                     "DISPATCH",
@@ -470,6 +477,29 @@ impl Dispatcher {
                 )
                 .await
             }
+        }
+    }
+
+    /// Зарегистрировать run получателя для доставки финального ответа в
+    /// исходный Telegram-чат отправителя (см. spawn_run_reply_worker).
+    /// Используется там, где у доставки нет собственного chat_id
+    /// (dispatch_to/msg_to): чат берётся как последний известный inbound-чат
+    /// роли-отправителя. Если чата нет — ответ не трекается (терять нечему).
+    async fn track_reply_for_sender(&self, sender: &str, run_id: &str, recipient: &str) {
+        let Ok(Some(chat_id)) = self.store.telegram_chat_for_role(sender).await else {
+            return;
+        };
+        if let Err(error) = self
+            .store
+            .track_run_reply(run_id, recipient, chat_id)
+            .await
+        {
+            warn!(
+                sender = %sender,
+                recipient = %recipient,
+                error = %error,
+                "tracking run reply failed"
+            );
         }
     }
 
@@ -611,6 +641,14 @@ impl Dispatcher {
             .all_roles
             .iter()
             .filter(|role| role.as_str() != sender)
+            // mcp-only роли не принимают сообщения (endpoint отсутствует).
+            .filter(|role| {
+                !self
+                    .config
+                    .agents
+                    .get(*role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !allowed.contains(&target) {
@@ -699,6 +737,9 @@ impl Dispatcher {
                 });
                 result[key] = json!(value);
                 handle.decorate_result(&mut result);
+                if let DispatchHandle::Run(run_id) = &handle {
+                    self.track_reply_for_sender(sender, run_id, &target).await;
+                }
                 let audit = self.audit(
                     sender,
                     "MSG",
@@ -739,6 +780,14 @@ impl Dispatcher {
             .all_roles
             .iter()
             .filter(|role| role.as_str() != sender)
+            // mcp-only роли не принимают сообщения (endpoint отсутствует).
+            .filter(|role| {
+                !self
+                    .config
+                    .agents
+                    .get(*role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if targets.is_empty() {
@@ -4158,6 +4207,73 @@ mod tests {
 
         // The run is no longer tracked once delivered.
         assert!(store.due_run_replies().await?.is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_tracks_run_reply_to_senders_chat() -> anyhow::Result<()> {
+        // Менеджер получил приказ из Telegram-чата, затем dispatch_to
+        // контактеру — ответ контактера (вывод run) должен уйти в тот же чат.
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/") {
+                (
+                    200,
+                    json!({
+                        "object": "hermes.run",
+                        "run_id": "run-dt",
+                        "status": "completed",
+                        "output": "Отчёт контактера",
+                    }),
+                )
+            } else {
+                (202, json!({"run_id": "run-dt"}))
+            }
+        }))
+        .await?;
+        let inbound = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 77,
+                message_id: 501,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "приказ".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
+
+        let out = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "отчитайся о звонках".to_string(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!out.is_error, "unexpected: {:?}", out.value);
+        let tracks = store.due_run_replies().await?;
+        assert!(
+            tracks
+                .iter()
+                .any(|(run_id, role, chat_id, _)| run_id == "run-dt"
+                    && role == "developer"
+                    && *chat_id == 424_242),
+            "ответ run'а контактера должен отслеживаться для чата менеджера: {tracks:?}"
+        );
+
+        dispatcher.flush_run_replies().await?;
+        let items = store.due_outbox(10).await?;
+        let reply = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("the dispatch run reply must be enqueued");
+        assert_eq!(reply.text, "Отчёт контактера");
+        assert_eq!(reply.chat_id, Some(424_242));
         testutil::remove_db_files(&path).await;
         Ok(())
     }
