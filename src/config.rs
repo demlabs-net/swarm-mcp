@@ -138,7 +138,7 @@ pub struct Config {
     /// Directory (shared with the agent containers) where inbound Telegram
     /// file attachments are saved; the path is passed to the agent in the
     /// dispatch message.
-    pub inbound_files_dir: PathBuf,
+    pub shared_files_dir: PathBuf,
     pub manager_instructions: String,
     pub executor_instructions: String,
     pub authority_instructions: String,
@@ -639,8 +639,8 @@ impl Config {
                 "SWARM_TELEGRAM_INBOUND_RUN_INSTRUCTIONS",
             )?,
             telegram_inbound_template,
-            inbound_files_dir: PathBuf::from(
-                optional(env, "SWARM_INBOUND_FILES_DIR")
+            shared_files_dir: PathBuf::from(
+                optional(env, "SWARM_SHARED_FILES_DIR")
                     .unwrap_or_else(|| "/opt/data/inbound".to_string()),
             ),
             manager_instructions: required(env, "SWARM_MANAGER_MCP_INSTRUCTIONS")?,

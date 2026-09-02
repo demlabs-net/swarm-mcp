@@ -206,7 +206,7 @@ impl RoleMcp {
         }
         tools.push(tool(
             "telegram_reply",
-            "Send a message (and optionally files) to the operator who started the most recent Telegram dispatch for this role.",
+            "Send a message (and optionally one or more files) to the operator who started the most recent Telegram dispatch for this role. May be used at any point during the work (intermediate updates and/or the final answer). For files, pass the file path in files[].path (a file inside the shared directory /opt/data/inbound) — this is the reliable way for any size; base64 content in files[].content_b64 is also accepted for small files. Images (mime image/*) are sent as photos, anything else as a document. The message text becomes the caption of the first file; message may be omitted when files are attached.",
             object_schema(
                 &json!({
                     "message": {
@@ -222,9 +222,10 @@ impl RoleMcp {
                             "properties": {
                                 "filename": {"type": "string", "minLength": 1, "maxLength": 255},
                                 "mime_type": {"type": "string", "maxLength": 100},
+                                "path": {"type": "string", "minLength": 1, "maxLength": 1024},
                                 "content_b64": {"type": "string", "minLength": 1, "maxLength": 8_000_000}
                             },
-                            "required": ["filename", "content_b64"],
+                            "required": ["filename"],
                             "additionalProperties": false
                         }
                     }

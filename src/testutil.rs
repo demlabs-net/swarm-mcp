@@ -131,9 +131,9 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         telegram_backlog_mode: TelegramBacklogMode::Discard,
         telegram_inbound_instructions: "execute the Telegram request".to_string(),
         telegram_inbound_template: "update {update_id} from user {user_id}: {message}".to_string(),
-        // Keep parallel tests isolated: sharing /tmp/inbound lets one test's
-        // cleanup remove another test's just-downloaded attachments.
-        inbound_files_dir: state_db_path.with_extension("inbound"),
+        // Уникальный каталог на тест (рядом с БД): общий /tmp/inbound у всех
+        // тестов приводил к гонкам при параллельном запуске.
+        shared_files_dir: state_db_path.with_extension("inbound"),
         manager_instructions: "You are the swarm manager.".to_string(),
         executor_instructions: "You are an executor.".to_string(),
         authority_instructions: "You may dispatch to: {targets}".to_string(),

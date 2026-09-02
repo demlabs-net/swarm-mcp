@@ -424,7 +424,7 @@ impl TelegramGateway {
                 document.file_name.clone(),
             ));
         }
-        let dir = self.state.config.inbound_files_dir.clone();
+        let dir = self.state.config.shared_files_dir.clone();
         if let Err(error) = tokio::fs::create_dir_all(&dir).await {
             warn!(error = %error, path = %dir.display(), "inbound files dir create failed");
             return notes;
@@ -1232,7 +1232,7 @@ mod tests {
         .await?;
         // Каталог входящих файлов — рядом с тестовой БД; чистим перед
         // прогоном, т.к. cleanup удаляет только файлы старше суток.
-        let inbound_dir = gateway.state.config.inbound_files_dir.clone();
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
         let _ = std::fs::remove_dir_all(&inbound_dir);
         std::fs::create_dir_all(&inbound_dir)?;
         gateway.poll_once().await?;
@@ -1305,7 +1305,7 @@ mod tests {
             Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
         )
         .await?;
-        let inbound_dir = gateway.state.config.inbound_files_dir.clone();
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
         let _ = std::fs::remove_dir_all(&inbound_dir);
         std::fs::create_dir_all(&inbound_dir)?;
         let stale = inbound_dir.join("stale.png");

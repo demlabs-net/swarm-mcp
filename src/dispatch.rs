@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, ensure, Context as _};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, future::join_all};
 use reqwest::{Client, Proxy};
@@ -298,7 +298,14 @@ pub struct TelegramFileArgs {
     pub filename: String,
     #[serde(default)]
     pub mime_type: Option<String>,
+    /// Base64-encoded content. Prefer `path` instead: large base64 passed
+    /// through LLM tool-call arguments gets truncated by model output limits.
+    #[serde(default)]
     pub content_b64: String,
+    /// Path of the file inside the shared files directory (the swarm MCP
+    /// reads it directly — reliable for any file size).
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1013,16 +1020,39 @@ impl Dispatcher {
         }
         let mut media = Vec::with_capacity(files.len());
         for file in files {
-            if file.filename.is_empty() || file.content_b64.is_empty() {
+            if file.filename.is_empty() {
                 return tool_error(json!({
                     "ok": false,
-                    "error": "Telegram file must have a filename and content_b64",
+                    "error": "Telegram file must have a filename",
                 }));
             }
+            let content_b64 = match file.path {
+                // Путь в общей папке — надёжный способ (base64 через tool-call
+                // модели обрезается лимитом выходных токенов).
+                Some(path) => match self.read_shared_file(&path).await {
+                    Ok(content) => content,
+                    Err(error) => {
+                        warn!(path = %path, error = %error, "reading shared reply file failed");
+                        return tool_error(json!({
+                            "ok": false,
+                            "error": format!("cannot read shared file {path}: {error}"),
+                        }));
+                    }
+                },
+                None => {
+                    if file.content_b64.is_empty() {
+                        return tool_error(json!({
+                            "ok": false,
+                            "error": "Telegram file must have content_b64 or a shared path",
+                        }));
+                    }
+                    file.content_b64
+                }
+            };
             media.push(MediaPayload {
                 filename: file.filename,
                 mime_type: file.mime_type,
-                content_b64: file.content_b64,
+                content_b64,
             });
         }
         // MCP-only roles may reply proactively with no prior dispatch: the
@@ -1055,6 +1085,37 @@ impl Dispatcher {
             }),
             is_error: false,
         }
+    }
+
+    /// Читает файл из общей папки для отправки вложением. Путь может быть
+    /// абсолютным (внутри общей папки) или относительным к ней; выход за её
+    /// пределы отклоняется. Размер ограничен 20 МБ (лимит Telegram).
+    async fn read_shared_file(&self, path: &str) -> anyhow::Result<String> {
+        use base64::Engine as _;
+        let root = self.config.shared_files_dir.clone();
+        let candidate = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            root.join(path)
+        };
+        let root_canonical = tokio::fs::canonicalize(&root)
+            .await
+            .with_context(|| format!("shared files dir {} is unavailable", root.display()))?;
+        let file_canonical = tokio::fs::canonicalize(&candidate)
+            .await
+            .with_context(|| format!("shared file {path} does not exist"))?;
+        ensure!(
+            file_canonical.starts_with(&root_canonical),
+            "path {path} escapes the shared files directory"
+        );
+        let metadata = tokio::fs::metadata(&file_canonical).await?;
+        ensure!(metadata.is_file(), "shared path {path} is not a file");
+        ensure!(
+            metadata.len() <= 20 * 1024 * 1024,
+            "shared file {path} exceeds the 20 MB Telegram limit"
+        );
+        let bytes = tokio::fs::read(&file_canonical).await?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
     pub fn spawn_outbox_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
@@ -2437,6 +2498,7 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    use base64::Engine as _;
     use crate::testutil;
     use sqlx::Row;
 
@@ -3696,11 +3758,13 @@ mod tests {
                 filename: "cover_ru.png".to_string(),
                 mime_type: Some("image/png".to_string()),
                 content_b64: "aGVsbG8=".to_string(),
+                    path: None,
             },
             TelegramFileArgs {
                 filename: "report.pdf".to_string(),
                 mime_type: None,
                 content_b64: "cGRm".to_string(),
+                    path: None,
             },
         ];
         let reply = dispatcher
@@ -3749,6 +3813,7 @@ mod tests {
                     filename: "x.png".to_string(),
                     mime_type: Some("image/png".to_string()),
                     content_b64: "eA==".to_string(),
+                    path: None,
                 }],
             )
             .await;
@@ -3760,6 +3825,121 @@ mod tests {
         let items = store.due_outbox(10).await?;
         assert!(items.iter().any(|item| item.media.len() == 1));
         testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_reads_files_from_the_shared_path() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        let shared_dir = dispatcher.config.shared_files_dir.clone();
+        std::fs::create_dir_all(&shared_dir)?;
+        let payload = b"\x89PNG-real-bytes-123";
+        std::fs::write(shared_dir.join("reply_cover.png"), payload)?;
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 15,
+                message_id: 404,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        // Абсолютный путь внутри общей папки.
+        let reply = dispatcher
+            .telegram_reply(
+                "developer",
+                "готово".to_string(),
+                vec![TelegramFileArgs {
+                    filename: "cover.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    content_b64: String::new(),
+                    path: Some(shared_dir.join("reply_cover.png").to_string_lossy().to_string()),
+                }],
+            )
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        // Относительный путь тоже работает.
+        let reply2 = dispatcher
+            .telegram_reply(
+                "developer",
+                "готово2".to_string(),
+                vec![TelegramFileArgs {
+                    filename: "cover2.png".to_string(),
+                    mime_type: None,
+                    content_b64: String::new(),
+                    path: Some("reply_cover.png".to_string()),
+                }],
+            )
+            .await;
+        assert!(!reply2.is_error, "unexpected: {:?}", reply2.value);
+        let items = store.due_outbox(10).await?;
+        let covers: Vec<_> = items
+            .iter()
+            .filter(|item| item.event == "TELEGRAM_REPLY")
+            .collect();
+        assert_eq!(covers.len(), 2);
+        let expected = base64::engine::general_purpose::STANDARD.encode(payload);
+        for cover in &covers {
+            assert_eq!(cover.media[0].content_b64, expected, "файл прочитан целиком");
+        }
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&shared_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_rejects_paths_outside_the_shared_dir() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        let shared_dir = dispatcher.config.shared_files_dir.clone();
+        std::fs::create_dir_all(&shared_dir)?;
+        std::fs::write(shared_dir.join("secrets.txt"), b"secret")?;
+        for bad_path in ["/etc/hostname", "/opt/data/../etc/passwd"] {
+            let reply = dispatcher
+                .telegram_reply(
+                    "developer",
+                    "x".to_string(),
+                    vec![TelegramFileArgs {
+                        filename: "evil.png".to_string(),
+                        mime_type: None,
+                        content_b64: String::new(),
+                        path: Some(bad_path.to_string()),
+                    }],
+                )
+                .await;
+            assert!(reply.is_error, "path {bad_path} must be rejected: {:?}", reply.value);
+        }
+        // Отсутствующий файл внутри общей папки — тоже ошибка.
+        let reply = dispatcher
+            .telegram_reply(
+                "developer",
+                "x".to_string(),
+                vec![TelegramFileArgs {
+                    filename: "nope.png".to_string(),
+                    mime_type: None,
+                    content_b64: String::new(),
+                    path: Some("no_such_file.png".to_string()),
+                }],
+            )
+            .await;
+        assert!(reply.is_error, "missing file must be rejected: {:?}", reply.value);
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&shared_dir);
         Ok(())
     }
 
@@ -3811,16 +3991,19 @@ mod tests {
                 filename: "a.png".to_string(),
                 mime_type: Some("image/png".to_string()),
                 content_b64: "YQ==".to_string(),
+                    path: None,
             },
             TelegramFileArgs {
                 filename: "b.pdf".to_string(),
                 mime_type: None,
                 content_b64: "Yg==".to_string(),
+                    path: None,
             },
             TelegramFileArgs {
                 filename: "c.pdf".to_string(),
                 mime_type: None,
                 content_b64: "Yw==".to_string(),
+                    path: None,
             },
         ];
         assert!(
