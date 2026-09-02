@@ -11,3 +11,4 @@ __pycache__/
 .vscode/
 dist/
 .env.agent-sales-0
+.env.*
