@@ -349,6 +349,8 @@ impl TelegramGateway {
                         chat_id: message.chat.id,
                     })
                     .await;
+                // Пользователь ждёт ответа агентом — сразу ставим «печатает».
+                let _ = self.send_typing(message.chat.id).await;
                 if outcome.value.get("error").and_then(Value::as_str)
                     == Some("persistent dispatch reservation failed")
                 {
@@ -496,6 +498,23 @@ impl TelegramGateway {
             .bytes()
             .await?;
         Ok(bytes.to_vec())
+    }
+
+    /// «Печатает…» в чате: показываем сразу при приёме запроса и при каждом
+    /// тике воркера, пока агент ещё работает (Telegram-пузырь живёт ~5 с).
+    async fn send_typing(&self, chat_id: i64) -> anyhow::Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/sendChatAction", self.bot_url))
+            .json(&json!({
+                "chat_id": chat_id,
+                "action": "typing",
+            }))
+            .send()
+            .await
+            .map_err(|_| anyhow!("Telegram sendChatAction request failed"))?;
+        telegram_payload(response).await?;
+        Ok(())
     }
 
     async fn send_text(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {

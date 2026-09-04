@@ -1299,6 +1299,14 @@ impl Dispatcher {
                 continue;
             }
             match self.fetch_run_outcome(&run_id, &role).await {
+                Ok(RunOutcome::Running) => {
+                    // Агент ещё думает (локальные модели — минуты): держим
+                    // «печатает…» живым на каждом тике (интервал ≈ 5 с,
+                    // пузырь Telegram живёт ~5–6 с).
+                    if let Err(error) = self.send_typing(Some(chat_id)).await {
+                        debug!(run_id = %run_id, error = %error, "typing heartbeat failed");
+                    }
+                }
                 Ok(outcome) => {
                     self.deliver_run_reply(&run_id, &role, chat_id, outcome)
                         .await;
@@ -1377,6 +1385,34 @@ impl Dispatcher {
         if let Err(error) = self.store.untrack_run_reply(run_id).await {
             warn!(run_id = %run_id, error = %error, "untracking run reply failed");
         }
+    }
+
+    /// «Печатает…» в целевой чат (— fallback: общий чат).
+    async fn send_typing(&self, chat: Option<i64>) -> anyhow::Result<()> {
+        if !self.config.telegram_enabled {
+            return Ok(());
+        }
+        let Some(token) = &self.config.telegram_bot_token else {
+            return Ok(());
+        };
+        let chat_id = match (chat, &self.config.telegram_group_id) {
+            (Some(chat), _) => chat.to_string(),
+            (None, Some(group)) => group.clone(),
+            (None, None) => return Ok(()),
+        };
+        let api_base = self.config.telegram_api_base_url.as_str().trim_end_matches('/');
+        let response = self
+            .telegram_client
+            .post(format!("{api_base}/bot{}/sendChatAction", token.expose()))
+            .json(&json!({"chat_id": chat_id, "action": "typing"}))
+            .send()
+            .await
+            .map_err(|_| anyhow!("Telegram sendChatAction request failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("sendChatAction failed: HTTP {status}"));
+        }
+        Ok(())
     }
 
     async fn flush_outbox(&self) -> anyhow::Result<()> {
@@ -3464,8 +3500,9 @@ mod tests {
             )
         };
         let router = Router::new()
-            .route("/bot{token}/sendMessage", post(handler))
-            .route("/bot{token}/sendPhoto", post(handler))
+            .route("/bot{token}/sendMessage", post(handler.clone()))
+            .route("/bot{token}/sendChatAction", post(handler.clone()))
+            .route("/bot{token}/sendPhoto", post(handler.clone()))
             .route("/bot{token}/sendDocument", post(handler))
             .route("/bot{token}/getFile", get(get_file_handler))
             .route("/file/bot{token}/{*path}", get(file_handler))
@@ -4207,6 +4244,73 @@ mod tests {
 
         // The run is no longer tracked once delivered.
         assert!(store.due_run_replies().await?.is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    /// Покеда агент думает — воркер должен держать «печатает…» живым:
+    /// на каждом тике flush шлётся sendChatAction(chat_id).
+    #[tokio::test]
+    async fn flush_run_replies_keeps_typing_while_agent_runs() -> anyhow::Result<()> {
+        let seen: Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_bot = seen.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, body| {
+                if body.starts_with("GET /v1/runs/") {
+                    (200, json!({"object": "hermes.run", "run_id": "run-tg", "status": "running"}))
+                } else {
+                    (202, json!({"run_id": "run-tg"}))
+                }
+            }),
+            Arc::new(move |path, body| {
+                seen_bot.lock().unwrap().push((path.to_string(), json!(body)));
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 7,
+                message_id: 101,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+
+        dispatcher.flush_run_replies().await?;
+
+        let calls = seen.lock().unwrap();
+        let typing = calls
+            .iter()
+            .filter(|entry| entry.0.ends_with("sendChatAction"))
+            .collect::<Vec<_>>();
+        assert!(!typing.is_empty(), "heartbeat sendChatAction must fire while running: {calls:?}");
+        assert!(
+            typing[0].1.to_string().contains("424242"),
+            "typing must target the source chat: {typing:?}",
+        );
+        // Пузырь «печатает» ставится ровно один раз за тик (без спама sendMessage).
+        assert!(
+            !calls.iter().any(|entry| entry.0.ends_with("sendMessage")),
+            "heartbeat must not send messages: {calls:?}",
+        );
+        // Пока running — трек не снимается, ответ ещё не поставлен.
+        assert_eq!(store.due_run_replies().await?.len(), 1);
+        // Ответа ещё нет: в outbox не должно быть TELEGRAM_REPLY (audit-запись
+        // приёма — не считается).
+        assert!(
+            store
+                .due_outbox(10)
+                .await?
+                .iter()
+                .all(|item| item.event != "TELEGRAM_REPLY")
+        );
+        drop(calls);
         testutil::remove_db_files(&path).await;
         Ok(())
     }
