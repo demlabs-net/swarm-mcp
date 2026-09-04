@@ -1396,7 +1396,11 @@ impl Dispatcher {
             (None, Some(group)) => group.clone(),
             (None, None) => return Ok(()),
         };
-        let api_base = self.config.telegram_api_base_url.as_str().trim_end_matches('/');
+        let api_base = self
+            .config
+            .telegram_api_base_url
+            .as_str()
+            .trim_end_matches('/');
         let response = self
             .telegram_client
             .post(format!("{api_base}/bot{}/sendChatAction", token.expose()))
@@ -4294,13 +4298,19 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_telegram_bot(
             Arc::new(|_, body| {
                 if body.starts_with("GET /v1/runs/") {
-                    (200, json!({"object": "hermes.run", "run_id": "run-tg", "status": "running"}))
+                    (
+                        200,
+                        json!({"object": "hermes.run", "run_id": "run-tg", "status": "running"}),
+                    )
                 } else {
                     (202, json!({"run_id": "run-tg"}))
                 }
             }),
             Arc::new(move |path, body| {
-                seen_bot.lock().unwrap().push((path.to_string(), json!(body)));
+                seen_bot
+                    .lock()
+                    .unwrap()
+                    .push((path.to_string(), json!(body)));
                 (200, json!({"ok": true}), None)
             }),
         )
@@ -4325,7 +4335,10 @@ mod tests {
             .iter()
             .filter(|entry| entry.0.ends_with("sendChatAction"))
             .collect::<Vec<_>>();
-        assert!(!typing.is_empty(), "heartbeat sendChatAction must fire while running: {calls:?}");
+        assert!(
+            !typing.is_empty(),
+            "heartbeat sendChatAction must fire while running: {calls:?}"
+        );
         assert!(
             typing[0].1.to_string().contains("424242"),
             "typing must target the source chat: {typing:?}",
