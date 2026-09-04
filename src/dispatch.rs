@@ -705,7 +705,7 @@ impl Dispatcher {
                 ("message", message.as_str()),
             ]),
         ) {
-            Ok(value) => value,
+            Ok(value) => append_opaque_correlation_guard(value, correlation_id.as_deref()),
             Err(error) => {
                 return self
                     .fail_dispatch(&message_id, error, sender, "MSG_FAILED", &target, &message)
@@ -823,7 +823,8 @@ impl Dispatcher {
                     ("correlation_id", correlation_id.as_deref().unwrap_or("")),
                     ("message", message.as_str()),
                 ]),
-            );
+            )
+            .map(|value| append_opaque_correlation_guard(value, correlation_id.as_deref()));
             let result = match body {
                 Ok(body) => {
                     self.dispatch_role_or_queue(
@@ -2432,6 +2433,19 @@ fn render_dispatch_template(
             ("message", message),
         ]),
     )
+    .map(|value| append_opaque_correlation_guard(value, correlation_id))
+}
+
+fn append_opaque_correlation_guard(mut body: String, correlation_id: Option<&str>) -> String {
+    if let Some(task_id) = correlation_id.filter(|value| !value.is_empty()) {
+        body.push_str(
+            "\n\n[OPAQUE_CORRELATION] The Correlation value is the exact opaque SLC task ID. ",
+        );
+        body.push_str("Copy it byte-for-byte into task tools, including apparent truncation or suffixes; never expand, normalize, or reconstruct it from a task name or slug. Exact task_id: `");
+        body.push_str(task_id);
+        body.push('`');
+    }
+    body
 }
 
 fn telegram_chunks(header: &str, text: &str, limit: usize) -> Vec<String> {
@@ -2591,6 +2605,24 @@ mod tests {
             .unwrap(),
             "dispatch_1|manager|designer|make a mockup"
         );
+    }
+
+    #[test]
+    fn correlated_dispatch_appends_an_opaque_task_id_guard() {
+        let body = render_dispatch_template(
+            "{correlation_id}|{message}",
+            "dispatch_1",
+            "manager",
+            "dev-senior-0",
+            Some("whole_design_build_gostinitsa_sky_port_novosibir"),
+            "ready",
+        )
+        .unwrap();
+
+        assert!(body.starts_with("whole_design_build_gostinitsa_sky_port_novosibir|ready"));
+        assert!(body.contains("[OPAQUE_CORRELATION]"));
+        assert!(body.contains("Copy it byte-for-byte"));
+        assert!(body.contains("never expand, normalize, or reconstruct"));
     }
 
     use std::collections::BTreeSet;

@@ -74,7 +74,10 @@ accepted during migration but is not advertised.
 
 The delivered prompt contains `dispatch_id`, sender, recipient, optional
 `correlation_id`, and message. The recipient must read canonical task state
-from SLC rather than treating the transport payload as authoritative.
+from SLC rather than treating the transport payload as authoritative. When a
+correlation is present, the transport appends a non-authoritative guard that
+requires the recipient to copy that opaque SLC task ID byte-for-byte instead
+of reconstructing a truncated identifier from a human-readable task name.
 
 ## Resources
 
