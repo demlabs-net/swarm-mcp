@@ -147,10 +147,10 @@ impl RoleMcp {
             ));
             tools.push(control_tool(
                 "messaging_clear_queue",
-                "Cancel undelivered role wakes and Telegram audit items sent by or addressed to one executor without deleting delivered history.",
+                "Cancel undelivered role wakes and Telegram audit items sent by or addressed to one role, including the manager's own inbound backlog, without deleting delivered history.",
                 object_schema(
                     &json!({
-                        "agent": {"type": "string", "enum": config.agent_roles},
+                        "agent": {"type": "string", "enum": config.all_roles},
                         "include_dead": {
                             "type": "boolean",
                             "default": true,

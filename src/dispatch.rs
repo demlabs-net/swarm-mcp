@@ -1989,7 +1989,7 @@ impl Dispatcher {
         if let Err(outcome) = self.authorize_messaging_control(sender) {
             return outcome;
         }
-        let target = match self.control_target(&args.agent) {
+        let target = match self.queue_control_target(&args.agent) {
             Ok(target) => target,
             Err(outcome) => return outcome,
         };
@@ -2065,6 +2065,18 @@ impl Dispatcher {
                 "ok": false,
                 "error": "messaging controls apply only to configured executor roles",
                 "allowed": self.config.agent_roles,
+            })));
+        }
+        Ok(target)
+    }
+
+    fn queue_control_target(&self, value: &str) -> Result<String, ToolOutcome> {
+        let target = value.trim().to_lowercase();
+        if !self.config.all_roles.contains(&target) {
+            return Err(tool_error(json!({
+                "ok": false,
+                "error": "queue controls apply only to configured swarm roles",
+                "allowed": self.config.all_roles,
             })));
         }
         Ok(target)
@@ -2762,6 +2774,18 @@ mod tests {
             )
             .await;
         assert!(unauthorized_clear.is_error);
+
+        let manager_self_clear = dispatcher
+            .clear_message_queue(
+                "manager",
+                ClearMessageQueueArgs {
+                    agent: "manager".to_string(),
+                    include_dead: true,
+                },
+            )
+            .await;
+        assert!(!manager_self_clear.is_error);
+        assert_eq!(manager_self_clear.value["agent"], json!("manager"));
 
         let blocked_dispatch = dispatcher
             .dispatch_to(
