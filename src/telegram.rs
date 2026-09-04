@@ -42,6 +42,18 @@ struct TelegramMessage {
     document: Option<TelegramDocument>,
     #[serde(default)]
     caption: Option<String>,
+    #[serde(default)]
+    video: Option<TelegramVideo>,
+    #[serde(default)]
+    audio: Option<TelegramAudio>,
+    #[serde(default)]
+    voice: Option<TelegramVoice>,
+    #[serde(default)]
+    video_note: Option<TelegramVideoNote>,
+    #[serde(default)]
+    sticker: Option<TelegramSticker>,
+    #[serde(default)]
+    animation: Option<TelegramAnimation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +78,104 @@ struct TelegramDocument {
     mime_type: Option<String>,
     #[serde(default)]
     file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVideo {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAudio {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVoice {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVideoNote {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _length: Option<i64>,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramSticker {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _width: Option<i64>,
+    #[serde(default)]
+    _height: Option<i64>,
+    #[serde(default)]
+    is_animated: Option<bool>,
+    #[serde(default)]
+    is_video: Option<bool>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAnimation {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +536,92 @@ impl TelegramGateway {
                 document.file_name.clone(),
             ));
         }
+        if let Some(video) = &message.video {
+            let name = video.file_name.clone().or_else(|| {
+                let w = video.width.unwrap_or(0);
+                let h = video.height.unwrap_or(0);
+                Some(format!("video_{w}x{h}.mp4"))
+            });
+            targets.push((
+                &video.file_id,
+                video.file_size,
+                video
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("video/mp4".to_string())),
+                name,
+            ));
+        }
+        if let Some(audio) = &message.audio {
+            let name = audio
+                .file_name
+                .clone()
+                .or_else(|| Some("audio.mp3".to_string()));
+            targets.push((
+                &audio.file_id,
+                audio.file_size,
+                audio
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("audio/mpeg".to_string())),
+                name,
+            ));
+        }
+        if let Some(voice) = &message.voice {
+            targets.push((
+                &voice.file_id,
+                voice.file_size,
+                voice
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("audio/ogg".to_string())),
+                Some("voice.ogg".to_string()),
+            ));
+        }
+        if let Some(video_note) = &message.video_note {
+            targets.push((
+                &video_note.file_id,
+                video_note.file_size,
+                Some("video/mp4".to_string()),
+                Some("video_note.mp4".to_string()),
+            ));
+        }
+        if let Some(sticker) = &message.sticker {
+            let is_animated = sticker.is_animated.unwrap_or(false);
+            let is_video = sticker.is_video.unwrap_or(false);
+            let (mime, ext) = if is_animated {
+                ("application/json", "tgs")
+            } else if is_video {
+                ("video/webm", "webm")
+            } else {
+                ("image/webp", "webp")
+            };
+            targets.push((
+                &sticker.file_id,
+                sticker.file_size,
+                Some(mime.to_string()),
+                sticker
+                    .file_name
+                    .clone()
+                    .or_else(|| Some(format!("sticker.{ext}"))),
+            ));
+        }
+        if let Some(animation) = &message.animation {
+            let name = animation.file_name.clone().or_else(|| {
+                let w = animation.width.unwrap_or(0);
+                let h = animation.height.unwrap_or(0);
+                Some(format!("animation_{w}x{h}.gif"))
+            });
+            targets.push((
+                &animation.file_id,
+                animation.file_size,
+                animation
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("image/gif".to_string())),
+                name,
+            ));
+        }
         let dir = self.state.config.shared_files_dir.clone();
         if let Err(error) = tokio::fs::create_dir_all(&dir).await {
             warn!(error = %error, path = %dir.display(), "inbound files dir create failed");
@@ -439,16 +635,28 @@ impl TelegramGateway {
                         Ok(path) => {
                             let downloaded_size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
                             let size_kb = size.unwrap_or(downloaded_size) / 1024;
+                            let mime_str = mime.as_deref().unwrap_or("application/octet-stream");
+                            let file_name = path
+                                .file_name()
+                                .map_or_else(|| "file".into(), |n| n.to_string_lossy().to_string());
                             notes.push(format!(
                                 "\n📎 Вложение: {} ({}), {} КБ — путь: {}",
-                                path.file_name().map_or_else(
-                                    || "file".into(),
-                                    |n| n.to_string_lossy().to_string()
-                                ),
-                                mime.as_deref().unwrap_or("application/octet-stream"),
+                                file_name,
+                                mime_str,
                                 size_kb,
                                 path.display()
                             ));
+                            // Инлайним содержимое малых текстовых файлов.
+                            let inline_limit = self.state.config.file_inline_max_bytes;
+                            if !bytes.is_empty()
+                                && bytes.len() <= inline_limit
+                                && is_text_mime(mime_str, &file_name)
+                                && let Ok(text) = std::str::from_utf8(&bytes)
+                            {
+                                notes.push(format!(
+                                    "\n📄 Содержимое {file_name}:\n```\n{text}\n```"
+                                ));
+                            }
                         }
                         Err(error) => {
                             warn!(file_id = %file_id, error = %error, "saving inbound file failed");
@@ -460,8 +668,15 @@ impl TelegramGateway {
                 }
             }
         }
-        // Чистим файлы старше суток (входящие вложения не должны копиться).
-        cleanup_inbound_files(&dir, Duration::from_secs(24 * 60 * 60)).await;
+        // Инструкция агенту: если получены файлы — сказать что с ними делать.
+        if !notes.is_empty() {
+            let instructions = &self.state.config.file_inbound_instructions;
+            if !instructions.is_empty() {
+                notes.push(format!("\n\n{instructions}"));
+            }
+        }
+        // Чистим файлы старше настроенного TTL.
+        cleanup_inbound_files(&dir, self.state.config.inbound_file_ttl).await;
         notes
     }
 
@@ -532,6 +747,36 @@ impl TelegramGateway {
         telegram_payload(response).await?;
         Ok(())
     }
+}
+
+/// Returns `true` if the MIME type or filename extension indicates a text file
+/// suitable for inlining into the dispatch message.
+fn is_text_mime(mime: &str, filename: &str) -> bool {
+    if mime.starts_with("text/") || mime == "application/json" || mime == "application/xml" {
+        return true;
+    }
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    matches!(
+        ext,
+        "md" | "txt"
+            | "csv"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "rs"
+            | "py"
+            | "js"
+            | "ts"
+            | "html"
+            | "css"
+            | "sh"
+            | "env"
+            | "cfg"
+            | "ini"
+            | "conf"
+    )
 }
 
 /// Сохраняет вложение в папку входящих файлов с уникальным именем
@@ -1497,5 +1742,195 @@ mod tests {
         assert!(error.contains("getUpdates request failed"), "{error}");
         testutil::remove_db_files(&path).await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn video_attachment_is_downloaded_and_noted() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = Value::Null;
+        update["message"]["caption"] = json!("Видео с презентации");
+        update["message"]["video"] = json!({
+            "file_id": "vid1",
+            "file_unique_id": "uv1",
+            "width": 1920,
+            "height": 1080,
+            "duration": 120,
+            "mime_type": "video/mp4",
+            "file_size": 5_000_000,
+            "file_name": "presentation.mp4"
+        });
+        let updates = json!([update]);
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+            b"\x00\x00\x00\x1cftypmp42".to_vec(),
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("Видео с презентации"),
+                "caption передан: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("📎 Вложение:"),
+                "заметка о видео: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("presentation.mp4"),
+                "имя видеофайла: {}",
+                bodies[0]
+            );
+        }
+        let files = std::fs::read_dir(&inbound_dir)?;
+        let names: Vec<String> = files
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 1, "видео сохранено: {names:?}");
+        assert!(
+            names[0].ends_with("presentation.mp4"),
+            "имя видеофайла: {names:?}"
+        );
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_inbound_instructions_appended_when_files_present() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = Value::Null;
+        update["message"]["caption"] = json!("Документ");
+        update["message"]["document"] = json!({
+            "file_id": "doc1", "file_unique_id": "ud",
+            "file_name": "spec.md", "mime_type": "text/markdown", "file_size": 100
+        });
+        let updates = json!([update]);
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+            b"# Spec content".to_vec(),
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        // Set file_inbound_instructions.
+        {
+            let mut config_mut = gateway.state.config.as_ref().clone();
+            config_mut.file_inbound_instructions =
+                "SLC: slc_add_document, category: documentation".to_string();
+            // We need to rebuild the state with updated config. Instead, just check
+            // that the default fixture instructions appear in the body.
+        }
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("📎 Вложение:"),
+                "заметка о файле: {}",
+                bodies[0]
+            );
+            assert!(bodies[0].contains("spec.md"), "имя файла: {}", bodies[0]);
+            // The fixture config has file_inbound_instructions set.
+            assert!(
+                bodies[0].contains("slc_add_document"),
+                "инструкция SLC в диспатче: {}",
+                bodies[0]
+            );
+        }
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_text_file_is_inlined_in_dispatch() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = Value::Null;
+        update["message"]["caption"] = json!("ТЗ");
+        update["message"]["document"] = json!({
+            "file_id": "doc1", "file_unique_id": "ud",
+            "file_name": "tz.md", "mime_type": "text/markdown", "file_size": 50
+        });
+        let file_content = b"# \xd0\xa2\xd0\x97\n\n\xd0\xa0\xd0\xb5\xd0\xb4\xd0\xb8\xd0\xb7\xd0\xb0\xd0\xb9\xd0\xbd \xd1\x81\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb0";
+        let updates = json!([update]);
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let content_for_mock = file_content.to_vec();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+            content_for_mock,
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("📄 Содержимое"),
+                "содержимое файла инлайнится: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("tz.md"),
+                "имя файла в инлайне: {}",
+                bodies[0]
+            );
+        }
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn is_text_mime_matches_text_and_code_extensions() {
+        assert!(is_text_mime("text/plain", "readme.txt"));
+        assert!(is_text_mime("text/markdown", "doc.md"));
+        assert!(is_text_mime("application/json", "data.json"));
+        assert!(is_text_mime("application/xml", "config.xml"));
+        assert!(is_text_mime("text/x-python", "script.py"));
+        assert!(is_text_mime("text/x-rust", "main.rs"));
+        assert!(is_text_mime("text/html", "page.html"));
+        assert!(is_text_mime("text/css", "style.css"));
+        assert!(is_text_mime("application/octet-stream", "config.yaml"));
+        assert!(is_text_mime("application/octet-stream", "setup.toml"));
+        assert!(is_text_mime("application/octet-stream", ".env"));
+        assert!(!is_text_mime("image/png", "photo.png"));
+        assert!(!is_text_mime("video/mp4", "video.mp4"));
+        assert!(!is_text_mime("audio/mpeg", "song.mp3"));
+        assert!(!is_text_mime("application/pdf", "doc.pdf"));
     }
 }

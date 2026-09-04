@@ -134,6 +134,9 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         // Уникальный каталог на тест (рядом с БД): общий /tmp/inbound у всех
         // тестов приводил к гонкам при параллельном запуске.
         shared_files_dir: state_db_path.with_extension("inbound"),
+        file_inbound_instructions: "Save the file to SLC context (slc_add_document, category: documentation) and link to the active task (slc_update_task).".to_string(),
+        file_inline_max_bytes: 50_000,
+        inbound_file_ttl: Duration::from_secs(86_400),
         manager_instructions: "You are the swarm manager.".to_string(),
         executor_instructions: "You are an executor.".to_string(),
         authority_instructions: "You may dispatch to: {targets}".to_string(),

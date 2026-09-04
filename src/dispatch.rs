@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, ensure, Context as _};
+use anyhow::{Context as _, anyhow, ensure};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, future::join_all};
 use reqwest::{Client, Proxy};
@@ -489,11 +489,7 @@ impl Dispatcher {
         let Ok(Some(chat_id)) = self.store.telegram_chat_for_role(sender).await else {
             return;
         };
-        if let Err(error) = self
-            .store
-            .track_run_reply(run_id, recipient, chat_id)
-            .await
-        {
+        if let Err(error) = self.store.track_run_reply(run_id, recipient, chat_id).await {
             warn!(
                 sender = %sender,
                 recipient = %recipient,
@@ -2583,8 +2579,8 @@ mod tests {
 
     use std::collections::BTreeSet;
 
-    use base64::Engine as _;
     use crate::testutil;
+    use base64::Engine as _;
     use sqlx::Row;
 
     /// Build a dispatcher whose agents all point at one mock Hermes server.
@@ -3844,13 +3840,13 @@ mod tests {
                 filename: "cover_ru.png".to_string(),
                 mime_type: Some("image/png".to_string()),
                 content_b64: "aGVsbG8=".to_string(),
-                    path: None,
+                path: None,
             },
             TelegramFileArgs {
                 filename: "report.pdf".to_string(),
                 mime_type: None,
                 content_b64: "cGRm".to_string(),
-                    path: None,
+                path: None,
             },
         ];
         let reply = dispatcher
@@ -3948,7 +3944,12 @@ mod tests {
                     filename: "cover.png".to_string(),
                     mime_type: Some("image/png".to_string()),
                     content_b64: String::new(),
-                    path: Some(shared_dir.join("reply_cover.png").to_string_lossy().to_string()),
+                    path: Some(
+                        shared_dir
+                            .join("reply_cover.png")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
                 }],
             )
             .await;
@@ -3975,7 +3976,10 @@ mod tests {
         assert_eq!(covers.len(), 2);
         let expected = base64::engine::general_purpose::STANDARD.encode(payload);
         for cover in &covers {
-            assert_eq!(cover.media[0].content_b64, expected, "файл прочитан целиком");
+            assert_eq!(
+                cover.media[0].content_b64, expected,
+                "файл прочитан целиком"
+            );
         }
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&shared_dir);
@@ -4008,7 +4012,11 @@ mod tests {
                     }],
                 )
                 .await;
-            assert!(reply.is_error, "path {bad_path} must be rejected: {:?}", reply.value);
+            assert!(
+                reply.is_error,
+                "path {bad_path} must be rejected: {:?}",
+                reply.value
+            );
         }
         // Отсутствующий файл внутри общей папки — тоже ошибка.
         let reply = dispatcher
@@ -4023,7 +4031,11 @@ mod tests {
                 }],
             )
             .await;
-        assert!(reply.is_error, "missing file must be rejected: {:?}", reply.value);
+        assert!(
+            reply.is_error,
+            "missing file must be rejected: {:?}",
+            reply.value
+        );
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&shared_dir);
         Ok(())
@@ -4077,19 +4089,19 @@ mod tests {
                 filename: "a.png".to_string(),
                 mime_type: Some("image/png".to_string()),
                 content_b64: "YQ==".to_string(),
-                    path: None,
+                path: None,
             },
             TelegramFileArgs {
                 filename: "b.pdf".to_string(),
                 mime_type: None,
                 content_b64: "Yg==".to_string(),
-                    path: None,
+                path: None,
             },
             TelegramFileArgs {
                 filename: "c.pdf".to_string(),
                 mime_type: None,
                 content_b64: "Yw==".to_string(),
-                    path: None,
+                path: None,
             },
         ];
         assert!(

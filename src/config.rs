@@ -139,6 +139,17 @@ pub struct Config {
     /// file attachments are saved; the path is passed to the agent in the
     /// dispatch message.
     pub shared_files_dir: PathBuf,
+    /// Instructions appended to the dispatch message when inbound file
+    /// attachments are present. Tells the agent how to save the file into
+    /// SLC context and link it to the active task.
+    pub file_inbound_instructions: String,
+    /// Maximum file size (bytes) for inlining text file content directly
+    /// into the dispatch message. Files larger than this are referenced by
+    /// path only. Default: `50_000` (~50 KB).
+    pub file_inline_max_bytes: usize,
+    /// TTL for inbound files in `shared_files_dir`. Files older than this
+    /// are cleaned up after each inbound message. Default: 86400 (24h).
+    pub inbound_file_ttl: Duration,
     pub manager_instructions: String,
     pub executor_instructions: String,
     pub authority_instructions: String,
@@ -153,15 +164,17 @@ pub struct Config {
 /// pre-pass (ACL/coverage) and the per-role agent parsing so the two never
 /// disagree on a role's kind.
 fn agent_api_kind(env: &dyn Fn(&str) -> Option<String>, prefix: &str) -> anyhow::Result<ApiKind> {
-    Ok(match optional(env, &format!("{prefix}_API_KIND"))
-        .as_deref()
-        .unwrap_or("hermes")
-    {
-        "hermes" => ApiKind::Hermes,
-        "openai" => ApiKind::OpenAi,
-        "mcp" => ApiKind::Mcp,
-        other => bail!("{prefix}_API_KIND must be hermes, openai or mcp, got {other}"),
-    })
+    Ok(
+        match optional(env, &format!("{prefix}_API_KIND"))
+            .as_deref()
+            .unwrap_or("hermes")
+        {
+            "hermes" => ApiKind::Hermes,
+            "openai" => ApiKind::OpenAi,
+            "mcp" => ApiKind::Mcp,
+            other => bail!("{prefix}_API_KIND must be hermes, openai or mcp, got {other}"),
+        },
+    )
 }
 
 impl Config {
@@ -680,6 +693,16 @@ impl Config {
             shared_files_dir: PathBuf::from(
                 optional(env, "SWARM_SHARED_FILES_DIR")
                     .unwrap_or_else(|| "/opt/data/inbound".to_string()),
+            ),
+            file_inbound_instructions: optional(env, "SWARM_FILE_INBOUND_INSTRUCTIONS")
+                .unwrap_or_default(),
+            file_inline_max_bytes: optional(env, "SWARM_FILE_INLINE_MAX_BYTES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50_000),
+            inbound_file_ttl: Duration::from_secs(
+                optional(env, "SWARM_INBOUND_FILE_TTL_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86_400),
             ),
             manager_instructions: required(env, "SWARM_MANAGER_MCP_INSTRUCTIONS")?,
             executor_instructions: required(env, "SWARM_EXECUTOR_MCP_INSTRUCTIONS")?,
