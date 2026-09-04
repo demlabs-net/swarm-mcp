@@ -486,6 +486,9 @@ impl Dispatcher {
     /// (dispatch_to/msg_to): чат берётся как последний известный inbound-чат
     /// роли-отправителя. Если чата нет — ответ не трекается (терять нечему).
     async fn track_reply_for_sender(&self, sender: &str, run_id: &str, recipient: &str) {
+        if !self.config.telegram_track_dispatch_replies {
+            return;
+        }
         let Ok(Some(chat_id)) = self.store.telegram_chat_for_role(sender).await else {
             return;
         };
@@ -4459,6 +4462,47 @@ mod tests {
             .expect("the dispatch run reply must be enqueued");
         assert_eq!(reply.text, "Отчёт контактера");
         assert_eq!(reply.chat_id, Some(424_242));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_can_run_silently_without_inheriting_operator_chat() -> anyhow::Result<()> {
+        let (mut dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, _| {
+            (202, json!({"run_id": "run-silent"}))
+        }))
+        .await?;
+        Arc::make_mut(&mut dispatcher.config).telegram_track_dispatch_replies = false;
+
+        let inbound = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 88,
+                message_id: 601,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "operator request".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
+        // Direct Telegram runs keep their normal reply contract. Remove that
+        // fixture track so the assertion below observes only dispatch_to.
+        store.untrack_run_reply("run-silent").await?;
+        let out = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "silent internal wake".to_string(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+
+        assert!(!out.is_error, "unexpected: {:?}", out.value);
+        assert!(store.due_run_replies().await?.is_empty());
         testutil::remove_db_files(&path).await;
         Ok(())
     }

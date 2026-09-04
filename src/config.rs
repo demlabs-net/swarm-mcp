@@ -128,6 +128,10 @@ pub struct Config {
     pub outbox_batch_size: i64,
     pub outbox_retention_days: i64,
     pub telegram_inbound_enabled: bool,
+    /// Whether runs spawned indirectly through dispatch_to/msg_to inherit the
+    /// sender's last Telegram chat and publish their raw terminal output.
+    /// Direct Telegram inbound runs are always tracked separately.
+    pub telegram_track_dispatch_replies: bool,
     pub telegram_allowed_users: BTreeSet<i64>,
     pub telegram_inbound_targets: Vec<String>,
     pub telegram_poll_timeout: Duration,
@@ -502,6 +506,8 @@ impl Config {
         }
 
         let telegram_inbound_enabled = bool_env(env, "SWARM_TELEGRAM_INBOUND_ENABLED", false)?;
+        let telegram_track_dispatch_replies =
+            bool_env(env, "SWARM_TELEGRAM_TRACK_DISPATCH_REPLIES", true)?;
         let telegram_allowed_users = optional(env, "TELEGRAM_ALLOWED_USERS")
             .map(|value| {
                 value
@@ -676,6 +682,7 @@ impl Config {
             outbox_batch_size: positive(env, "SWARM_OUTBOX_BATCH_SIZE")?,
             outbox_retention_days: positive(env, "SWARM_OUTBOX_RETENTION_DAYS")?,
             telegram_inbound_enabled,
+            telegram_track_dispatch_replies,
             telegram_allowed_users,
             telegram_inbound_targets,
             telegram_poll_timeout: seconds(env, "SWARM_TELEGRAM_POLL_TIMEOUT_SECONDS")?,

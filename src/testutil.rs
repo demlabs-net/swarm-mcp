@@ -124,6 +124,7 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         outbox_batch_size: 10,
         outbox_retention_days: 30,
         telegram_inbound_enabled: false,
+        telegram_track_dispatch_replies: true,
         telegram_allowed_users: BTreeSet::new(),
         telegram_inbound_targets: Vec::new(),
         telegram_poll_timeout: Duration::from_secs(25),
