@@ -14,11 +14,11 @@ use serde_json::{Value, json};
 
 use crate::{
     AppState,
-    config::TelegramBotMode,
+    config::{ApiKind, TelegramBotMode},
     dispatch::{
-        BroadcastArgs, ClearMessageQueueArgs, DisableMessagingArgs, EnableMessagingArgs,
-        MessageAllArgs, MessageArgs, OrderArgs, ReportArgs, TelegramReplyArgs, ToolOutcome,
-        parse_arguments, render_template,
+        BroadcastArgs, CancelDeliveryArgs, ClearMessageQueueArgs, DisableMessagingArgs,
+        DispatchArgs, EnableMessagingArgs, MessageAllArgs, MessageArgs, TelegramReplyArgs,
+        ToolOutcome, parse_arguments, render_template,
     },
 };
 
@@ -36,48 +36,71 @@ impl RoleMcp {
     fn tools(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
         let config = &self.state.config;
+        tools.push(tool(
+            "cancel_delivery",
+            "Cancel one pending/dead Swarm transport FIFO item by queue_id. This never cancels or mutates an SLC task. Only the original sender or swarm manager may cancel; a delivered item is immutable.",
+            object_schema(
+                &json!({
+                    "queue_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 160,
+                        "description": "Exact Swarm queue_id returned by a queued delivery or read from swarm://operations."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": "Why this undelivered transport wake is no longer eligible."
+                    }
+                }),
+                &["queue_id", "reason"],
+            ),
+        ));
         let targets = config
-            .order_acl
+            .dispatch_acl
             .get(&self.role)
             .cloned()
             .unwrap_or_default();
         if !targets.is_empty() {
             tools.push(tool(
-                "order",
-                "Assign a task to one executor authorized by the current hierarchy.",
+                "dispatch_to",
+                "Deliver a transport message to one authorized role. This does not create, own, mutate, queue, or validate a task; SLC MCP owns the task FIFO. If the role's single-writer Hermes slot is busy, Swarm accepts this content-free wake into its durable transport FIFO and delivers it later.",
                 object_schema(
                     &json!({
-                        "agent": {
+                        "recipient": {
                             "type": "string",
                             "enum": targets,
-                            "description": "Authorized target executor."
+                            "description": "Authorized delivery target."
                         },
-                        "command": {
+                        "message": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": config.max_message_chars,
-                            "description": "Concrete task command."
+                            "description": "Payload to deliver. Task state must already exist in SLC MCP."
                         },
+                        "correlation_id": correlation_schema(),
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["agent", "command"],
+                    &["recipient", "message"],
                 ),
             ));
         }
         if config.global_authorities.contains(&self.role) {
             tools.push(tool(
-                "order_all",
-                "Assign the same task to every executor under this global authority.",
+                "dispatch_all",
+                "Deliver the same transport message to every role in this authority's delivery ACL. No task or status is created.",
                 object_schema(
                     &json!({
-                        "command": {
+                        "message": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": config.max_message_chars
                         },
+                        "correlation_id": correlation_schema(),
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["command"],
+                    &["message"],
                 ),
             ));
         }
@@ -85,19 +108,15 @@ impl RoleMcp {
             let agents = config.agent_roles.clone();
             tools.push(control_tool(
                 "messaging_disable",
-                "Immediately block an executor from sending or receiving Swarm MCP dispatches and optionally cancel undelivered Telegram audits involving it.",
+                "Immediately block an executor from sending or receiving Swarm transport and optionally cancel undelivered role wakes and Telegram audits involving it.",
                 object_schema(
                     &json!({
                         "agent": {"type": "string", "enum": agents},
-                        "reason": {
-                            "type": "string",
-                            "maxLength": 500,
-                            "default": ""
-                        },
+                        "reason": {"type": "string", "maxLength": 500, "default": ""},
                         "clear_queue": {
                             "type": "boolean",
                             "default": true,
-                            "description": "Cancel pending and dead Telegram audit items sent by or addressed to this role."
+                            "description": "Cancel pending/dead role deliveries and Telegram audit items sent by or addressed to this role."
                         }
                     }),
                     &["agent"],
@@ -128,10 +147,10 @@ impl RoleMcp {
             ));
             tools.push(control_tool(
                 "messaging_clear_queue",
-                "Cancel undelivered Telegram audit items sent by or addressed to one executor without deleting delivered audit history.",
+                "Cancel undelivered role wakes and Telegram audit items sent by or addressed to one role, including the manager's own inbound backlog, without deleting delivered history.",
                 object_schema(
                     &json!({
-                        "agent": {"type": "string", "enum": config.agent_roles},
+                        "agent": {"type": "string", "enum": config.all_roles},
                         "include_dead": {
                             "type": "boolean",
                             "default": true,
@@ -143,91 +162,84 @@ impl RoleMcp {
                 true,
             ));
         }
-        if config.agent_roles.contains(&self.role) {
-            let supervisors = config.supervisors(&self.role);
-            let peers = config
-                .agent_roles
-                .iter()
-                .filter(|role| *role != &self.role)
-                .cloned()
-                .collect::<Vec<_>>();
-            tools.push(tool(
-                "report",
-                "Persist and audit progress, completion, failure, or a blocker for an authorized supervisor. Progress does not start a supervisor run; configured terminal statuses do.",
-                object_schema(
-                    &json!({
-                        "summary": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": config.max_message_chars
-                        },
-                        "task_id": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
-                            "description": "Task identifier from the order being reported."
-                        },
-                        "status": {
-                            "type": "string",
-                            "enum": config.report_statuses,
-                            "default": "completed"
-                        },
-                        "recipient": {
-                            "type": "string",
-                            "enum": supervisors,
-                            "default": config.manager_role
-                        },
-                        "idempotency_key": idempotency_schema()
-                    }),
-                    &["summary", "task_id"],
-                ),
-            ));
+
+        // Адресаты msg_to/msg_all — все роли, КРОМЕ mcp-only: облачные роли
+        // (например, голосовые агенты Yandex Realtime) не имеют endpoint'а и
+        // не могут принимать доставку; они сами инициируют сообщения.
+        let peers = config
+            .all_roles
+            .iter()
+            .filter(|role| *role != &self.role)
+            .filter(|role| {
+                !config
+                    .agents
+                    .get(*role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !peers.is_empty() {
             tools.push(tool(
                 "msg_to",
-                "Send a direct coordination message to another executor.",
+                "Deliver a direct wake to another role. Swarm stores transport metadata only and durably queues the wake if that role is busy; for task communication pass only a runnable content-free delivery envelope returned by SLC MCP.",
                 object_schema(
                     &json!({
-                        "agent": {"type": "string", "enum": peers},
-                        "task_id": task_id_schema(),
+                        "recipient": {"type": "string", "enum": peers},
                         "message": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": config.max_message_chars
                         },
+                        "correlation_id": correlation_schema(),
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["agent", "task_id", "message"],
+                    &["recipient", "message"],
                 ),
             ));
             tools.push(tool(
                 "msg_all",
-                "Send the same coordination message to every other executor.",
+                "Deliver the same coordination message to every other role. This is transport, not a task event.",
                 object_schema(
                     &json!({
-                        "task_id": task_id_schema(),
                         "message": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": config.max_message_chars
                         },
+                        "correlation_id": correlation_schema(),
                         "idempotency_key": idempotency_schema()
                     }),
-                    &["task_id", "message"],
+                    &["message"],
                 ),
             ));
         }
         tools.push(tool(
             "telegram_reply",
-            "Send the final answer to the operator who started the most recent Telegram dispatch for this role.",
+            "Send a message (and optionally one or more files) to the operator who started the most recent Telegram dispatch for this role. May be used at any point during the work (intermediate updates and/or the final answer). For files, pass the file path in files[].path (a file inside the shared directory /opt/data/inbound) — this is the reliable way for any size; base64 content in files[].content_b64 is also accepted for small files. Images (mime image/*) are sent as photos, anything else as a document. The message text becomes the caption of the first file; message may be omitted when files are attached.",
             object_schema(
                 &json!({
                     "message": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": config.max_message_chars
+                    },
+                    "files": {
+                        "type": "array",
+                        "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+                                "mime_type": {"type": "string", "maxLength": 100},
+                                "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+                                "content_b64": {"type": "string", "minLength": 1, "maxLength": 8_000_000}
+                            },
+                            "required": ["filename"],
+                            "additionalProperties": false
+                        }
                     }
                 }),
-                &["message"],
+                &[],
             ),
         ));
         tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -237,8 +249,8 @@ impl RoleMcp {
     fn resources(&self) -> Vec<Resource> {
         let mut resources = vec![
             Resource::new("swarm://hierarchy", "hierarchy")
-                .with_title("Development swarm hierarchy")
-                .with_description("Role hierarchy, order ACL, supervisors, and capabilities.")
+                .with_title("Swarm transport topology")
+                .with_description("Role delivery ACL and transport capabilities. Task hierarchy lives in SLC MCP.")
                 .with_mime_type("application/json"),
             Resource::new("swarm://operations", "operations")
                 .with_title("Role operation ledger")
@@ -270,7 +282,7 @@ impl RoleMcp {
         if self
             .state
             .config
-            .order_acl
+            .dispatch_acl
             .get(&self.role)
             .is_some_and(|targets| !targets.is_empty())
         {
@@ -290,7 +302,7 @@ impl RoleMcp {
     fn hierarchy(&self) -> Value {
         let config = &self.state.config;
         let targets = config
-            .order_acl
+            .dispatch_acl
             .get(&self.role)
             .cloned()
             .unwrap_or_default();
@@ -309,23 +321,29 @@ impl RoleMcp {
                 } else {
                     config.descriptions.get(role).map_or("", String::as_str)
                 },
-                "may_order": config.order_acl.get(role).cloned().unwrap_or_default(),
+                "mcp_only": config
+                    .agents
+                    .get(role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp),
+                "may_dispatch": config.dispatch_acl.get(role).cloned().unwrap_or_default(),
             })).collect::<Vec<_>>(),
-            "caller_may_order": targets,
-            "caller_supervisors": if config.agent_roles.contains(&self.role) {
-                config.supervisors(&self.role)
-            } else {
-                Vec::<String>::new()
-            },
+            "caller_may_dispatch": targets,
+            "caller_delivery_sources": config.dispatch_sources(&self.role),
             "tools": tools,
+            "domain_boundary": {
+                "transport_only": true,
+                "task_system": "slc-mcp",
+                "correlation_id": "opaque"
+            },
             "safeguards": {
                 "durable_operations": true,
+                "busy_recipient_delivery_fifo": true,
+                "delivery_fifo_scope": "recipient",
                 "idempotency_keys": true,
                 "rate_limit": config.rate_limit,
                 "rate_window_seconds": config.rate_window.as_secs(),
                 "duplicate_window_seconds": config.duplicate_window.as_secs(),
                 "messaging_reenable_cooldown_seconds": config.messaging_reenable_cooldown.as_secs(),
-                "report_wake_statuses": config.report_wake_statuses,
                 "max_inflight_dispatches": config.max_inflight_dispatches,
                 "telegram_outbox": config.telegram_enabled,
                 "telegram_bot_mode": match config.telegram_bot_mode {
@@ -347,7 +365,7 @@ impl RoleMcp {
             config.executor_instructions.clone()
         }];
         if let Some(targets) = config
-            .order_acl
+            .dispatch_acl
             .get(&self.role)
             .filter(|targets| !targets.is_empty())
         {
@@ -363,22 +381,13 @@ impl RoleMcp {
         }
         pieces.push(
             format!(
-                "Use a unique, stable idempotency_key when retrying any order, report, or message; never recycle it for another logical operation. A dispatch that definitively failed releases its key, so retrying with the same key re-executes; accepted, partial, and indeterminate results replay. The server also suppresses content-identical dispatches for {} seconds even when the caller changes or omits the key. Idempotency records are retained for {} days. Read swarm://operations before retrying.",
+                "Swarm MCP is transport only. SLC MCP owns task FIFO position, readiness, status, lineage, reports, and task messages. Call dispatch_to/msg_to only for an SLC envelope with wake_recommended=true and pass its task id as opaque correlation_id; never send readiness, availability, preflight, or status probes because each delivery starts a real run. A busy Hermes profile (HTTP 429 from max_concurrent_runs) is accepted into a durable per-recipient transport FIFO; queued=true is success, so do not retry or create another task. If an undelivered wake becomes obsolete, its original sender (or the manager) may cancel only its exact queue_id with cancel_delivery; this never changes the SLC task. Use one stable idempotency_key per logical delivery. Content-identical deliveries are suppressed for {} seconds. Delivery records are retained for {} days; read swarm://operations for queued/delivered/dead/cancelled transport state.",
                 config.duplicate_window.as_secs(), config.operation_retention_days
             )
         );
-        pieces.push(format!(
-            "Progress reports are persisted and audited without starting a supervisor run. Only these terminal/material statuses wake the supervisor: {}.",
-            config
-                .report_wake_statuses
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
         if self.role == config.manager_role {
             pieces.push(format!(
-                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered Telegram audits sent by or addressed to that executor. A dispatch rejected by this breaker is a terminal stop condition for the current run: do not call messaging_enable to make an order succeed. Re-enable only in a later turn after an explicit human resume request, verified remediation, a fresh swarm://messaging read, and the {}-second cooldown. messaging_enable never replays cancelled items.",
+                "Use messaging_disable as the emergency circuit breaker when an executor loops or floods communication. It blocks both directions through Swarm MCP and, by default, cancels undelivered role wakes and Telegram audits sent by or addressed to that executor. A delivery rejected by this breaker is a terminal stop condition for the current run: do not call messaging_enable merely to make delivery succeed. Re-enable only in a later turn after an explicit human resume request, verified remediation, a fresh swarm://messaging read, and the {}-second cooldown. messaging_enable never replays cancelled items.",
                 config.messaging_reenable_cooldown.as_secs()
             ));
         }
@@ -426,16 +435,21 @@ impl ServerHandler for RoleMcp {
             ));
         }
         let outcome = match request.name.as_ref() {
-            "order" => match parse_arguments::<OrderArgs>(request.arguments) {
-                Ok(args) => self.state.dispatcher.order(&self.role, args).await,
+            "cancel_delivery" => match parse_arguments::<CancelDeliveryArgs>(request.arguments) {
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .cancel_delivery(&self.role, args)
+                        .await
+                }
                 Err(outcome) => outcome,
             },
-            "order_all" => match parse_arguments::<BroadcastArgs>(request.arguments) {
-                Ok(args) => self.state.dispatcher.order_all(&self.role, args).await,
+            "dispatch_to" => match parse_arguments::<DispatchArgs>(request.arguments) {
+                Ok(args) => self.state.dispatcher.dispatch_to(&self.role, args).await,
                 Err(outcome) => outcome,
             },
-            "report" => match parse_arguments::<ReportArgs>(request.arguments) {
-                Ok(args) => self.state.dispatcher.report(&self.role, args).await,
+            "dispatch_all" => match parse_arguments::<BroadcastArgs>(request.arguments) {
+                Ok(args) => self.state.dispatcher.dispatch_all(&self.role, args).await,
                 Err(outcome) => outcome,
             },
             "msg_to" => match parse_arguments::<MessageArgs>(request.arguments) {
@@ -447,7 +461,12 @@ impl ServerHandler for RoleMcp {
                 Err(outcome) => outcome,
             },
             "telegram_reply" => match parse_arguments::<TelegramReplyArgs>(request.arguments) {
-                Ok(args) => self.state.dispatcher.telegram_reply(&self.role, args.message).await,
+                Ok(args) => {
+                    self.state
+                        .dispatcher
+                        .telegram_reply(&self.role, args.message, args.files)
+                        .await
+                }
                 Err(outcome) => outcome,
             },
             "messaging_disable" => match parse_arguments::<DisableMessagingArgs>(request.arguments)
@@ -517,7 +536,7 @@ impl ServerHandler for RoleMcp {
                 let allowed = self
                     .state
                     .config
-                    .order_acl
+                    .dispatch_acl
                     .get(&self.role)
                     .cloned()
                     .unwrap_or_default();
@@ -600,7 +619,9 @@ fn object_schema(properties: &Value, required: &[&str]) -> Arc<JsonObject> {
             "type": "object",
             "properties": properties,
             "required": required,
-            "additionalProperties": false,
+            // Lenient: LLM clients occasionally add stray fields (e.g. wait_s);
+            // rejecting them breaks the whole call. Unknown fields are ignored.
+            "additionalProperties": true,
         })
         .as_object()
         .cloned()
@@ -618,12 +639,13 @@ fn idempotency_schema() -> Value {
     })
 }
 
-fn task_id_schema() -> Value {
+fn correlation_schema() -> Value {
     json!({
         "type": "string",
         "minLength": 1,
         "maxLength": crate::dispatch::MAX_IDENTIFIER_BYTES,
-        "description": "Task identifier from the active order; peer coordination without task lineage is rejected."
+        "pattern": "^[A-Za-z0-9_.:-]+$",
+        "description": "Optional opaque external reference, normally an SLC task/event id. Swarm MCP never resolves or mutates it."
     })
 }
 
@@ -684,11 +706,14 @@ mod tests {
         assert_eq!(
             tool_names(&mcp),
             vec![
+                "cancel_delivery",
+                "dispatch_all",
+                "dispatch_to",
                 "messaging_clear_queue",
                 "messaging_disable",
                 "messaging_enable",
-                "order",
-                "order_all",
+                "msg_all",
+                "msg_to",
                 "telegram_reply"
             ]
         );
@@ -696,15 +721,15 @@ mod tests {
         assert!(resources.contains(&"swarm://executors".to_string()));
         assert!(resources.contains(&"swarm://activity".to_string()));
         assert!(resources.contains(&"swarm://messaging".to_string()));
-        // the order tool schema enumerates exactly the ACL targets
-        let order = mcp
+        // the dispatch tool schema enumerates exactly the delivery ACL targets
+        let dispatch = mcp
             .tools()
             .into_iter()
-            .find(|tool| tool.name == "order")
+            .find(|tool| tool.name == "dispatch_to")
             .unwrap();
-        let schema = serde_json::to_value(&order.input_schema).unwrap();
+        let schema = serde_json::to_value(&dispatch.input_schema).unwrap();
         assert_eq!(
-            schema["properties"]["agent"]["enum"],
+            schema["properties"]["recipient"]["enum"],
             json!(["developer", "lead-developer"])
         );
         let enable = mcp
@@ -726,7 +751,7 @@ mod tests {
         let (mcp, path) = role_mcp("developer").await?;
         assert_eq!(
             tool_names(&mcp),
-            vec!["msg_all", "msg_to", "report", "telegram_reply"]
+            vec!["cancel_delivery", "msg_all", "msg_to", "telegram_reply"]
         );
         let resources = resource_uris(&mcp);
         assert!(!resources.contains(&"swarm://executors".to_string()));
@@ -740,7 +765,13 @@ mod tests {
         let (mcp, path) = role_mcp("lead-developer").await?;
         assert_eq!(
             tool_names(&mcp),
-            vec!["msg_all", "msg_to", "order", "report", "telegram_reply"]
+            vec![
+                "cancel_delivery",
+                "dispatch_to",
+                "msg_all",
+                "msg_to",
+                "telegram_reply"
+            ]
         );
         let resources = resource_uris(&mcp);
         assert!(resources.contains(&"swarm://activity".to_string()));
@@ -754,36 +785,52 @@ mod tests {
         let hierarchy = mcp.hierarchy();
         assert_eq!(hierarchy["caller"], json!("lead-developer"));
         assert_eq!(hierarchy["manager"], json!("manager"));
-        assert_eq!(hierarchy["caller_may_order"], json!(["developer"]));
-        assert_eq!(hierarchy["caller_supervisors"], json!(["manager"]));
+        assert_eq!(hierarchy["caller_may_dispatch"], json!(["developer"]));
+        assert_eq!(hierarchy["caller_delivery_sources"], json!(["manager"]));
+        assert_eq!(
+            hierarchy["domain_boundary"]["task_system"],
+            json!("slc-mcp")
+        );
         assert_eq!(
             hierarchy["safeguards"]["telegram_sender_configured"],
             json!(false)
         );
         assert_eq!(
-            hierarchy["tools"],
-            json!(["msg_all", "msg_to", "order", "report", "telegram_reply"])
+            hierarchy["safeguards"]["busy_recipient_delivery_fifo"],
+            json!(true)
         );
-        assert!(mcp.instructions().contains("releases its key"));
+        assert_eq!(
+            hierarchy["tools"],
+            json!([
+                "cancel_delivery",
+                "dispatch_to",
+                "msg_all",
+                "msg_to",
+                "telegram_reply"
+            ])
+        );
+        assert!(mcp.instructions().contains("queued=true is success"));
         testutil::remove_db_files(&path).await;
         Ok(())
     }
 
     #[test]
-    fn parse_arguments_validates_the_json_contract() {
-        let valid: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
-            serde_json::from_str(r#"{"agent":"developer","command":"x"}"#).unwrap(),
+    fn parse_arguments_requires_known_fields_and_ignores_stray_fields() {
+        let valid: Result<DispatchArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"recipient":"developer","message":"x"}"#).unwrap(),
         ));
         assert!(valid.is_ok());
-        let unknown: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
-            serde_json::from_str(r#"{"agent":"developer","command":"x","extra":1}"#).unwrap(),
+        let unknown: Result<DispatchArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"recipient":"developer","message":"x","event_id":"task_event_1","wake_recommended":true}"#).unwrap(),
         ));
-        assert!(unknown.is_err(), "deny_unknown_fields must reject extras");
-        let missing: Result<OrderArgs, ToolOutcome> = parse_arguments(Some(
-            serde_json::from_str(r#"{"agent":"developer"}"#).unwrap(),
+        let unknown = unknown.expect("stray LLM fields must be ignored");
+        assert_eq!(unknown.agent, "developer");
+        assert_eq!(unknown.message, "x");
+        let missing: Result<DispatchArgs, ToolOutcome> = parse_arguments(Some(
+            serde_json::from_str(r#"{"recipient":"developer"}"#).unwrap(),
         ));
         assert!(missing.is_err(), "required fields are enforced");
-        let empty: Result<OrderArgs, ToolOutcome> = parse_arguments(None);
+        let empty: Result<DispatchArgs, ToolOutcome> = parse_arguments(None);
         assert!(empty.is_err(), "no arguments is an error");
     }
 
@@ -797,7 +844,7 @@ mod tests {
         let mut config = testutil::fixture_config(&path);
         config.allowed_hosts = vec!["127.0.0.1".to_string()];
         for agent in config.agents.values_mut() {
-            agent.api_url = hermes.parse()?;
+            agent.api_url = Some(hermes.parse()?);
         }
         let config = Arc::new(config);
         let store = crate::store::Store::connect(&config).await?;
@@ -843,22 +890,23 @@ mod tests {
         ))
         .await?;
 
-        // order tool end-to-end: MCP call -> ACL -> mock Hermes -> durable result.
-        let call =
-            client
-                .call_tool(CallToolRequestParams::new("order").with_arguments(
-                    serde_json::from_str(r#"{"agent":"developer","command":"do it"}"#)?,
-                ))
-                .await?;
+        // transport dispatch end-to-end: MCP call -> ACL -> mock Hermes -> durable result.
+        let call = client
+            .call_tool(CallToolRequestParams::new("dispatch_to").with_arguments(
+                serde_json::from_str(
+                    r#"{"recipient":"developer","message":"do it","correlation_id":"slc-task-1"}"#,
+                )?,
+            ))
+            .await?;
         let structured = call.structured_content.expect("structured result");
         assert_eq!(structured["ok"], json!(true));
         assert_eq!(structured["run_id"], json!("run-e2e"));
 
-        // order_all goes through the same wire path as a global authority.
+        // dispatch_all goes through the same wire path as a global authority.
         let call_all = client
             .call_tool(
-                CallToolRequestParams::new("order_all")
-                    .with_arguments(serde_json::from_str(r#"{"command":"broadcast"}"#)?),
+                CallToolRequestParams::new("dispatch_all")
+                    .with_arguments(serde_json::from_str(r#"{"message":"broadcast"}"#)?),
             )
             .await?;
         let structured_all = call_all.structured_content.expect("structured result");
@@ -885,11 +933,14 @@ mod tests {
         assert_eq!(
             value["tools"],
             json!([
+                "cancel_delivery",
+                "dispatch_all",
+                "dispatch_to",
                 "messaging_clear_queue",
                 "messaging_disable",
                 "messaging_enable",
-                "order",
-                "order_all",
+                "msg_all",
+                "msg_to",
                 "telegram_reply"
             ])
         );
@@ -927,21 +978,19 @@ mod tests {
             .auth_header(config.agents["manager"].mcp_token.expose()),
         ))
         .await?;
-        let assignment =
-            manager
-                .call_tool(CallToolRequestParams::new("order").with_arguments(
-                    serde_json::from_value(json!({
-                        "agent": "lead-developer",
-                        "command": "Review the assigned task"
-                    }))?,
-                ))
-                .await?;
-        let task_id = assignment
-            .structured_content
-            .as_ref()
-            .and_then(|value| value["task_id"].as_str())
-            .expect("assigned task id")
-            .to_string();
+        let delivery = manager
+            .call_tool(CallToolRequestParams::new("dispatch_to").with_arguments(
+                serde_json::from_value(json!({
+                    "recipient": "lead-developer",
+                    "message": "Review SLC task slc-task-42",
+                    "correlation_id": "slc-task-42"
+                }))?,
+            ))
+            .await?;
+        assert_eq!(
+            delivery.structured_content.as_ref().unwrap()["correlation_id"],
+            json!("slc-task-42")
+        );
         manager.cancel().await?;
 
         let client = rmcp::model::ClientInfo::new(
@@ -964,30 +1013,16 @@ mod tests {
         assert_eq!(value["enabled"], json!(true));
         assert_eq!(value["mode"], json!("record-only"));
 
-        // report and msg_to arms of call_tool.
-        let report =
+        let msg =
             client
-                .call_tool(CallToolRequestParams::new("report").with_arguments(
-                    serde_json::from_value(json!({
-                        "summary": "done",
-                        "task_id": task_id,
-                    }))?,
+                .call_tool(CallToolRequestParams::new("msg_to").with_arguments(
+                    serde_json::from_value(json!({"recipient": "developer", "message": "ping", "correlation_id": "slc-task-42"}))?,
                 ))
                 .await?;
-        let report_value = report.structured_content.expect("structured result");
-        assert_eq!(report_value["ok"], json!(true));
-        assert_eq!(report_value["recipient"], json!("manager"));
-
-        let msg = client
-            .call_tool(
-                CallToolRequestParams::new("msg_to").with_arguments(serde_json::from_str(
-                    &format!(r#"{{"agent":"developer","task_id":"{task_id}","message":"ping"}}"#),
-                )?),
-            )
-            .await?;
         let msg_value = msg.structured_content.expect("structured result");
         assert_eq!(msg_value["ok"], json!(true));
-        assert_eq!(msg_value["agent"], json!("developer"));
+        assert_eq!(msg_value["recipient"], json!("developer"));
+        assert_eq!(msg_value["correlation_id"], json!("slc-task-42"));
 
         // The executor must NOT see the manager-only alias.
         assert!(

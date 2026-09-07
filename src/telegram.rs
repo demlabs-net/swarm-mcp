@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex, atomic::AtomicUsize},
+    time::Duration,
+};
 
 use anyhow::{Context, anyhow, bail, ensure};
 use futures::StreamExt;
@@ -12,6 +16,9 @@ use tracing::{error, info, warn};
 use crate::{AppState, config::TelegramBacklogMode, dispatch::TelegramInboundArgs};
 
 const MAX_TELEGRAM_RESPONSE_BYTES: usize = 1024 * 1024;
+static FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+type AttachmentTarget<'a> = (&'a str, Option<i64>, Option<String>, Option<String>);
 
 #[derive(Debug, Deserialize)]
 struct TelegramUpdate {
@@ -27,6 +34,148 @@ struct TelegramMessage {
     from: Option<TelegramUser>,
     chat: TelegramChat,
     text: Option<String>,
+    /// Photos attached to the message (largest size is used); the caption
+    /// carries the accompanying text.
+    #[serde(default)]
+    photo: Vec<TelegramPhotoSize>,
+    #[serde(default)]
+    document: Option<TelegramDocument>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    video: Option<TelegramVideo>,
+    #[serde(default)]
+    audio: Option<TelegramAudio>,
+    #[serde(default)]
+    voice: Option<TelegramVoice>,
+    #[serde(default)]
+    video_note: Option<TelegramVideoNote>,
+    #[serde(default)]
+    sticker: Option<TelegramSticker>,
+    #[serde(default)]
+    animation: Option<TelegramAnimation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramPhotoSize {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    width: i64,
+    height: i64,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramDocument {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVideo {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAudio {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVoice {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVideoNote {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _length: Option<i64>,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramSticker {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    _width: Option<i64>,
+    #[serde(default)]
+    _height: Option<i64>,
+    #[serde(default)]
+    is_animated: Option<bool>,
+    #[serde(default)]
+    is_video: Option<bool>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAnimation {
+    file_id: String,
+    #[serde(rename = "file_unique_id")]
+    _file_unique_id: String,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+    #[serde(default)]
+    _duration: Option<i64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    file_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +244,10 @@ struct TelegramGateway {
     state: Arc<AppState>,
     client: Client,
     bot_url: String,
+    api_base: String,
+    token: String,
     group_id: i64,
+    queued_notices: Mutex<HashSet<i64>>,
 }
 
 impl TelegramGateway {
@@ -119,20 +271,22 @@ impl TelegramGateway {
             builder = builder.proxy(Proxy::all(proxy.as_str())?);
         }
         let client = builder.build()?;
-        let bot_url = format!(
-            "{}/bot{}",
-            state
-                .config
-                .telegram_api_base_url
-                .as_str()
-                .trim_end_matches('/'),
-            token.expose()
-        );
+        let api_base = state
+            .config
+            .telegram_api_base_url
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
+        let token_value = token.expose().to_string();
+        let bot_url = format!("{api_base}/bot{token_value}");
         Ok(Self {
             state,
             client,
             bot_url,
+            api_base,
+            token: token_value,
             group_id,
+            queued_notices: Mutex::new(HashSet::new()),
         })
     }
 
@@ -252,14 +406,30 @@ impl TelegramGateway {
         if user.is_bot || !self.state.config.telegram_allowed_users.contains(&user.id) {
             return Ok(());
         }
-        let Some(text) = message.text.as_deref().map(str::trim) else {
+        // Текст: обычный text или caption фото/документа. Сообщение с одними
+        // файлами (без текста) тоже обрабатывается.
+        let raw_text = message
+            .text
+            .as_deref()
+            .or(message.caption.as_deref())
+            .map(str::trim)
+            .unwrap_or_default();
+        let mut text = raw_text.to_string();
+        // Вложения: скачиваем файлы через Bot API и сохраняем в общую с
+        // агентами папку, путь передаём в сообщении.
+        let notes = self.download_attachments(message).await;
+        if text.is_empty() && notes.is_empty() {
+            // Сообщение без текста и без вложений — нечего диспатчить.
             return Ok(());
-        };
-        let command = parse_mention(text, &self.state.config.telegram_inbound_targets)
-            .or_else(|| parse_command(text, &self.state.config.telegram_inbound_targets))
+        }
+        for note in notes {
+            text.push_str(&note);
+        }
+        let command = parse_mention(&text, &self.state.config.telegram_inbound_targets)
+            .or_else(|| parse_command(&text, &self.state.config.telegram_inbound_targets))
             .unwrap_or_else(|| ParsedCommand::Dispatch {
                 targets: vec![self.state.config.manager_role.clone()],
-                message: text.to_string(),
+                message: text.clone(),
             });
         match command {
             ParsedCommand::Reply(text) => {
@@ -289,11 +459,36 @@ impl TelegramGateway {
                         chat_id: message.chat.id,
                     })
                     .await;
+                // Пользователь ждёт ответа агентом — сразу ставим «печатает».
+                let _ = self.send_typing(message.chat.id).await;
                 if outcome.value.get("error").and_then(Value::as_str)
                     == Some("persistent dispatch reservation failed")
                 {
                     bail!("Telegram dispatch could not be reserved");
                 }
+                if outcome
+                    .value
+                    .get("retryable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let first_notice = self
+                        .queued_notices
+                        .lock()
+                        .expect("Telegram queue notice lock")
+                        .insert(update.update_id);
+                    if first_notice {
+                        let notice = "⏳ Запрос принят и ждёт свободного слота менеджера. Отвечу автоматически; повторять сообщение не нужно.";
+                        if let Err(error) = self.send_text(message.chat.id, notice).await {
+                            warn!(error = %error, "send Telegram queued notice failed");
+                        }
+                    }
+                    bail!("Telegram target is busy; update retained for retry");
+                }
+                self.queued_notices
+                    .lock()
+                    .expect("Telegram queue notice lock")
+                    .remove(&update.update_id);
                 let audit_queued = outcome
                     .value
                     .pointer("/telegram/queued")
@@ -318,6 +513,225 @@ impl TelegramGateway {
         Ok(())
     }
 
+    /// Скачивает файловые вложения сообщения через Bot API (getFile + файл),
+    /// сохраняет в общую с агентами папку и возвращает заметки для сообщения
+    /// диспатча. Сообщения с одними файлами (без текста) тоже обрабатываются.
+    async fn download_attachments(&self, message: &TelegramMessage) -> Vec<String> {
+        let mut notes = Vec::new();
+        let mut targets: Vec<AttachmentTarget<'_>> = Vec::new();
+        // Самое крупное фото (если несколько — берём максимальное).
+        if let Some(photo) = message.photo.iter().max_by_key(|p| p.width * p.height) {
+            targets.push((
+                &photo.file_id,
+                photo.file_size,
+                Some("image/jpeg".to_string()),
+                Some(format!("photo_{}x{}.jpg", photo.width, photo.height)),
+            ));
+        }
+        if let Some(document) = &message.document {
+            targets.push((
+                &document.file_id,
+                document.file_size,
+                document.mime_type.clone(),
+                document.file_name.clone(),
+            ));
+        }
+        if let Some(video) = &message.video {
+            let name = video.file_name.clone().or_else(|| {
+                let w = video.width.unwrap_or(0);
+                let h = video.height.unwrap_or(0);
+                Some(format!("video_{w}x{h}.mp4"))
+            });
+            targets.push((
+                &video.file_id,
+                video.file_size,
+                video
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("video/mp4".to_string())),
+                name,
+            ));
+        }
+        if let Some(audio) = &message.audio {
+            let name = audio
+                .file_name
+                .clone()
+                .or_else(|| Some("audio.mp3".to_string()));
+            targets.push((
+                &audio.file_id,
+                audio.file_size,
+                audio
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("audio/mpeg".to_string())),
+                name,
+            ));
+        }
+        if let Some(voice) = &message.voice {
+            targets.push((
+                &voice.file_id,
+                voice.file_size,
+                voice
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("audio/ogg".to_string())),
+                Some("voice.ogg".to_string()),
+            ));
+        }
+        if let Some(video_note) = &message.video_note {
+            targets.push((
+                &video_note.file_id,
+                video_note.file_size,
+                Some("video/mp4".to_string()),
+                Some("video_note.mp4".to_string()),
+            ));
+        }
+        if let Some(sticker) = &message.sticker {
+            let is_animated = sticker.is_animated.unwrap_or(false);
+            let is_video = sticker.is_video.unwrap_or(false);
+            let (mime, ext) = if is_animated {
+                ("application/json", "tgs")
+            } else if is_video {
+                ("video/webm", "webm")
+            } else {
+                ("image/webp", "webp")
+            };
+            targets.push((
+                &sticker.file_id,
+                sticker.file_size,
+                Some(mime.to_string()),
+                sticker
+                    .file_name
+                    .clone()
+                    .or_else(|| Some(format!("sticker.{ext}"))),
+            ));
+        }
+        if let Some(animation) = &message.animation {
+            let name = animation.file_name.clone().or_else(|| {
+                let w = animation.width.unwrap_or(0);
+                let h = animation.height.unwrap_or(0);
+                Some(format!("animation_{w}x{h}.gif"))
+            });
+            targets.push((
+                &animation.file_id,
+                animation.file_size,
+                animation
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("image/gif".to_string())),
+                name,
+            ));
+        }
+        let dir = self.state.config.shared_files_dir.clone();
+        if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+            warn!(error = %error, path = %dir.display(), "inbound files dir create failed");
+            return notes;
+        }
+        for (file_id, size, mime, name) in targets {
+            match self.download_file(file_id).await {
+                Ok(bytes) => {
+                    let saved = save_inbound_file(&dir, name.as_deref(), &bytes).await;
+                    match saved {
+                        Ok(path) => {
+                            let downloaded_size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+                            let size_kb = size.unwrap_or(downloaded_size) / 1024;
+                            let mime_str = mime.as_deref().unwrap_or("application/octet-stream");
+                            let file_name = path
+                                .file_name()
+                                .map_or_else(|| "file".into(), |n| n.to_string_lossy().to_string());
+                            notes.push(format!(
+                                "\n📎 Вложение: {} ({}), {} КБ — путь: {}",
+                                file_name,
+                                mime_str,
+                                size_kb,
+                                path.display()
+                            ));
+                            // Инлайним содержимое малых текстовых файлов.
+                            let inline_limit = self.state.config.file_inline_max_bytes;
+                            if !bytes.is_empty()
+                                && bytes.len() <= inline_limit
+                                && is_text_mime(mime_str, &file_name)
+                                && let Ok(text) = std::str::from_utf8(&bytes)
+                            {
+                                notes.push(format!(
+                                    "\n📄 Содержимое {file_name}:\n```\n{text}\n```"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            warn!(file_id = %file_id, error = %error, "saving inbound file failed");
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(file_id = %file_id, error = %error, "downloading inbound file failed");
+                }
+            }
+        }
+        // Инструкция агенту: если получены файлы — сказать что с ними делать.
+        if !notes.is_empty() {
+            let instructions = &self.state.config.file_inbound_instructions;
+            if !instructions.is_empty() {
+                notes.push(format!("\n\n{instructions}"));
+            }
+        }
+        // Чистим файлы старше настроенного TTL.
+        cleanup_inbound_files(&dir, self.state.config.inbound_file_ttl).await;
+        notes
+    }
+
+    async fn download_file(&self, file_id: &str) -> anyhow::Result<Vec<u8>> {
+        // Явные таймауты на каждый запрос: клиент гейтвея ограничен
+        // (poll_timeout + 10s), а скачивание вложения может быть дольше.
+        let get_url = format!("{}/getFile?file_id={}", self.bot_url, file_id);
+        let payload: Value = self
+            .client
+            .get(&get_url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let file_path = payload
+            .pointer("/result/file_path")
+            .and_then(Value::as_str)
+            .context("getFile result is missing file_path")?;
+        let file_url = format!(
+            "{}/file/bot{}/{}",
+            self.api_base,
+            self.token,
+            file_path.trim_start_matches('/')
+        );
+        let bytes = self
+            .client
+            .get(&file_url)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// «Печатает…» в чате: показываем сразу при приёме запроса и при каждом
+    /// тике воркера, пока агент ещё работает (Telegram-пузырь живёт ~5 с).
+    async fn send_typing(&self, chat_id: i64) -> anyhow::Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/sendChatAction", self.bot_url))
+            .json(&json!({
+                "chat_id": chat_id,
+                "action": "typing",
+            }))
+            .send()
+            .await
+            .map_err(|_| anyhow!("Telegram sendChatAction request failed"))?;
+        telegram_payload(response).await?;
+        Ok(())
+    }
+
     async fn send_text(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
         let response = self
             .client
@@ -335,11 +749,97 @@ impl TelegramGateway {
     }
 }
 
+/// Returns `true` if the MIME type or filename extension indicates a text file
+/// suitable for inlining into the dispatch message.
+fn is_text_mime(mime: &str, filename: &str) -> bool {
+    if mime.starts_with("text/") || mime == "application/json" || mime == "application/xml" {
+        return true;
+    }
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    matches!(
+        ext,
+        "md" | "txt"
+            | "csv"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "rs"
+            | "py"
+            | "js"
+            | "ts"
+            | "html"
+            | "css"
+            | "sh"
+            | "env"
+            | "cfg"
+            | "ini"
+            | "conf"
+    )
+}
+
+/// Сохраняет вложение в папку входящих файлов с уникальным именем
+/// (`<unix_ms>_<safe_name>`); возвращает полный путь.
+async fn save_inbound_file(
+    dir: &std::path::Path,
+    name: Option<&str>,
+    bytes: &[u8],
+) -> anyhow::Result<std::path::PathBuf> {
+    let safe: String = name
+        .unwrap_or("file")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    let safe = if safe.trim().is_empty() {
+        "file".to_string()
+    } else {
+        safe
+    };
+    let sequence = FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!(
+        "{}_{sequence}_{safe}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    ));
+    tokio::fs::write(&path, bytes).await?;
+    Ok(path)
+}
+
+/// Удаляет входящие файлы старше `max_age`.
+async fn cleanup_inbound_files(dir: &std::path::Path, max_age: Duration) {
+    let Ok(entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut entries = entries;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(metadata) = entry.metadata().await
+            && metadata.is_file()
+            && let Ok(modified) = metadata.modified()
+            && let Ok(age) = modified.elapsed()
+            && age > max_age
+        {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
 /// Parses an "@role message" mention (e.g. "@writer сделай X", "@all текст").
 /// Returns None when the message is not a mention of an allowed target.
 fn parse_mention(text: &str, allowed_targets: &[String]) -> Option<ParsedCommand> {
     let text = text.trim();
-    let (raw_mention, rest) = text.split_once(char::is_whitespace).map_or((text, ""), |(m, r)| (m, r.trim()));
+    let (raw_mention, rest) = text
+        .split_once(char::is_whitespace)
+        .map_or((text, ""), |(m, r)| (m, r.trim()));
     let mention = raw_mention.strip_prefix('@')?.to_lowercase();
     let mention = mention.split('@').next().unwrap_or_default();
     if mention == "all" {
@@ -352,7 +852,7 @@ fn parse_mention(text: &str, allowed_targets: &[String]) -> Option<ParsedCommand
             })
         };
     }
-    if allowed_targets.iter().any(|target| target == &mention) && !rest.is_empty() {
+    if allowed_targets.iter().any(|target| target == mention) && !rest.is_empty() {
         return Some(ParsedCommand::Dispatch {
             targets: vec![mention.to_string()],
             message: rest.to_string(),
@@ -481,19 +981,16 @@ mod tests {
     #[test]
     fn parses_role_mentions() {
         let allowed = targets();
-        let ParsedCommand::Dispatch {
-            targets,
-            message,
-        } = parse_mention("@developer implement it", &allowed).unwrap()
+        let ParsedCommand::Dispatch { targets, message } =
+            parse_mention("@developer implement it", &allowed).unwrap()
         else {
             panic!("expected a mention dispatch");
         };
         assert_eq!(targets, vec!["developer"]);
         assert_eq!(message, "implement it");
 
-        let ParsedCommand::Dispatch {
-            targets: all, ..
-        } = parse_mention("@all status check", &allowed).unwrap()
+        let ParsedCommand::Dispatch { targets: all, .. } =
+            parse_mention("@all status check", &allowed).unwrap()
         else {
             panic!("expected an @all dispatch");
         };
@@ -583,17 +1080,25 @@ mod tests {
     type MockBot = Arc<dyn Fn(&str, &str) -> (u16, Value, Option<String>) + Send + Sync>;
 
     async fn spawn_mock_telegram(behavior: MockBot) -> String {
+        spawn_mock_telegram_with_files(behavior, Vec::new()).await
+    }
+
+    /// Mock с поддержкой входящих файлов: `/getFile` отдаёт фиксированный
+    /// `file_path`, `/file/bot{token}/{path}` — сырые `file_bytes`.
+    async fn spawn_mock_telegram_with_files(behavior: MockBot, file_bytes: Vec<u8>) -> String {
         use axum::{
             Json, Router,
+            body::Bytes,
             extract::{OriginalUri, State as AxumState},
             http::StatusCode,
             response::IntoResponse,
-            routing::post,
+            routing::{get, post},
         };
         let handler = move |AxumState(behavior): AxumState<MockBot>,
                             uri: OriginalUri,
-                            Json(body): Json<Value>| async move {
-            let (status, payload, retry_after) = behavior(uri.path(), &body.to_string());
+                            body: Bytes| async move {
+            let body = String::from_utf8_lossy(&body).to_string();
+            let (status, payload, retry_after) = behavior(uri.path(), &body);
             let mut response = (
                 StatusCode::from_u16(status).expect("mock status"),
                 Json(payload),
@@ -607,9 +1112,25 @@ mod tests {
             }
             response
         };
+        let file_handler = move || async move {
+            let bytes = file_bytes.clone();
+            let mut response = (StatusCode::OK, bytes).into_response();
+            response.headers_mut().insert(
+                reqwest::header::CONTENT_TYPE,
+                "image/png".parse().expect("mime"),
+            );
+            response
+        };
+        let get_file_handler = move || async move {
+            Json(
+                json!({"ok": true, "result": {"file_id": "f1", "file_unique_id": "u1", "file_path": "photos/x.png"}}),
+            )
+        };
         let router = Router::new()
             .route("/bot{token}/getUpdates", post(handler))
             .route("/bot{token}/sendMessage", post(handler))
+            .route("/bot{token}/getFile", get(get_file_handler))
+            .route("/file/bot{token}/{*path}", get(file_handler))
             .with_state(behavior);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -652,22 +1173,68 @@ mod tests {
         backlog: TelegramBacklogMode,
         bot: MockBot,
     ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
-        let path = testutil::temp_db_path("telegram");
-        let telegram_base = spawn_mock_telegram(bot).await;
-        let hermes_base =
-            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "run-1"})))).await;
+        gateway_with_mocks_and_hermes(
+            backlog,
+            bot,
+            Arc::new(|_, _| (202, json!({"run_id": "run-1"}))),
+        )
+        .await
+    }
+
+    async fn gateway_with_mocks_and_files_hermes(
+        backlog: TelegramBacklogMode,
+        bot: MockBot,
+        file_bytes: Vec<u8>,
+        hermes_behavior: testutil::MockHermes,
+    ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("telegram-files");
+        let telegram_base = spawn_mock_telegram_with_files(bot, file_bytes).await;
+        let hermes_base = testutil::spawn_mock_hermes(hermes_behavior).await;
         let mut config = testutil::fixture_config(&path);
         config.telegram_enabled = true;
         config.telegram_bot_mode = TelegramBotMode::Shared;
         config.telegram_bot_token = Some(Secret::new("test-bot-token".to_string()));
         config.telegram_group_id = Some("-100123".to_string());
         config.telegram_inbound_enabled = true;
-        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_inbound_targets = vec!["manager".to_string(), "developer".to_string()];
         config.telegram_allowed_users = BTreeSet::from([42]);
         config.telegram_backlog_mode = backlog;
         config.telegram_api_base_url = telegram_base.parse()?;
         for agent in config.agents.values_mut() {
-            agent.api_url = hermes_base.parse()?;
+            agent.api_url = Some(hermes_base.parse()?);
+        }
+        let config = Arc::new(config);
+        let store = crate::store::Store::connect(&config).await?;
+        let dispatcher = crate::dispatch::Dispatcher::new(config.clone(), store.clone())?;
+        let state = Arc::new(AppState {
+            config,
+            store: store.clone(),
+            dispatcher,
+        });
+        let gateway = TelegramGateway::new(state)?;
+        Ok((gateway, store, path))
+    }
+
+    async fn gateway_with_mocks_and_hermes(
+        backlog: TelegramBacklogMode,
+        bot: MockBot,
+        hermes_behavior: testutil::MockHermes,
+    ) -> anyhow::Result<(TelegramGateway, crate::store::Store, std::path::PathBuf)> {
+        let path = testutil::temp_db_path("telegram");
+        let telegram_base = spawn_mock_telegram(bot).await;
+        let hermes_base = testutil::spawn_mock_hermes(hermes_behavior).await;
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["manager".to_string(), "developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        config.telegram_backlog_mode = backlog;
+        config.telegram_api_base_url = telegram_base.parse()?;
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(hermes_base.parse()?);
         }
         let config = Arc::new(config);
         let store = crate::store::Store::connect(&config).await?;
@@ -715,6 +1282,56 @@ mod tests {
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(status, "accepted", "the Telegram command reached the swarm");
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_target_retains_update_and_sends_one_queue_notice() -> anyhow::Result<()> {
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (gateway, store, path) = gateway_with_mocks_and_hermes(
+            TelegramBacklogMode::Process,
+            canned_bot(json!([allowed_update()]), sent.clone()),
+            Arc::new(|_, _| (429, json!({"error": "busy"}))),
+        )
+        .await?;
+
+        let first = gateway.poll_once().await;
+        assert!(
+            first.is_err(),
+            "busy target must retain the Telegram update"
+        );
+        assert_eq!(
+            store.telegram_update_offset().await?,
+            None,
+            "the durable offset must not advance before target admission"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE id='telegram_5'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "failed", "the failed reservation is retryable");
+        let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            outbox, 0,
+            "transient queue pressure must not spam the shared audit group"
+        );
+        assert_eq!(sent.lock().expect("sent").len(), 1);
+        assert!(
+            sent.lock().expect("sent")[0].contains("ждёт свободного слота"),
+            "operator receives a queue notice"
+        );
+
+        let second = gateway.poll_once().await;
+        assert!(second.is_err());
+        assert_eq!(
+            sent.lock().expect("sent").len(),
+            1,
+            "the same update must not spam repeated queue notices"
+        );
 
         testutil::remove_db_files(&path).await;
         Ok(())
@@ -848,6 +1465,124 @@ mod tests {
             "bots and messages without text never reach the swarm"
         );
         testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_files_are_downloaded_and_passed_to_the_dispatch() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = Value::Null;
+        update["message"]["caption"] = json!("Вот логотип");
+        update["message"]["photo"] = json!([
+            {"file_id": "small", "file_unique_id": "us", "width": 100, "height": 50, "file_size": 100},
+            {"file_id": "large", "file_unique_id": "ul", "width": 800, "height": 400, "file_size": 4000}
+        ]);
+        update["message"]["document"] = json!({
+            "file_id": "doc1", "file_unique_id": "ud",
+            "file_name": "logo.png", "mime_type": "image/png", "file_size": 2048
+        });
+        let updates = json!([update]);
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+            b"\x89PNG-fake-bytes".to_vec(),
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
+        )
+        .await?;
+        // Каталог входящих файлов — рядом с тестовой БД; чистим перед
+        // прогоном, т.к. cleanup удаляет только файлы старше суток.
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        // Диспатч ушёл: сообщение содержит подпись и заметки о двух вложениях.
+        let row: String =
+            sqlx::query_scalar("SELECT result_json FROM dispatches WHERE id = 'telegram_5'")
+                .fetch_one(store.pool())
+                .await?;
+        let value: serde_json::Value = serde_json::from_str(&row)?;
+        assert!(
+            value["results"]["manager"]["run_id"].as_str().is_some(),
+            "простой текст с вложением уходит менеджеру: {value}"
+        );
+        // Сам диспатч (тело запроса к Hermes) несёт подпись и пути к файлам.
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("Вот логотип"),
+                "подпись фото передана: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("📎 Вложение:"),
+                "заметки о вложениях: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("logo.png"),
+                "имя документа: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains(inbound_dir.to_str().unwrap()),
+                "путь для агента должен указывать на общую папку: {}",
+                bodies[0]
+            );
+        }
+        let files = std::fs::read_dir(&inbound_dir)?;
+        let mut names = Vec::new();
+        for entry in files.flatten() {
+            names.push(entry.file_name().to_string_lossy().to_string());
+        }
+        assert_eq!(names.len(), 2, "фото и документ сохранены: {names:?}");
+        assert!(
+            names.iter().any(|n| n.ends_with("logo.png")),
+            "имя документа сохранено: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("photo_800x400.jpg")),
+            "самое крупное фото: {names:?}"
+        );
+        // Содержимое файла совпадает с тем, что отдал Bot API.
+        let saved = std::fs::read(
+            inbound_dir.join(names.iter().find(|n| n.ends_with("logo.png")).unwrap()),
+        )?;
+        assert_eq!(saved, b"\x89PNG-fake-bytes");
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_file_cleanup_removes_old_attachments() -> anyhow::Result<()> {
+        let update = allowed_update();
+        let updates = json!([update]);
+        let (gateway, _store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        let stale = inbound_dir.join("stale.png");
+        std::fs::write(&stale, b"old")?;
+        // Ставим mtime на 25 часов назад (cleanup — старше суток).
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60));
+        std::fs::File::open(&stale)?.set_times(times)?;
+        // Обработанное сообщение запускает cleanup входящих файлов.
+        gateway.poll_once().await?;
+        assert!(!stale.exists(), "файл старше суток удалён");
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
         Ok(())
     }
 
@@ -1007,5 +1742,195 @@ mod tests {
         assert!(error.contains("getUpdates request failed"), "{error}");
         testutil::remove_db_files(&path).await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn video_attachment_is_downloaded_and_noted() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = Value::Null;
+        update["message"]["caption"] = json!("Видео с презентации");
+        update["message"]["video"] = json!({
+            "file_id": "vid1",
+            "file_unique_id": "uv1",
+            "width": 1920,
+            "height": 1080,
+            "duration": 120,
+            "mime_type": "video/mp4",
+            "file_size": 5_000_000,
+            "file_name": "presentation.mp4"
+        });
+        let updates = json!([update]);
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+            b"\x00\x00\x00\x1cftypmp42".to_vec(),
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("Видео с презентации"),
+                "caption передан: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("📎 Вложение:"),
+                "заметка о видео: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("presentation.mp4"),
+                "имя видеофайла: {}",
+                bodies[0]
+            );
+        }
+        let files = std::fs::read_dir(&inbound_dir)?;
+        let names: Vec<String> = files
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 1, "видео сохранено: {names:?}");
+        assert!(
+            names[0].ends_with("presentation.mp4"),
+            "имя видеофайла: {names:?}"
+        );
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_inbound_instructions_appended_when_files_present() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = Value::Null;
+        update["message"]["caption"] = json!("Документ");
+        update["message"]["document"] = json!({
+            "file_id": "doc1", "file_unique_id": "ud",
+            "file_name": "spec.md", "mime_type": "text/markdown", "file_size": 100
+        });
+        let updates = json!([update]);
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+            b"# Spec content".to_vec(),
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        // Set file_inbound_instructions.
+        {
+            let mut config_mut = gateway.state.config.as_ref().clone();
+            config_mut.file_inbound_instructions =
+                "SLC: slc_add_document, category: documentation".to_string();
+            // We need to rebuild the state with updated config. Instead, just check
+            // that the default fixture instructions appear in the body.
+        }
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("📎 Вложение:"),
+                "заметка о файле: {}",
+                bodies[0]
+            );
+            assert!(bodies[0].contains("spec.md"), "имя файла: {}", bodies[0]);
+            // The fixture config has file_inbound_instructions set.
+            assert!(
+                bodies[0].contains("slc_add_document"),
+                "инструкция SLC в диспатче: {}",
+                bodies[0]
+            );
+        }
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_text_file_is_inlined_in_dispatch() -> anyhow::Result<()> {
+        let mut update = allowed_update();
+        update["message"]["text"] = Value::Null;
+        update["message"]["caption"] = json!("ТЗ");
+        update["message"]["document"] = json!({
+            "file_id": "doc1", "file_unique_id": "ud",
+            "file_name": "tz.md", "mime_type": "text/markdown", "file_size": 50
+        });
+        let file_content = b"# \xd0\xa2\xd0\x97\n\n\xd0\xa0\xd0\xb5\xd0\xb4\xd0\xb8\xd0\xb7\xd0\xb0\xd0\xb9\xd0\xbd \xd1\x81\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb0";
+        let updates = json!([update]);
+        let hermes_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bodies = hermes_bodies.clone();
+        let content_for_mock = file_content.to_vec();
+        let (gateway, store, path) = gateway_with_mocks_and_files_hermes(
+            TelegramBacklogMode::Process,
+            Arc::new(move |_, _| (200, json!({"ok": true, "result": updates.clone()}), None)),
+            content_for_mock,
+            Arc::new(move |_, body| {
+                bodies.lock().expect("bodies").push(body.to_string());
+                (202, json!({"run_id": "run-1"}))
+            }),
+        )
+        .await?;
+        let inbound_dir = gateway.state.config.shared_files_dir.clone();
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        std::fs::create_dir_all(&inbound_dir)?;
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        {
+            let bodies = hermes_bodies.lock().expect("bodies");
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("📄 Содержимое"),
+                "содержимое файла инлайнится: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].contains("tz.md"),
+                "имя файла в инлайне: {}",
+                bodies[0]
+            );
+        }
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn is_text_mime_matches_text_and_code_extensions() {
+        assert!(is_text_mime("text/plain", "readme.txt"));
+        assert!(is_text_mime("text/markdown", "doc.md"));
+        assert!(is_text_mime("application/json", "data.json"));
+        assert!(is_text_mime("application/xml", "config.xml"));
+        assert!(is_text_mime("text/x-python", "script.py"));
+        assert!(is_text_mime("text/x-rust", "main.rs"));
+        assert!(is_text_mime("text/html", "page.html"));
+        assert!(is_text_mime("text/css", "style.css"));
+        assert!(is_text_mime("application/octet-stream", "config.yaml"));
+        assert!(is_text_mime("application/octet-stream", "setup.toml"));
+        assert!(is_text_mime("application/octet-stream", ".env"));
+        assert!(!is_text_mime("image/png", "photo.png"));
+        assert!(!is_text_mime("video/mp4", "video.mp4"));
+        assert!(!is_text_mime("audio/mpeg", "song.mp3"));
+        assert!(!is_text_mime("application/pdf", "doc.pdf"));
     }
 }

@@ -1,5 +1,10 @@
 # swarm-mcp: review findings & remediation plan
 
+> Historical audit snapshot for the retired pre-0.5 task-aware interface.
+> Any `order`, `report`, assignment, lineage, or status references below are
+> non-normative history. SLC MCP now owns all workflow state; Swarm MCP carries
+> only transport deliveries and opaque correlations.
+
 Date: 2026-08-14 · Review scope: full Rust codebase (src/, ~5400 LOC) at commit `c494788` (rebased `develop`).
 Baseline: `cargo fmt` ✅ · `cargo test --locked --all-targets` ✅ (17 tests) · `cargo build --locked` ✅ ·
 `cargo clippy --locked --all-targets -- -D warnings` ❌ (fails on toolchains ≥ 1.90, see C-01).
@@ -455,3 +460,39 @@ row claim. The production topology remains a single active Swarm MCP replica.
 Verification: **116 lib + 5 bin tests**; `fmt` ✅; `clippy -D warnings` ✅;
 release build ✅; line coverage **93.67%** (CI gate 90%) ✅; RustSec audit of
 272 locked dependencies (**0 vulnerabilities**) ✅.
+
+---
+
+# Iteration 12 (2026-09-01) — busy-recipient transport FIFO
+
+Scope: preserve one writer per Hermes profile while accepting wakes that arrive
+during its active run. Task readiness and FIFO ownership stay in SLC; Swarm
+stores opaque delivery retries only.
+
+- Schema v6 adds `delivery_outbox` with a monotonic sequence and
+  pending/delivered/dead/cancelled transport states.
+- Per-recipient gates and due-head queries prevent overtaking; a caller sees
+  `queued=true` as a durable accepted result instead of retrying HTTP 429.
+- Circuit-breaker controls cover the new outbox in both directions and preserve
+  held rows when `clear_queue=false`.
+- A cancellable delivery worker is started and awaited with the existing
+  server workers.
+- Regression coverage exercises busy acceptance, FIFO head isolation,
+  no-overtake behavior, delivery completion, circuit-breaker cancellation, and
+  pause/resume. Suite: **140 lib + 5 bin tests**.
+
+Remaining accepted limit: downstream acceptance cannot be exactly-once across
+a process/database failure until Hermes supports an idempotency key on
+`POST /v1/runs`.
+
+# Iteration 13 (2026-09-01) — FIFO crash and stale-snapshot hardening
+
+- Queue-backed operations left pending by a process stop are recovered as
+  accepted from durable outbox evidence; only operations without such evidence
+  remain indeterminate. Partial/dead/cancelled evidence is non-retryable but
+  explicitly returns `ok=false,recovery_required=true`.
+- Delivery enqueue validates duplicate queue IDs and payload identity inside
+  one transaction.
+- Last-moment eligibility now requires the row to be due and still be the
+  oldest pending row for its recipient.
+- Regression coverage exercises restart recovery and stale/head eligibility.

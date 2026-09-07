@@ -1,0 +1,18 @@
+[Unit]
+Description=Swarm MCP — роль-ориентированная коммуникационная плоскость роя
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=swarm-mcp
+Group=swarm-mcp
+EnvironmentFile=/etc/swarm-mcp/.env
+ExecStart=/usr/local/bin/swarm-mcp serve
+WorkingDirectory=/etc/swarm-mcp
+Restart=always
+RestartSec=5
+ReadWritePaths=/var/lib/swarm-mcp
+
+[Install]
+WantedBy=multi-user.target

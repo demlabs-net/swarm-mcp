@@ -1,6 +1,6 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, ensure};
+use anyhow::{Context as _, anyhow, ensure};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, future::join_all};
 use reqwest::{Client, Proxy};
@@ -8,16 +8,16 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{RwLock, Semaphore},
+    sync::{Mutex, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, TelegramBotMode},
-    store::{AuditMessage, OutboxItem, Reservation, Store},
+    config::{ApiKind, Config, TelegramBotMode},
+    store::{AuditMessage, DeliveryQueueItem, MediaPayload, OutboxItem, Reservation, Store},
 };
 
 #[derive(Clone)]
@@ -28,6 +28,43 @@ pub struct Dispatcher {
     telegram_client: Client,
     inflight: Arc<Semaphore>,
     messaging_gate: Arc<RwLock<()>>,
+    delivery_gates: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+}
+
+enum RunOutcome {
+    /// The run finished and produced this final answer.
+    Completed(String),
+    /// The run finished without a usable answer (failed/cancelled/empty).
+    Failed,
+    /// The run is still in progress.
+    Running,
+}
+
+/// Where a dispatch to a role went: a Hermes run or an OpenAI-style
+/// initiation (the role answers through the swarm MCP server).
+#[derive(Clone, Debug)]
+pub enum DispatchHandle {
+    Run(String),
+    Initiated,
+    Queued { queue_id: String, position: i64 },
+}
+
+impl DispatchHandle {
+    /// Primary identifier for JSON results.
+    fn key_value(&self) -> (&'static str, String) {
+        match self {
+            DispatchHandle::Run(run_id) => ("run_id", run_id.clone()),
+            DispatchHandle::Initiated => ("initiated", "true".to_string()),
+            DispatchHandle::Queued { queue_id, .. } => ("queue_id", queue_id.clone()),
+        }
+    }
+
+    fn decorate_result(&self, result: &mut Value) {
+        if let DispatchHandle::Queued { position, .. } = self {
+            result["queued"] = json!(true);
+            result["queue_position"] = json!(position);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -40,6 +77,7 @@ pub struct ToolOutcome {
 struct RunFailure {
     error: anyhow::Error,
     indeterminate: bool,
+    retry_after_seconds: Option<u64>,
 }
 
 impl RunFailure {
@@ -47,6 +85,7 @@ impl RunFailure {
         Self {
             error,
             indeterminate: false,
+            retry_after_seconds: None,
         }
     }
 
@@ -54,6 +93,15 @@ impl RunFailure {
         Self {
             error,
             indeterminate: true,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn retryable(error: anyhow::Error, retry_after_seconds: u64) -> Self {
+        Self {
+            error,
+            indeterminate: false,
+            retry_after_seconds: Some(retry_after_seconds.max(1)),
         }
     }
 
@@ -103,7 +151,7 @@ impl std::fmt::Display for TelegramFailure {
     }
 }
 
-/// Shared aggregation of per-target broadcast outcomes (`order_all`, `msg_all`,
+/// Shared aggregation of per-target broadcast outcomes (`dispatch_all`, `msg_all`,
 /// Telegram inbound). A broadcast is `accepted` only when every target run was
 /// accepted; `indeterminate` when nothing was accepted and at least one target
 /// may have been reached; `partial` when some but not all runs were accepted.
@@ -112,6 +160,8 @@ struct BroadcastSummary {
     results: Map<String, Value>,
     succeeded: usize,
     indeterminate: usize,
+    retryable: usize,
+    retry_after_seconds: u64,
 }
 
 impl BroadcastSummary {
@@ -121,28 +171,41 @@ impl BroadcastSummary {
             results: Map::new(),
             succeeded: 0,
             indeterminate: 0,
+            retryable: 0,
+            retry_after_seconds: 0,
         }
     }
 
-    fn push(&mut self, target: String, result: Result<String, RunFailure>) {
+    fn push(&mut self, target: String, result: Result<DispatchHandle, RunFailure>) {
         match result {
-            Ok(run_id) => {
+            Ok(handle) => {
                 self.succeeded += 1;
-                self.results.insert(target, json!({"run_id": run_id}));
+                let (key, value) = handle.key_value();
+                let mut result = json!({ (key): value });
+                handle.decorate_result(&mut result);
+                self.results.insert(target, result);
             }
             Err(error) => {
                 warn!(%target, error = %error, "{}", self.label);
                 self.indeterminate += usize::from(error.indeterminate);
-                self.results.insert(
-                    target,
-                    json!({
-                        "error": error.to_string(),
-                        "status": error.status(),
-                        "recovery_required": error.indeterminate,
-                    }),
-                );
+                let mut result = json!({
+                    "error": error.to_string(),
+                    "status": error.status(),
+                    "recovery_required": error.indeterminate,
+                });
+                if let Some(retry_after_seconds) = error.retry_after_seconds {
+                    self.retryable += 1;
+                    self.retry_after_seconds = self.retry_after_seconds.max(retry_after_seconds);
+                    result["retryable"] = json!(true);
+                    result["retry_after_seconds"] = json!(retry_after_seconds);
+                }
+                self.results.insert(target, result);
             }
         }
+    }
+
+    fn entirely_retryable(&self, total: usize) -> bool {
+        total > 0 && self.succeeded == 0 && self.retryable == total
     }
 
     fn status(&self, total: usize) -> &'static str {
@@ -159,50 +222,46 @@ impl BroadcastSummary {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrderArgs {
+pub struct DispatchArgs {
+    #[serde(rename = "recipient", alias = "agent")]
     pub agent: String,
-    pub command: String,
+    pub message: String,
+    /// Opaque domain reference, such as an SLC task id. Swarm records and
+    /// forwards it without validation against any task store.
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BroadcastArgs {
-    pub command: String,
+    pub message: String,
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReportArgs {
-    pub summary: String,
-    pub task_id: String,
-    #[serde(default = "completed_status")]
-    pub status: String,
-    pub recipient: Option<String>,
-    pub idempotency_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessageArgs {
+    #[serde(rename = "recipient", alias = "agent")]
     pub agent: String,
-    pub task_id: String,
     pub message: String,
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessageAllArgs {
-    pub task_id: String,
     pub message: String,
+    pub correlation_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+pub struct CancelDeliveryArgs {
+    pub queue_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DisableMessagingArgs {
     pub agent: String,
     #[serde(default)]
@@ -212,7 +271,6 @@ pub struct DisableMessagingArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EnableMessagingArgs {
     pub agent: String,
     pub reason: String,
@@ -220,7 +278,6 @@ pub struct EnableMessagingArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClearMessageQueueArgs {
     pub agent: String,
     #[serde(default = "default_true")]
@@ -231,6 +288,24 @@ pub struct ClearMessageQueueArgs {
 #[serde(deny_unknown_fields)]
 pub struct TelegramReplyArgs {
     pub message: String,
+    #[serde(default)]
+    pub files: Vec<TelegramFileArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramFileArgs {
+    pub filename: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    /// Base64-encoded content. Prefer `path` instead: large base64 passed
+    /// through LLM tool-call arguments gets truncated by model output limits.
+    #[serde(default)]
+    pub content_b64: String,
+    /// Path of the file inside the shared files directory (the swarm MCP
+    /// reads it directly — reliable for any file size).
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -243,10 +318,6 @@ pub struct TelegramInboundArgs {
     pub targets: Vec<String>,
     /// Source Telegram chat: private chat id for DM, group/channel id otherwise.
     pub chat_id: i64,
-}
-
-fn completed_status() -> String {
-    "completed".to_string()
 }
 
 fn default_true() -> bool {
@@ -269,6 +340,7 @@ impl Dispatcher {
         Ok(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight_dispatches)),
             messaging_gate: Arc::new(RwLock::new(())),
+            delivery_gates: Arc::new(Mutex::new(BTreeMap::new())),
             config,
             store,
             hermes_client,
@@ -276,345 +348,19 @@ impl Dispatcher {
         })
     }
 
-    pub async fn order(&self, sender: &str, args: OrderArgs) -> ToolOutcome {
+    pub async fn dispatch_to(&self, sender: &str, args: DispatchArgs) -> ToolOutcome {
         let _messaging_guard = self.messaging_gate.read().await;
         let target = args.agent.trim().to_lowercase();
         let allowed = self
             .config
-            .order_acl
+            .dispatch_acl
             .get(sender)
             .cloned()
             .unwrap_or_default();
         if !allowed.contains(&target) {
             return tool_error(json!({
                 "ok": false,
-                "error": format!("{sender} is not authorized to order '{target}'"),
-                "allowed": allowed,
-            }));
-        }
-        if let Some(outcome) = self
-            .messaging_block(sender, std::slice::from_ref(&target))
-            .await
-        {
-            return outcome;
-        }
-        let command = match self.clean_text(&args.command, "command") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let task_id = format!("task_{}", Uuid::new_v4().simple());
-        let targets = vec![target.clone()];
-        let fingerprint = fingerprint(&json!({
-            "target": target,
-            "command": normalize_dispatch_text(&command),
-        }));
-        if let Some(outcome) = self
-            .reserve_or_replay(
-                &task_id,
-                sender,
-                "order",
-                &targets,
-                idempotency_key.as_deref(),
-                &fingerprint,
-            )
-            .await
-        {
-            return outcome;
-        }
-        let message = match render_order_template(
-            &self.config.order_template,
-            &task_id,
-            sender,
-            &target,
-            &command,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return self
-                    .fail_dispatch(&task_id, error, sender, "ORDER_FAILED", &target, &command)
-                    .await;
-            }
-        };
-        match self
-            .start_run(&target, &message, &self.config.executor_run_instructions)
-            .await
-        {
-            Ok(run_id) => {
-                let mut result = json!({
-                    "ok": true,
-                    "task_id": task_id,
-                    "authority": sender,
-                    "agent": target,
-                    "run_id": run_id,
-                });
-                let audit = self.audit(
-                    sender,
-                    "ORDER",
-                    &target,
-                    &format!("{task_id}\n{command}"),
-                    &mut result,
-                );
-                self.finish(&task_id, "accepted", &result, audit, false)
-                    .await
-            }
-            Err(error) => {
-                self.fail_run(&task_id, error, sender, "ORDER_FAILED", &target, &command)
-                    .await
-            }
-        }
-    }
-
-    pub async fn order_all(&self, sender: &str, args: BroadcastArgs) -> ToolOutcome {
-        let _messaging_guard = self.messaging_gate.read().await;
-        if !self.config.global_authorities.contains(sender) {
-            return tool_error(json!({
-                "ok": false,
-                "error": format!("{sender} has no broadcast authority"),
-            }));
-        }
-        let command = match self.clean_text(&args.command, "command") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let task_id = format!("task_{}", Uuid::new_v4().simple());
-        let targets = self
-            .config
-            .order_acl
-            .get(sender)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(outcome) = self.messaging_block(sender, &targets).await {
-            return outcome;
-        }
-        let fingerprint = fingerprint(&json!({
-            "targets": targets,
-            "command": normalize_dispatch_text(&command),
-        }));
-        if let Some(outcome) = self
-            .reserve_or_replay(
-                &task_id,
-                sender,
-                "order_all",
-                &targets,
-                idempotency_key.as_deref(),
-                &fingerprint,
-            )
-            .await
-        {
-            return outcome;
-        }
-        let requests = targets.iter().map(|target| async {
-            let result = match render_order_template(
-                &self.config.order_template,
-                &task_id,
-                sender,
-                target,
-                &command,
-            ) {
-                Ok(message) => {
-                    self.start_run(target, &message, &self.config.executor_run_instructions)
-                        .await
-                }
-                Err(error) => Err(RunFailure::rejected(error)),
-            };
-            (target.clone(), result)
-        });
-        let mut summary = BroadcastSummary::new("broadcast dispatch failed");
-        for (target, result) in join_all(requests).await {
-            summary.push(target, result);
-        }
-        let ok = summary.succeeded == targets.len();
-        let status = summary.status(targets.len());
-        let mut result = json!({
-            "ok": ok,
-            "task_id": task_id,
-            "authority": sender,
-            "results": summary.results,
-        });
-        let audit = self.audit(
-            sender,
-            "ORDER_ALL",
-            &targets.join(", "),
-            &format!("{task_id}\n{command}"),
-            &mut result,
-        );
-        self.finish(&task_id, status, &result, audit, !ok).await
-    }
-
-    pub async fn report(&self, sender: &str, args: ReportArgs) -> ToolOutcome {
-        let _messaging_guard = self.messaging_gate.read().await;
-        let supervisors = self.config.supervisors(sender);
-        let recipient = args
-            .recipient
-            .as_deref()
-            .unwrap_or(&self.config.manager_role)
-            .trim()
-            .to_lowercase();
-        if !supervisors.contains(&recipient) {
-            return tool_error(json!({
-                "ok": false,
-                "error": format!("{recipient} is not a supervisor of {sender}"),
-                "allowed": supervisors,
-            }));
-        }
-        if let Some(outcome) = self
-            .messaging_block(sender, std::slice::from_ref(&recipient))
-            .await
-        {
-            return outcome;
-        }
-        let summary = match self.clean_text(&args.summary, "summary") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let task_id = match validate_identifier(&args.task_id, "task_id") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let status = args.status.trim().to_lowercase();
-        if !self.config.report_statuses.contains(&status) {
-            return tool_error(json!({
-                "ok": false,
-                "error": "unsupported report status",
-                "allowed": self.config.report_statuses,
-            }));
-        }
-        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
-            return outcome;
-        }
-        let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
-        };
-        let dispatch_id = format!("report_{}", Uuid::new_v4().simple());
-        let targets = vec![recipient.clone()];
-        let fingerprint = fingerprint(&json!({
-            "recipient": recipient,
-            "task_id": task_id,
-            "status": status,
-            "summary": normalize_dispatch_text(&summary),
-        }));
-        if let Some(outcome) = self
-            .reserve_or_replay(
-                &dispatch_id,
-                sender,
-                "report",
-                &targets,
-                idempotency_key.as_deref(),
-                &fingerprint,
-            )
-            .await
-        {
-            return outcome;
-        }
-        if !self.config.report_wake_statuses.contains(&status) {
-            let mut result = json!({
-                "ok": true,
-                "report_id": dispatch_id,
-                "recipient": recipient,
-                "task_id": task_id,
-                "status": status,
-                "supervisor_woken": false,
-            });
-            let audit = self.audit(
-                sender,
-                "REPORT",
-                &recipient,
-                &format!("{task_id} [{status}]\n{summary}"),
-                &mut result,
-            );
-            return self
-                .finish(&dispatch_id, "accepted", &result, audit, false)
-                .await;
-        }
-        let message = match render_template(
-            &self.config.report_template,
-            &BTreeMap::from([
-                ("sender", sender),
-                ("recipient", recipient.as_str()),
-                ("task_id", task_id.as_str()),
-                ("status", status.as_str()),
-                ("message", summary.as_str()),
-            ]),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return self
-                    .fail_dispatch(
-                        &dispatch_id,
-                        error,
-                        sender,
-                        "REPORT_FAILED",
-                        &recipient,
-                        &summary,
-                    )
-                    .await;
-            }
-        };
-        match self
-            .start_run(
-                &recipient,
-                &message,
-                &self.config.supervisor_report_instructions,
-            )
-            .await
-        {
-            Ok(run_id) => {
-                let mut result = json!({
-                    "ok": true,
-                    "report_id": dispatch_id,
-                    "recipient": recipient,
-                    "recipient_run_id": run_id,
-                    "task_id": task_id,
-                    "status": status,
-                    "supervisor_woken": true,
-                });
-                let audit = self.audit(
-                    sender,
-                    "REPORT",
-                    &recipient,
-                    &format!("{task_id} [{status}]\n{summary}"),
-                    &mut result,
-                );
-                self.finish(&dispatch_id, "accepted", &result, audit, false)
-                    .await
-            }
-            Err(error) => {
-                self.fail_run(
-                    &dispatch_id,
-                    error,
-                    sender,
-                    "REPORT_FAILED",
-                    &recipient,
-                    &summary,
-                )
-                .await
-            }
-        }
-    }
-
-    pub async fn message(&self, sender: &str, args: MessageArgs) -> ToolOutcome {
-        let _messaging_guard = self.messaging_gate.read().await;
-        let target = args.agent.trim().to_lowercase();
-        let allowed = self
-            .config
-            .agent_roles
-            .iter()
-            .filter(|role| role.as_str() != sender)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !allowed.contains(&target) {
-            return tool_error(json!({
-                "ok": false,
-                "error": "target must be another executor",
+                "error": format!("{sender} is not authorized to dispatch to '{target}'"),
                 "allowed": allowed,
             }));
         }
@@ -628,13 +374,306 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        let task_id = match validate_identifier(&args.task_id, "task_id") {
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
+        };
+        let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
+        let dispatch_id = format!("dispatch_{}", Uuid::new_v4().simple());
+        let targets = vec![target.clone()];
+        let fingerprint = fingerprint(&json!({
+            "target": target,
+            "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
+        }));
+        if let Some(outcome) = self
+            .reserve_or_replay(
+                &dispatch_id,
+                sender,
+                "dispatch_to",
+                &targets,
+                idempotency_key.as_deref(),
+                &fingerprint,
+            )
+            .await
+        {
             return outcome;
         }
+        let body = match render_dispatch_template(
+            &self.config.dispatch_template,
+            &dispatch_id,
+            sender,
+            &target,
+            correlation_id.as_deref(),
+            &message,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return self
+                    .fail_dispatch(
+                        &dispatch_id,
+                        error,
+                        sender,
+                        "DISPATCH_FAILED",
+                        &target,
+                        &message,
+                    )
+                    .await;
+            }
+        };
+        match self
+            .dispatch_role_or_queue(
+                &dispatch_id,
+                sender,
+                "dispatch_to",
+                &target,
+                &body,
+                &self.config.executor_run_instructions,
+            )
+            .await
+        {
+            Ok(handle) => {
+                let (key, value) = handle.key_value();
+                let mut result = json!({
+                    "ok": true,
+                    "dispatch_id": dispatch_id,
+                    "sender": sender,
+                    "recipient": target,
+                    "correlation_id": correlation_id,
+                });
+                result[key] = json!(value);
+                handle.decorate_result(&mut result);
+                // Ответ исполнителя (вывод run'а) доставляем в исходный
+                // Telegram-чат отправителя: у dispatch_to (в отличие от
+                // telegram_inbound) нет собственного chat_id, поэтому берём
+                // последний известный чат роли-отправителя.
+                if let DispatchHandle::Run(run_id) = &handle {
+                    self.track_reply_for_sender(sender, run_id, &target).await;
+                }
+                let audit = self.audit(
+                    sender,
+                    "DISPATCH",
+                    &target,
+                    &format!("{dispatch_id}\n{message}"),
+                    &mut result,
+                );
+                self.finish(&dispatch_id, "accepted", &result, audit, false)
+                    .await
+            }
+            Err(error) => {
+                self.fail_run(
+                    &dispatch_id,
+                    error,
+                    sender,
+                    "DISPATCH_FAILED",
+                    &target,
+                    &message,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Зарегистрировать run получателя для доставки финального ответа в
+    /// исходный Telegram-чат отправителя (см. `spawn_run_reply_worker`).
+    /// Используется там, где у доставки нет собственного `chat_id`
+    /// (`dispatch_to`/`msg_to`): чат берётся как последний известный inbound-чат
+    /// роли-отправителя. Если чата нет — ответ не трекается (терять нечему).
+    async fn track_reply_for_sender(&self, sender: &str, run_id: &str, recipient: &str) {
+        if !self.config.telegram_track_dispatch_replies {
+            return;
+        }
+        let Ok(Some(chat_id)) = self.store.telegram_chat_for_role(sender).await else {
+            return;
+        };
+        if let Err(error) = self.store.track_run_reply(run_id, recipient, chat_id).await {
+            warn!(
+                sender = %sender,
+                recipient = %recipient,
+                error = %error,
+                "tracking run reply failed"
+            );
+        }
+    }
+
+    /// Cancel one queued transport wake. This deliberately accepts only the
+    /// Swarm queue id and never interprets an SLC task/correlation id.
+    pub async fn cancel_delivery(&self, sender: &str, args: CancelDeliveryArgs) -> ToolOutcome {
+        let queue_id = match validate_identifier(&args.queue_id, "queue_id") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        let reason = match Self::clean_control_reason(&args.reason) {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        // The delivery worker takes the read side before selecting and
+        // dispatching an item. The write side makes cancellation linearizable:
+        // it either wins before POST /v1/runs or observes a delivered item.
+        let _messaging_guard = self.messaging_gate.write().await;
+        match self
+            .store
+            .cancel_delivery(&queue_id, sender, &self.config.manager_role, &reason)
+            .await
+        {
+            Ok(value) => ToolOutcome {
+                value,
+                is_error: false,
+            },
+            Err(error) => tool_error(json!({
+                "ok": false,
+                "queue_id": queue_id,
+                "error": error.to_string(),
+            })),
+        }
+    }
+
+    pub async fn dispatch_all(&self, sender: &str, args: BroadcastArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
+        if !self.config.global_authorities.contains(sender) {
+            return tool_error(json!({
+                "ok": false,
+                "error": format!("{sender} has no broadcast authority"),
+            }));
+        }
+        let message = match self.clean_text(&args.message, "message") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
+        };
+        let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        let dispatch_id = format!("dispatch_{}", Uuid::new_v4().simple());
+        let targets = self
+            .config
+            .dispatch_acl
+            .get(sender)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(outcome) = self.messaging_block(sender, &targets).await {
+            return outcome;
+        }
+        let fingerprint = fingerprint(&json!({
+            "targets": targets,
+            "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
+        }));
+        if let Some(outcome) = self
+            .reserve_or_replay(
+                &dispatch_id,
+                sender,
+                "dispatch_all",
+                &targets,
+                idempotency_key.as_deref(),
+                &fingerprint,
+            )
+            .await
+        {
+            return outcome;
+        }
+        let requests = targets.iter().map(|target| async {
+            let result = match render_dispatch_template(
+                &self.config.dispatch_template,
+                &dispatch_id,
+                sender,
+                target,
+                correlation_id.as_deref(),
+                &message,
+            ) {
+                Ok(message) => {
+                    self.dispatch_role_or_queue(
+                        &dispatch_id,
+                        sender,
+                        "dispatch_all",
+                        target,
+                        &message,
+                        &self.config.executor_run_instructions,
+                    )
+                    .await
+                }
+                Err(error) => Err(RunFailure::rejected(error)),
+            };
+            (target.clone(), result)
+        });
+        let mut summary = BroadcastSummary::new("broadcast dispatch failed");
+        for (target, result) in join_all(requests).await {
+            summary.push(target, result);
+        }
+        let ok = summary.succeeded == targets.len();
+        let status = summary.status(targets.len());
+        let mut result = json!({
+            "ok": ok,
+            "dispatch_id": dispatch_id,
+            "sender": sender,
+            "correlation_id": correlation_id,
+            "results": summary.results,
+        });
+        let audit = self.audit(
+            sender,
+            "DISPATCH_ALL",
+            &targets.join(", "),
+            &format!("{dispatch_id}\n{message}"),
+            &mut result,
+        );
+        self.finish(&dispatch_id, status, &result, audit, !ok).await
+    }
+
+    pub async fn message(&self, sender: &str, args: MessageArgs) -> ToolOutcome {
+        let _messaging_guard = self.messaging_gate.read().await;
+        let target = args.agent.trim().to_lowercase();
+        let allowed = self
+            .config
+            .all_roles
+            .iter()
+            .filter(|role| role.as_str() != sender)
+            // mcp-only роли не принимают сообщения (endpoint отсутствует).
+            .filter(|role| {
+                !self
+                    .config
+                    .agents
+                    .get(*role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !allowed.contains(&target) {
+            return tool_error(json!({
+                "ok": false,
+                "error": "recipient must be another configured role",
+                "allowed": allowed,
+            }));
+        }
+        if let Some(outcome) = self
+            .messaging_block(sender, std::slice::from_ref(&target))
+            .await
+        {
+            return outcome;
+        }
+        let message = match self.clean_text(&args.message, "message") {
+            Ok(value) => value,
+            Err(error) => return tool_error_message(error),
+        };
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
+        };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -643,8 +682,8 @@ impl Dispatcher {
         let targets = vec![target.clone()];
         let fingerprint = fingerprint(&json!({
             "target": target,
-            "task_id": task_id,
             "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
         }));
         if let Some(outcome) = self
             .reserve_or_replay(
@@ -665,11 +704,11 @@ impl Dispatcher {
                 ("message_id", message_id.as_str()),
                 ("sender", sender),
                 ("recipient", target.as_str()),
-                ("task_id", task_id.as_str()),
+                ("correlation_id", correlation_id.as_deref().unwrap_or("")),
                 ("message", message.as_str()),
             ]),
         ) {
-            Ok(value) => value,
+            Ok(value) => append_opaque_correlation_guard(value, correlation_id.as_deref()),
             Err(error) => {
                 return self
                     .fail_dispatch(&message_id, error, sender, "MSG_FAILED", &target, &message)
@@ -677,17 +716,29 @@ impl Dispatcher {
             }
         };
         match self
-            .start_run(&target, &body, &self.config.peer_run_instructions)
+            .dispatch_role_or_queue(
+                &message_id,
+                sender,
+                "msg_to",
+                &target,
+                &body,
+                &self.config.peer_run_instructions,
+            )
             .await
         {
-            Ok(run_id) => {
+            Ok(handle) => {
+                let (key, value) = handle.key_value();
                 let mut result = json!({
                     "ok": true,
                     "message_id": message_id,
-                    "task_id": task_id,
-                    "agent": target,
-                    "run_id": run_id,
+                    "recipient": target,
+                    "correlation_id": correlation_id,
                 });
+                result[key] = json!(value);
+                handle.decorate_result(&mut result);
+                if let DispatchHandle::Run(run_id) = &handle {
+                    self.track_reply_for_sender(sender, run_id, &target).await;
+                }
                 let audit = self.audit(
                     sender,
                     "MSG",
@@ -711,9 +762,12 @@ impl Dispatcher {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
         };
-        let task_id = match validate_identifier(&args.task_id, "task_id") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
+        let correlation_id = match args.correlation_id.as_deref() {
+            Some(value) => match validate_identifier(value, "correlation_id") {
+                Ok(value) => Some(value),
+                Err(error) => return tool_error_message(error),
+            },
+            None => None,
         };
         let idempotency_key = match validate_idempotency(args.idempotency_key.as_deref()) {
             Ok(value) => value,
@@ -722,27 +776,32 @@ impl Dispatcher {
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let targets = self
             .config
-            .agent_roles
+            .all_roles
             .iter()
             .filter(|role| role.as_str() != sender)
+            // mcp-only роли не принимают сообщения (endpoint отсутствует).
+            .filter(|role| {
+                !self
+                    .config
+                    .agents
+                    .get(*role)
+                    .is_some_and(|agent| agent.api_kind == ApiKind::Mcp)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if targets.is_empty() {
             return tool_error(json!({
                 "ok": false,
-                "error": "no peer executors to message",
+                "error": "no other roles to message",
             }));
         }
         if let Some(outcome) = self.messaging_block(sender, &targets).await {
             return outcome;
         }
-        if let Some(outcome) = self.task_lineage_block(sender, &task_id).await {
-            return outcome;
-        }
         let fingerprint = fingerprint(&json!({
             "targets": targets,
-            "task_id": task_id,
             "message": normalize_dispatch_text(&message),
+            "correlation_id": correlation_id,
         }));
         if let Some(outcome) = self
             .reserve_or_replay(
@@ -764,14 +823,22 @@ impl Dispatcher {
                     ("message_id", message_id.as_str()),
                     ("sender", sender),
                     ("recipient", target.as_str()),
-                    ("task_id", task_id.as_str()),
+                    ("correlation_id", correlation_id.as_deref().unwrap_or("")),
                     ("message", message.as_str()),
                 ]),
-            );
+            )
+            .map(|value| append_opaque_correlation_guard(value, correlation_id.as_deref()));
             let result = match body {
                 Ok(body) => {
-                    self.start_run(target, &body, &self.config.peer_run_instructions)
-                        .await
+                    self.dispatch_role_or_queue(
+                        &message_id,
+                        sender,
+                        "msg_all",
+                        target,
+                        &body,
+                        &self.config.peer_run_instructions,
+                    )
+                    .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
             };
@@ -786,7 +853,7 @@ impl Dispatcher {
         let mut result = json!({
             "ok": ok,
             "message_id": message_id,
-            "task_id": task_id,
+            "correlation_id": correlation_id,
             "results": summary.results,
         });
         let audit = self.audit(
@@ -813,6 +880,7 @@ impl Dispatcher {
                 "error": "Telegram update contains invalid identifiers",
             }));
         }
+        let private_chat = args.chat_id == args.user_id;
         let message = match self.clean_text(&args.message, "message") {
             Ok(value) => value,
             Err(error) => return tool_error_message(error),
@@ -894,7 +962,7 @@ impl Dispatcher {
             );
             let result = match body {
                 Ok(body) => {
-                    self.start_run(target, &body, &self.config.telegram_inbound_instructions)
+                    self.dispatch_role(target, &body, &self.config.telegram_inbound_instructions)
                         .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
@@ -905,8 +973,22 @@ impl Dispatcher {
         for (target, result) in join_all(requests).await {
             summary.push(target, result);
         }
+        // Запоминаем запущенные раны (долговечно, в БД), чтобы их итоговый
+        // ответ доставился оператору в исходный чат (см. spawn_run_reply_worker).
+        for (target, value) in &summary.results {
+            if let Some(run_id) = value.get("run_id").and_then(Value::as_str)
+                && let Err(error) = self
+                    .store
+                    .track_run_reply(run_id, target, args.chat_id)
+                    .await
+            {
+                warn!(run_id = %run_id, error = %error, "tracking run reply failed");
+            }
+        }
         let ok = summary.succeeded == targets.len();
         let status = summary.status(targets.len());
+        let entirely_retryable = summary.entirely_retryable(targets.len());
+        let retry_after_seconds = summary.retry_after_seconds;
         let mut result = json!({
             "ok": ok,
             "dispatch_id": dispatch_id,
@@ -917,45 +999,114 @@ impl Dispatcher {
             "username": args.username,
             "results": summary.results.clone(),
         });
-        let audit = self.audit_with_chat(
-            &manager,
-            "TELEGRAM_INBOUND",
-            &targets.join(", "),
-            &format!(
-                "{dispatch_id} [{status}]\nTelegram user {} ({}) → {}:\n{message}\n\nDispatch result: {}",
-                args.username,
-                args.user_id,
-                targets.join(", "),
-                Value::Object(summary.results)
-            ),
-            Some(args.chat_id),
-            &mut result,
-        );
+        if entirely_retryable {
+            result["retryable"] = json!(true);
+            result["retry_after_seconds"] = json!(retry_after_seconds.max(1));
+        }
+        let audit = if entirely_retryable {
+            // Queue pressure is not an auditable rejection. The Telegram
+            // gateway retains this update and will retry it; emitting an
+            // outbox item here would spam the shared group on every retry.
+            result["telegram"] = json!({
+                "queued": false,
+                "enabled": self.config.telegram_enabled,
+                "delivery": "retrying_inbound",
+            });
+            None
+        } else if private_chat {
+            // A private operator conversation must never be copied into the
+            // shared Telegram audit group. The dispatch itself stays durable,
+            // and its final answer is delivered back to the source chat by the
+            // run-reply worker.
+            result["telegram"] = json!({
+                "queued": false,
+                "enabled": self.config.telegram_enabled,
+                "privacy": "private_chat",
+            });
+            None
+        } else {
+            self.audit(
+                &manager,
+                "TELEGRAM_INBOUND",
+                &targets.join(", "),
+                &format!(
+                    "{dispatch_id} [{status}]\nTelegram user {} ({}) → {}:\n{message}\n\nDispatch result: {}",
+                    args.username,
+                    args.user_id,
+                    targets.join(", "),
+                    Value::Object(summary.results)
+                ),
+                &mut result,
+            )
+        };
         self.finish(&dispatch_id, status, &result, audit, !ok).await
     }
 
-    /// Delivers the agent's final answer to the operator who started the most
-    /// recent Telegram inbound dispatch targeting `sender` (used by the
-    /// `telegram_reply` MCP tool).
-    pub async fn telegram_reply(&self, sender: &str, message: String) -> ToolOutcome {
-        let message = match self.clean_text(&message, "message") {
-            Ok(value) => value,
-            Err(error) => return tool_error_message(error),
+    /// Delivers the agent's answer (text and/or one or more files) to the
+    /// operator who started the most recent Telegram inbound dispatch
+    /// targeting `sender` (used by the `telegram_reply` MCP tool).
+    pub async fn telegram_reply(
+        &self,
+        sender: &str,
+        message: String,
+        files: Vec<TelegramFileArgs>,
+    ) -> ToolOutcome {
+        // Files-only replies are valid: the message is optional when files
+        // are attached, so only clean a non-empty message.
+        let message = if message.trim().is_empty() {
+            String::new()
+        } else {
+            match self.clean_text(&message, "message") {
+                Ok(value) => value,
+                Err(error) => return tool_error_message(error),
+            }
         };
-        if message.is_empty() {
+        if message.is_empty() && files.is_empty() {
             return tool_error(json!({
                 "ok": false,
                 "error": "Telegram reply must not be empty",
             }));
         }
-        let chat_id = match self.store.telegram_chat_for_role(sender).await {
-            Ok(Some(chat_id)) => chat_id,
-            Ok(None) => {
+        let mut media = Vec::with_capacity(files.len());
+        for file in files {
+            if file.filename.is_empty() {
                 return tool_error(json!({
                     "ok": false,
-                    "error": "no active Telegram dispatch for this role",
+                    "error": "Telegram file must have a filename",
                 }));
             }
+            // Путь в общей папке — надёжный способ (base64 через tool-call
+            // модели обрезается лимитом выходных токенов).
+            let content_b64 = if let Some(path) = file.path {
+                match self.read_shared_file(&path).await {
+                    Ok(content) => content,
+                    Err(error) => {
+                        warn!(path = %path, error = %error, "reading shared reply file failed");
+                        return tool_error(json!({
+                            "ok": false,
+                            "error": format!("cannot read shared file {path}: {error}"),
+                        }));
+                    }
+                }
+            } else {
+                if file.content_b64.is_empty() {
+                    return tool_error(json!({
+                        "ok": false,
+                        "error": "Telegram file must have content_b64 or a shared path",
+                    }));
+                }
+                file.content_b64
+            };
+            media.push(MediaPayload {
+                filename: file.filename,
+                mime_type: file.mime_type,
+                content_b64,
+            });
+        }
+        // MCP-only roles may reply proactively with no prior dispatch: the
+        // chat falls back to the latest operator chat, then to the group.
+        let chat_id = match self.store.telegram_chat_for_role(sender).await {
+            Ok(chat_id) => chat_id,
             Err(error) => {
                 warn!(role = %sender, error = %error, "Telegram reply chat lookup failed");
                 return tool_error_message(error);
@@ -967,7 +1118,8 @@ impl Dispatcher {
             event: "TELEGRAM_REPLY".to_string(),
             recipients: "operator".to_string(),
             text: message,
-            chat_id: Some(chat_id),
+            chat_id,
+            media,
         };
         if let Err(error) = self.store.enqueue_outbox(audit).await {
             warn!(role = %sender, error = %error, "Telegram reply enqueue failed");
@@ -981,6 +1133,37 @@ impl Dispatcher {
             }),
             is_error: false,
         }
+    }
+
+    /// Читает файл из общей папки для отправки вложением. Путь может быть
+    /// абсолютным (внутри общей папки) или относительным к ней; выход за её
+    /// пределы отклоняется. Размер ограничен 20 МБ (лимит Telegram).
+    async fn read_shared_file(&self, path: &str) -> anyhow::Result<String> {
+        use base64::Engine as _;
+        let root = self.config.shared_files_dir.clone();
+        let candidate = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            root.join(path)
+        };
+        let root_canonical = tokio::fs::canonicalize(&root)
+            .await
+            .with_context(|| format!("shared files dir {} is unavailable", root.display()))?;
+        let file_canonical = tokio::fs::canonicalize(&candidate)
+            .await
+            .with_context(|| format!("shared file {path} does not exist"))?;
+        ensure!(
+            file_canonical.starts_with(&root_canonical),
+            "path {path} escapes the shared files directory"
+        );
+        let metadata = tokio::fs::metadata(&file_canonical).await?;
+        ensure!(metadata.is_file(), "shared path {path} is not a file");
+        ensure!(
+            metadata.len() <= 20 * 1024 * 1024,
+            "shared file {path} exceeds the 20 MB Telegram limit"
+        );
+        let bytes = tokio::fs::read(&file_canonical).await?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
     pub fn spawn_outbox_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
@@ -999,6 +1182,240 @@ impl Dispatcher {
                 }
             }
         })
+    }
+
+    pub fn spawn_delivery_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(dispatcher.config.outbox_poll_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = dispatcher.flush_delivery_queue().await {
+                            error!(error = %error, "role delivery queue flush failed");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn flush_delivery_queue(&self) -> anyhow::Result<()> {
+        for item in self
+            .store
+            .due_deliveries(self.config.outbox_batch_size)
+            .await?
+        {
+            let _messaging_guard = self.messaging_gate.read().await;
+            let role_gate = self.role_delivery_gate(&item.recipient).await;
+            let _role_guard = role_gate.lock().await;
+            if !self.store.delivery_eligible(&item.id).await? {
+                continue;
+            }
+            match self
+                .dispatch_role(&item.recipient, &item.body, &item.instructions)
+                .await
+            {
+                Ok(handle) => {
+                    let run_id = match &handle {
+                        DispatchHandle::Run(run_id) => Some(run_id.as_str()),
+                        DispatchHandle::Initiated => None,
+                        DispatchHandle::Queued { .. } => unreachable!(
+                            "delivery worker uses direct dispatch and cannot recursively queue"
+                        ),
+                    };
+                    self.store.mark_delivery_delivered(&item.id, run_id).await?;
+                    info!(
+                        queue_id = %item.id,
+                        dispatch_id = %item.dispatch_id,
+                        recipient = %item.recipient,
+                        "queued role delivery accepted"
+                    );
+                }
+                Err(error) if error.retry_after_seconds.is_some() => {
+                    let retry_after = error.retry_after_seconds.unwrap_or(1);
+                    let exponent = u32::try_from(item.attempts.clamp(0, 5)).unwrap_or(5);
+                    let backoff = 2_u64.saturating_pow(exponent).clamp(1, 30);
+                    let delay = retry_after.max(backoff).min(60);
+                    self.store
+                        .defer_delivery(&item.id, Duration::from_secs(delay), &error.to_string())
+                        .await?;
+                    debug!(
+                        queue_id = %item.id,
+                        recipient = %item.recipient,
+                        retry_after_seconds = delay,
+                        "role remains busy; delivery stays queued"
+                    );
+                }
+                Err(error) => {
+                    self.store
+                        .mark_delivery_dead(&item.id, &error.to_string())
+                        .await?;
+                    warn!(
+                        queue_id = %item.id,
+                        dispatch_id = %item.dispatch_id,
+                        recipient = %item.recipient,
+                        error = %error,
+                        "queued role delivery requires recovery"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Polls Telegram-dispatched runs and delivers their final answer to the
+    /// operator's chat — the reply does not depend on the model calling
+    /// `telegram_reply` (`api_server` runs are fire-and-forget).
+    pub fn spawn_run_reply_worker(&self, cancellation: CancellationToken) -> JoinHandle<()> {
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = dispatcher.flush_run_replies().await {
+                            error!(error = %error, "Telegram run reply flush failed");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn flush_run_replies(&self) -> anyhow::Result<()> {
+        let ttl = Duration::from_secs(6 * 60 * 60);
+        let now = Utc::now().timestamp_millis();
+        for (run_id, role, chat_id, created_ms) in self.store.due_run_replies().await? {
+            // Долгие задачи (медленные модели) живут до 6 часов; просроченные
+            // снимаются с трекинга, чтобы поллер не висел вечно.
+            if now - created_ms > i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX) {
+                self.store.untrack_run_reply(&run_id).await?;
+                continue;
+            }
+            match self.fetch_run_outcome(&run_id, &role).await {
+                Ok(RunOutcome::Running) => {
+                    // Агент ещё думает (локальные модели — минуты): держим
+                    // «печатает…» живым на каждом тике (интервал ≈ 5 с,
+                    // пузырь Telegram живёт ~5–6 с).
+                    if let Err(error) = self.send_typing(Some(chat_id)).await {
+                        debug!(run_id = %run_id, error = %error, "typing heartbeat failed");
+                    }
+                }
+                Ok(outcome) => {
+                    self.deliver_run_reply(&run_id, &role, chat_id, outcome)
+                        .await;
+                }
+                // transient HTTP error: retry on the next tick
+                Err(error) => {
+                    debug!(run_id = %run_id, error = %error, "run reply poll failed; will retry");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_run_outcome(&self, run_id: &str, role: &str) -> anyhow::Result<RunOutcome> {
+        let agent = self
+            .config
+            .agents
+            .get(role)
+            .ok_or_else(|| anyhow!("unknown target role {role}"))?;
+        let (Some(api_url), Some(api_key)) = (&agent.api_url, &agent.api_key) else {
+            return Ok(RunOutcome::Running);
+        };
+        let url = format!(
+            "{}/v1/runs/{}",
+            api_url.as_str().trim_end_matches('/'),
+            run_id
+        );
+        let response = self
+            .hermes_client
+            .get(&url)
+            .bearer_auth(api_key.expose())
+            .send()
+            .await
+            .map_err(|error| anyhow!("run status request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Ok(RunOutcome::Running);
+        }
+        let payload: Value = response.json().await?;
+        match payload.get("status").and_then(Value::as_str) {
+            Some("completed") => Ok(RunOutcome::Completed(
+                payload
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )),
+            Some("failed" | "cancelled") => Ok(RunOutcome::Failed),
+            _ => Ok(RunOutcome::Running),
+        }
+    }
+
+    async fn deliver_run_reply(&self, run_id: &str, role: &str, chat_id: i64, outcome: RunOutcome) {
+        let text = match outcome {
+            RunOutcome::Completed(output) if !output.is_empty() => output,
+            RunOutcome::Completed(_) => {
+                format!("⚠️ Агент {role} ответил пустым сообщением.")
+            }
+            RunOutcome::Failed => {
+                format!("⚠️ Агент {role} не смог обработать запрос.")
+            }
+            RunOutcome::Running => return,
+        };
+        let audit = AuditMessage {
+            id: format!("reply_{}", Uuid::new_v4().simple()),
+            sender: role.to_string(),
+            event: "TELEGRAM_REPLY".to_string(),
+            recipients: "operator".to_string(),
+            text,
+            chat_id: Some(chat_id),
+            media: vec![],
+        };
+        if let Err(error) = self.store.enqueue_outbox(audit).await {
+            warn!(run_id = %run_id, error = %error, "Telegram run reply enqueue failed");
+            return;
+        }
+        if let Err(error) = self.store.untrack_run_reply(run_id).await {
+            warn!(run_id = %run_id, error = %error, "untracking run reply failed");
+        }
+    }
+
+    /// «Печатает…» в целевой чат (— fallback: общий чат).
+    async fn send_typing(&self, chat: Option<i64>) -> anyhow::Result<()> {
+        if !self.config.telegram_enabled {
+            return Ok(());
+        }
+        let Some(token) = &self.config.telegram_bot_token else {
+            return Ok(());
+        };
+        let chat_id = match (chat, &self.config.telegram_group_id) {
+            (Some(chat), _) => chat.to_string(),
+            (None, Some(group)) => group.clone(),
+            (None, None) => return Ok(()),
+        };
+        let api_base = self
+            .config
+            .telegram_api_base_url
+            .as_str()
+            .trim_end_matches('/');
+        let response = self
+            .telegram_client
+            .post(format!("{api_base}/bot{}/sendChatAction", token.expose()))
+            .json(&json!({"chat_id": chat_id, "action": "typing"}))
+            .send()
+            .await
+            .map_err(|_| anyhow!("Telegram sendChatAction request failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("sendChatAction failed: HTTP {status}"));
+        }
+        Ok(())
     }
 
     async fn flush_outbox(&self) -> anyhow::Result<()> {
@@ -1067,16 +1484,21 @@ impl Dispatcher {
             .telegram_group_id
             .as_ref()
             .ok_or_else(|| TelegramFailure::permanent("Telegram group is not configured"))?;
-        let url = format!(
-            "{}/bot{}/sendMessage",
-            self.config
-                .telegram_api_base_url
-                .as_str()
-                .trim_end_matches('/'),
-            token.expose()
-        );
-        let header = format!("[{}] {} -> {}", item.event, item.sender, item.recipients);
-        let chunks = telegram_chunks(&header, &item.text, self.config.telegram_message_limit);
+        let api_base = self
+            .config
+            .telegram_api_base_url
+            .as_str()
+            .trim_end_matches('/');
+        let chat_id = item
+            .chat_id
+            .map_or_else(|| group.clone(), |chat_id| chat_id.to_string());
+        if !item.media.is_empty() {
+            return self
+                .send_telegram_media(api_base, token.expose(), &chat_id, item)
+                .await;
+        }
+        let url = format!("{api_base}/bot{}/sendMessage", token.expose());
+        let chunks = telegram_chunks_for_item(item, self.config.telegram_message_limit);
         let start = usize::try_from(item.next_chunk).unwrap_or(usize::MAX);
         if start > chunks.len() {
             return Err(TelegramFailure::permanent(
@@ -1084,10 +1506,6 @@ impl Dispatcher {
             ));
         }
         for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
-            let chat_id = item
-                .chat_id
-                .map(|chat_id| chat_id.to_string())
-                .unwrap_or_else(|| group.clone());
             let response = self
                 .telegram_client
                 .post(&url)
@@ -1110,6 +1528,260 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Deliver an attached file as a single sendPhoto (image/*) or
+    /// sendDocument message; the item text becomes the caption (≤1024 chars).
+    /// Deliver attached files: one sendPhoto (image/*) or sendDocument message
+    /// per file; the item text is the caption of the first file (≤1024 chars).
+    /// The outbox chunk cursor tracks the number of files already sent, so a
+    /// retry after a mid-batch failure resumes without re-sending earlier
+    /// files.
+    async fn send_telegram_media(
+        &self,
+        api_base: &str,
+        token: &str,
+        chat_id: &str,
+        item: &OutboxItem,
+    ) -> Result<(), TelegramFailure> {
+        use base64::Engine as _;
+        let caption: String = item.text.chars().take(1024).collect();
+        let start = usize::try_from(item.next_chunk).unwrap_or(usize::MAX);
+        if start > item.media.len() {
+            return Err(TelegramFailure::permanent(
+                "Telegram media chunk cursor is invalid",
+            ));
+        }
+        for (index, media) in item.media.iter().enumerate().skip(start) {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&media.content_b64)
+                .map_err(|_| TelegramFailure::new("Telegram media base64 decode failed", None))?;
+            let mime = media
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".into());
+            let is_image = mime.starts_with("image/");
+            let method = if is_image {
+                "sendPhoto"
+            } else {
+                "sendDocument"
+            };
+            let field = if is_image { "photo" } else { "document" };
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(media.filename.clone())
+                .mime_str(&mime)
+                .map_err(|error| {
+                    TelegramFailure::new(format!("media mime failed: {error}"), None)
+                })?;
+            let form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .text(
+                    "caption",
+                    if index == 0 {
+                        caption.clone()
+                    } else {
+                        String::new()
+                    },
+                )
+                .part(field, part);
+            let url = format!("{api_base}/bot{token}/{method}");
+            let response = self
+                .telegram_client
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|_| TelegramFailure::new("Telegram media request failed", None))?;
+            validate_telegram_response(response).await?;
+            // Checkpoint per file so a retry resumes after this one.
+            self.store
+                .mark_outbox_chunk_sent(&item.id, i64::try_from(index + 1).unwrap_or(i64::MAX))
+                .await
+                .map_err(|error| {
+                    TelegramFailure::new(format!("outbox checkpoint failed: {error}"), None)
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Attempt immediate delivery, then persist a transport-only FIFO wake on
+    /// a definitive busy response. The queue contains no task authority or
+    /// status; SLC remains the source of truth for whether work is runnable.
+    async fn dispatch_role_or_queue(
+        &self,
+        operation_id: &str,
+        sender: &str,
+        kind: &str,
+        role: &str,
+        message: &str,
+        instructions: &str,
+    ) -> Result<DispatchHandle, RunFailure> {
+        let role_gate = self.role_delivery_gate(role).await;
+        let _role_guard = role_gate.lock().await;
+        if self
+            .store
+            .has_pending_delivery(role)
+            .await
+            .map_err(|error| {
+                RunFailure::rejected(anyhow!(
+                    "cannot inspect the durable delivery queue for {role}: {error}"
+                ))
+            })?
+        {
+            return self
+                .queue_role_delivery(
+                    operation_id,
+                    sender,
+                    kind,
+                    role,
+                    message,
+                    instructions,
+                    Duration::from_secs(1),
+                    "queued behind an earlier recipient delivery",
+                )
+                .await;
+        }
+        match self.dispatch_role(role, message, instructions).await {
+            Ok(handle) => Ok(handle),
+            Err(error) if error.retry_after_seconds.is_some() => {
+                let retry_after_seconds = error.retry_after_seconds.unwrap_or(1);
+                self.queue_role_delivery(
+                    operation_id,
+                    sender,
+                    kind,
+                    role,
+                    message,
+                    instructions,
+                    Duration::from_secs(retry_after_seconds),
+                    &error.to_string(),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn role_delivery_gate(&self, role: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.delivery_gates.lock().await;
+        gates
+            .entry(role.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn queue_role_delivery(
+        &self,
+        operation_id: &str,
+        sender: &str,
+        kind: &str,
+        role: &str,
+        message: &str,
+        instructions: &str,
+        retry_after: Duration,
+        error: &str,
+    ) -> Result<DispatchHandle, RunFailure> {
+        let queue_id = format!("delivery_{operation_id}_{role}");
+        let item = DeliveryQueueItem {
+            id: queue_id.clone(),
+            dispatch_id: operation_id.to_string(),
+            sender: sender.to_string(),
+            kind: kind.to_string(),
+            recipient: role.to_string(),
+            body: message.to_string(),
+            instructions: instructions.to_string(),
+            attempts: 0,
+        };
+        let position = self
+            .store
+            .enqueue_delivery(&item, retry_after, error)
+            .await
+            .map_err(|queue_error| {
+                RunFailure::rejected(anyhow!(
+                    "{role} is busy and durable delivery enqueue failed: {queue_error}"
+                ))
+            })?;
+        Ok(DispatchHandle::Queued { queue_id, position })
+    }
+
+    /// Dispatch a message to a role: Hermes `api_server` run (current
+    /// mechanism) or OpenAI-compatible initiation for third-party roles.
+    async fn dispatch_role(
+        &self,
+        role: &str,
+        message: &str,
+        instructions: &str,
+    ) -> Result<DispatchHandle, RunFailure> {
+        let agent = self
+            .config
+            .agents
+            .get(role)
+            .ok_or_else(|| RunFailure::rejected(anyhow!("unknown target role")))?;
+        match agent.api_kind {
+            ApiKind::OpenAi => {
+                self.initiate_openai(agent, message, instructions).await?;
+                Ok(DispatchHandle::Initiated)
+            }
+            ApiKind::Hermes => {
+                let run_id = self.start_run(role, message, instructions).await?;
+                Ok(DispatchHandle::Run(run_id))
+            }
+            ApiKind::Mcp => Err(RunFailure::rejected(anyhow!(
+                "role {role} is MCP-only and initiates interaction itself; it has no dispatch endpoint"
+            ))),
+        }
+    }
+
+    /// Fire-and-forget initiation of a third-party role via an
+    /// OpenAI-compatible endpoint. The role then works and sends its answers
+    /// through the swarm MCP server (`telegram_reply`) at any point.
+    async fn initiate_openai(
+        &self,
+        agent: &crate::config::AgentConfig,
+        message: &str,
+        instructions: &str,
+    ) -> Result<(), RunFailure> {
+        let api_url = agent
+            .api_url
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {} has no api_url", agent.role)))?;
+        let api_key = agent
+            .api_key
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {} has no api key", agent.role)))?;
+        let url = format!(
+            "{}/v1/chat/completions",
+            api_url.as_str().trim_end_matches('/')
+        );
+        let model = agent
+            .api_model
+            .clone()
+            .unwrap_or_else(|| self.config.hermes_model_alias.clone());
+        let response = self
+            .hermes_client
+            .post(&url)
+            .bearer_auth(api_key.expose())
+            .json(&json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": message},
+                ],
+                "stream": false,
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                RunFailure::indeterminate(anyhow!("openai initiate to {}: {error}", agent.role))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(RunFailure::rejected(anyhow!(
+                "openai initiate to {} returned HTTP {status}",
+                agent.role
+            )));
+        }
+        Ok(())
+    }
+
     async fn start_run(
         &self,
         role: &str,
@@ -1121,15 +1793,23 @@ impl Dispatcher {
             .agents
             .get(role)
             .ok_or_else(|| RunFailure::rejected(anyhow!("unknown target role")))?;
+        let api_url = agent
+            .api_url
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {role} has no api_url")))?;
+        let api_key = agent
+            .api_key
+            .as_ref()
+            .ok_or_else(|| RunFailure::rejected(anyhow!("role {role} has no api key")))?;
         let _permit = tokio::time::timeout(self.config.api_timeout, self.inflight.acquire())
             .await
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is saturated")))?
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is shutting down")))?;
-        let url = format!("{}/v1/runs", agent.api_url.as_str().trim_end_matches('/'));
+        let url = format!("{}/v1/runs", api_url.as_str().trim_end_matches('/'));
         let response = self
             .hermes_client
             .post(url)
-            .bearer_auth(agent.api_key.expose())
+            .bearer_auth(api_key.expose())
             .json(&json!({
                 "model": self.config.hermes_model_alias,
                 "input": message,
@@ -1141,8 +1821,17 @@ impl Dispatcher {
                 RunFailure::indeterminate(anyhow!("dispatch run to {role}: {error}"))
             })?;
         if response.status() != reqwest::StatusCode::ACCEPTED {
-            let error = anyhow!("{role} API returned HTTP {}", response.status());
-            return Err(if response.status().is_server_error() {
+            let status = response.status();
+            let retry_after_seconds = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1);
+            let error = anyhow!("{role} API returned HTTP {status}");
+            return Err(if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                RunFailure::retryable(error, retry_after_seconds)
+            } else if status.is_server_error() {
                 RunFailure::indeterminate(error)
             } else {
                 RunFailure::rejected(error)
@@ -1307,7 +1996,7 @@ impl Dispatcher {
         if let Err(outcome) = self.authorize_messaging_control(sender) {
             return outcome;
         }
-        let target = match self.control_target(&args.agent) {
+        let target = match self.queue_control_target(&args.agent) {
             Ok(target) => target,
             Err(outcome) => return outcome,
         };
@@ -1376,25 +2065,6 @@ impl Dispatcher {
         Ok(())
     }
 
-    async fn task_lineage_block(&self, sender: &str, task_id: &str) -> Option<ToolOutcome> {
-        match self.store.task_assigned_to(task_id, sender).await {
-            Ok(true) => None,
-            Ok(false) => Some(tool_error(json!({
-                "ok": false,
-                "error": "task_id is not an accepted Swarm order assigned to the sending role",
-                "task_id": task_id,
-                "sender": sender,
-            }))),
-            Err(error) => {
-                error!(%sender, %task_id, error = %error, "task lineage lookup failed");
-                Some(tool_error(json!({
-                    "ok": false,
-                    "error": "task lineage is temporarily unavailable",
-                })))
-            }
-        }
-    }
-
     fn control_target(&self, value: &str) -> Result<String, ToolOutcome> {
         let target = value.trim().to_lowercase();
         if !self.config.agent_roles.contains(&target) {
@@ -1402,6 +2072,18 @@ impl Dispatcher {
                 "ok": false,
                 "error": "messaging controls apply only to configured executor roles",
                 "allowed": self.config.agent_roles,
+            })));
+        }
+        Ok(target)
+    }
+
+    fn queue_control_target(&self, value: &str) -> Result<String, ToolOutcome> {
+        let target = value.trim().to_lowercase();
+        if !self.config.all_roles.contains(&target) {
+            return Err(tool_error(json!({
+                "ok": false,
+                "error": "queue controls apply only to configured swarm roles",
+                "allowed": self.config.all_roles,
             })));
         }
         Ok(target)
@@ -1466,6 +2148,7 @@ impl Dispatcher {
             }) => Some(tool_error(json!({
                 "ok": false,
                 "error": "dispatch rate limit exceeded",
+                "retryable": true,
                 "retry_after_seconds": retry_after_seconds,
             }))),
             Err(error) => {
@@ -1511,6 +2194,7 @@ impl Dispatcher {
             recipients: recipients.to_string(),
             text: text.to_string(),
             chat_id,
+            media: vec![],
         })
     }
 
@@ -1733,22 +2417,37 @@ pub(crate) fn render_template(
     Ok(rendered)
 }
 
-fn render_order_template(
+fn render_dispatch_template(
     template: &str,
-    task_id: &str,
+    dispatch_id: &str,
     sender: &str,
     recipient: &str,
+    correlation_id: Option<&str>,
     message: &str,
 ) -> anyhow::Result<String> {
     render_template(
         template,
         &BTreeMap::from([
-            ("task_id", task_id),
+            ("dispatch_id", dispatch_id),
             ("sender", sender),
             ("recipient", recipient),
+            ("correlation_id", correlation_id.unwrap_or("")),
             ("message", message),
         ]),
     )
+    .map(|value| append_opaque_correlation_guard(value, correlation_id))
+}
+
+fn append_opaque_correlation_guard(mut body: String, correlation_id: Option<&str>) -> String {
+    if let Some(task_id) = correlation_id.filter(|value| !value.is_empty()) {
+        body.push_str(
+            "\n\n[OPAQUE_CORRELATION] The Correlation value is the exact opaque SLC task ID. ",
+        );
+        body.push_str("Copy it byte-for-byte into task tools, including apparent truncation or suffixes; never expand, normalize, or reconstruct it from a task name or slug. Exact task_id: `");
+        body.push_str(task_id);
+        body.push('`');
+    }
+    body
 }
 
 fn telegram_chunks(header: &str, text: &str, limit: usize) -> Vec<String> {
@@ -1763,6 +2462,30 @@ fn telegram_chunks(header: &str, text: &str, limit: usize) -> Vec<String> {
         .chunks(room)
         .map(|chunk| format!("{prefix}{}", chunk.iter().collect::<String>()))
         .collect()
+}
+
+fn telegram_plain_chunks(text: &str, limit: usize) -> Vec<String> {
+    let room = limit.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(room)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
+fn telegram_chunks_for_item(item: &OutboxItem, limit: usize) -> Vec<String> {
+    // Telegram private chats have positive IDs. Direct agent replies should
+    // read like normal conversation, while group-bound messages retain their
+    // audit envelope and attribution.
+    if item.event == "TELEGRAM_REPLY" && item.chat_id.is_some_and(|chat_id| chat_id > 0) {
+        telegram_plain_chunks(&item.text, limit)
+    } else {
+        let header = format!("[{}] {} -> {}", item.event, item.sender, item.recipients);
+        telegram_chunks(&header, &item.text, limit)
+    }
 }
 
 fn tool_error_message(error: anyhow::Error) -> ToolOutcome {
@@ -1810,6 +2533,35 @@ mod tests {
     }
 
     #[test]
+    fn private_telegram_reply_chunks_are_plain() {
+        let mut item = outbox_item();
+        item.event = "TELEGRAM_REPLY".to_string();
+        item.recipients = "operator".to_string();
+        item.text = "Личный ответ 🦀".repeat(100);
+        item.chat_id = Some(42);
+
+        let chunks = telegram_chunks_for_item(&item, 128);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 128));
+        assert!(chunks.iter().all(|chunk| !chunk.contains("TELEGRAM_REPLY")));
+        assert_eq!(chunks.concat(), item.text);
+    }
+
+    #[test]
+    fn group_telegram_reply_keeps_audit_header() {
+        let mut item = outbox_item();
+        item.event = "TELEGRAM_REPLY".to_string();
+        item.recipients = "operator".to_string();
+        item.text = "group reply".to_string();
+        item.chat_id = Some(-100_123);
+
+        assert_eq!(
+            telegram_chunks_for_item(&item, 512),
+            vec!["[TELEGRAM_REPLY] manager -> operator\ngroup reply"]
+        );
+    }
+
+    #[test]
     fn idempotency_keys_are_normalized_before_storage() {
         assert_eq!(
             validate_idempotency(Some("  stable-key  ")).unwrap(),
@@ -1842,23 +2594,44 @@ mod tests {
     }
 
     #[test]
-    fn order_template_uses_the_actual_recipient() {
+    fn dispatch_template_uses_the_actual_recipient() {
         assert_eq!(
-            render_order_template(
-                "{task_id}|{sender}|{recipient}|{message}",
-                "task_1",
+            render_dispatch_template(
+                "{dispatch_id}|{sender}|{recipient}|{message}",
+                "dispatch_1",
                 "manager",
                 "designer",
+                None,
                 "make a mockup",
             )
             .unwrap(),
-            "task_1|manager|designer|make a mockup"
+            "dispatch_1|manager|designer|make a mockup"
         );
+    }
+
+    #[test]
+    fn correlated_dispatch_appends_an_opaque_task_id_guard() {
+        let body = render_dispatch_template(
+            "{correlation_id}|{message}",
+            "dispatch_1",
+            "manager",
+            "dev-senior-0",
+            Some("whole_design_build_gostinitsa_sky_port_novosibir"),
+            "ready",
+        )
+        .unwrap();
+
+        assert!(body.starts_with("whole_design_build_gostinitsa_sky_port_novosibir|ready"));
+        assert!(body.contains("[OPAQUE_CORRELATION]"));
+        assert!(body.contains("Copy it byte-for-byte"));
+        assert!(body.contains("never expand, normalize, or reconstruct"));
     }
 
     use std::collections::BTreeSet;
 
     use crate::testutil;
+    use base64::Engine as _;
+    use sqlx::Row;
 
     /// Build a dispatcher whose agents all point at one mock Hermes server.
     async fn dispatcher_with_mock(
@@ -1868,7 +2641,7 @@ mod tests {
         let mut config = testutil::fixture_config(&path);
         let mock = testutil::spawn_mock_hermes(behavior).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
@@ -1877,7 +2650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_accepts_and_persists_run() -> anyhow::Result<()> {
+    async fn dispatch_accepts_and_persists_run() -> anyhow::Result<()> {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen_clone = seen.clone();
         let behavior: testutil::MockHermes = Arc::new(move |bearer, body| {
@@ -1890,25 +2663,26 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "  do the thing  ".to_string(),
+                    message: "  do the thing  ".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         assert!(!outcome.is_error, "unexpected: {outcome:?}");
         assert_eq!(outcome.value["run_id"], json!("run-1"));
-        let task_id = outcome.value["task_id"]
+        let dispatch_id = outcome.value["dispatch_id"]
             .as_str()
-            .expect("task id")
+            .expect("dispatch id")
             .to_string();
-        assert!(task_id.starts_with("task_"));
+        assert!(dispatch_id.starts_with("dispatch_"));
 
         let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
-            .bind(&task_id)
+            .bind(&dispatch_id)
             .fetch_one(store.pool())
             .await?;
         assert_eq!(status, "accepted");
@@ -1934,17 +2708,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_denies_unauthorized_targets() -> anyhow::Result<()> {
+    async fn dispatch_denies_unauthorized_targets() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run"})))).await?;
 
-        // developer has no order ACL entry at all.
+        // developer has no dispatch ACL entry at all.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "developer",
-                OrderArgs {
+                DispatchArgs {
                     agent: "lead-developer".to_string(),
-                    command: "x".to_string(),
+                    message: "x".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -1957,13 +2732,14 @@ mod tests {
                 .contains("not authorized")
         );
 
-        // manager cannot order itself.
+        // manager cannot dispatch to itself.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "manager".to_string(),
-                    command: "x".to_string(),
+                    message: "x".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2037,37 +2813,36 @@ mod tests {
             .await;
         assert!(unauthorized_clear.is_error);
 
-        let blocked_order = dispatcher
-            .order(
+        let manager_self_clear = dispatcher
+            .clear_message_queue(
                 "manager",
-                OrderArgs {
-                    agent: "developer".to_string(),
-                    command: "must not start".to_string(),
-                    idempotency_key: None,
+                ClearMessageQueueArgs {
+                    agent: "manager".to_string(),
+                    include_dead: true,
                 },
             )
             .await;
-        assert_eq!(blocked_order.value["disabled_agents"], json!(["developer"]));
-        assert_eq!(
-            blocked_order.value["action_required"],
-            json!("stop_current_run_and_escalate_to_human")
-        );
+        assert!(!manager_self_clear.is_error);
+        assert_eq!(manager_self_clear.value["agent"], json!("manager"));
 
-        let blocked_report = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "must not leave".to_string(),
-                    task_id: "task-blocked".to_string(),
-                    status: "completed".to_string(),
-                    recipient: Some("manager".to_string()),
+        let blocked_dispatch = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "must not start".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         assert_eq!(
-            blocked_report.value["error"],
-            json!("messaging is disabled for the sending role")
+            blocked_dispatch.value["disabled_agents"],
+            json!(["developer"])
+        );
+        assert_eq!(
+            blocked_dispatch.value["action_required"],
+            json!("stop_current_run_and_escalate_to_human")
         );
 
         let blocked_peer = dispatcher
@@ -2075,8 +2850,8 @@ mod tests {
                 "lead-developer",
                 MessageArgs {
                     agent: "developer".to_string(),
-                    task_id: "task-blocked".to_string(),
                     message: "must not arrive".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2100,11 +2875,12 @@ mod tests {
             .await;
         assert!(!enabled.is_error, "unexpected: {enabled:?}");
         let accepted = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "resume".to_string(),
+                    message: "resume".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2126,7 +2902,7 @@ mod tests {
         }))
         .await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
@@ -2211,7 +2987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_all_aggregates_partial_results() -> anyhow::Result<()> {
+    async fn dispatch_all_aggregates_partial_results() -> anyhow::Result<()> {
         let behavior: testutil::MockHermes = Arc::new(|bearer, _| {
             if bearer.ends_with("api-key-developer") {
                 (202, json!({"run_id": "run-dev"}))
@@ -2223,10 +2999,11 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
         let outcome = dispatcher
-            .order_all(
+            .dispatch_all(
                 "manager",
                 BroadcastArgs {
-                    command: "sync".to_string(),
+                    message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2246,7 +3023,7 @@ mod tests {
             json!(true)
         );
 
-        let dispatch_id = outcome.value["task_id"].as_str().expect("task id");
+        let dispatch_id = outcome.value["dispatch_id"].as_str().expect("dispatch id");
         let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
             .bind(dispatch_id)
             .fetch_one(store.pool())
@@ -2257,163 +3034,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_requires_authorized_supervisor() -> anyhow::Result<()> {
-        let (dispatcher, _store, path) =
-            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-report"})))).await?;
-
-        // designer is not a supervisor of developer.
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "done".to_string(),
-                    task_id: "t1".to_string(),
-                    status: "completed".to_string(),
-                    recipient: Some("designer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(outcome.is_error);
-        assert!(
-            outcome.value["error"]
-                .as_str()
-                .unwrap()
-                .contains("not a supervisor")
-        );
-
-        let unassigned = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "invented lineage".to_string(),
-                    task_id: "task-not-assigned".to_string(),
-                    status: "completed".to_string(),
-                    recipient: Some("lead-developer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(unassigned.is_error);
-        assert!(
-            unassigned.value["error"]
-                .as_str()
-                .unwrap()
-                .contains("not an accepted Swarm order")
-        );
-
-        let assignment = dispatcher
-            .order(
-                "manager",
-                OrderArgs {
-                    agent: "developer".to_string(),
-                    command: "Implement the assigned work".to_string(),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-
-        // lead-developer supervises developer (reverse ACL lookup).
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "done".to_string(),
-                    task_id,
-                    status: "completed".to_string(),
-                    recipient: Some("lead-developer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(!outcome.is_error, "unexpected: {outcome:?}");
-        assert_eq!(outcome.value["recipient_run_id"], json!("run-report"));
-
-        // unknown status is rejected.
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "done".to_string(),
-                    task_id: "t1".to_string(),
-                    status: "weird".to_string(),
-                    recipient: Some("lead-developer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        assert!(outcome.is_error);
-        testutil::remove_db_files(&path).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn progress_report_is_persisted_without_waking_supervisor() -> anyhow::Result<()> {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls_clone = calls.clone();
-        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
-            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            (202, json!({"run_id": "unexpected"}))
-        }))
-        .await?;
-
-        let assignment = dispatcher
-            .order(
-                "manager",
-                OrderArgs {
-                    agent: "developer".to_string(),
-                    command: "Reach one tested checkpoint".to_string(),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-
-        let outcome = dispatcher
-            .report(
-                "developer",
-                ReportArgs {
-                    summary: "Implementation reached the tested checkpoint".to_string(),
-                    task_id,
-                    status: "in_progress".to_string(),
-                    recipient: Some("lead-developer".to_string()),
-                    idempotency_key: None,
-                },
-            )
-            .await;
-
-        assert!(!outcome.is_error, "unexpected: {outcome:?}");
-        assert_eq!(outcome.value["supervisor_woken"], json!(false));
-        assert!(outcome.value.get("recipient_run_id").is_none());
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the assignment starts one run; progress must not start another"
-        );
-        let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
-            .bind(outcome.value["report_id"].as_str().expect("report id"))
-            .fetch_one(store.pool())
-            .await?;
-        assert_eq!(status, "accepted");
-
-        testutil::remove_db_files(&path).await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn message_all_without_peers_is_rejected() -> anyhow::Result<()> {
+    async fn executor_can_wake_manager_after_writing_slc_event() -> anyhow::Result<()> {
         let path = testutil::temp_db_path("dispatch-no-peers");
         let mut config = testutil::fixture_config(&path);
         config.agent_roles = vec!["developer".to_string()];
         config.all_roles = vec!["manager".to_string(), "developer".to_string()];
-        config.order_acl = BTreeMap::from([("manager".to_string(), vec!["developer".to_string()])]);
+        config.dispatch_acl =
+            BTreeMap::from([("manager".to_string(), vec!["developer".to_string()])]);
         config.global_authorities = BTreeSet::from(["manager".to_string()]);
         config.activity_routes = BTreeMap::new();
         config
@@ -2426,30 +3053,78 @@ mod tests {
         let mock =
             testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
 
-        // developer has no peers: sending to nobody must not report success.
+        // Task reports live in SLC, but an executor must still be able to wake
+        // the manager through the transport after writing a terminal event.
         let outcome = dispatcher
-            .message_all(
+            .message(
                 "developer",
-                MessageAllArgs {
-                    task_id: "task-no-peers".to_string(),
-                    message: "hi".to_string(),
+                MessageArgs {
+                    agent: "manager".to_string(),
+                    message: "SLC task task_example has a terminal event".to_string(),
+                    correlation_id: Some("task_example".to_string()),
+                    idempotency_key: Some("event_example".to_string()),
+                },
+            )
+            .await;
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.value);
+        assert_eq!(outcome.value["ok"], json!(true));
+        assert_eq!(outcome.value["recipient"], json!("manager"));
+        assert_eq!(outcome.value["correlation_id"], json!("task_example"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn msg_to_without_dispatch_id_is_a_plain_handoff() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-msg-no-correlation");
+        let mut config = testutil::fixture_config(&path);
+        let mock =
+            testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(mock.parse()?);
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        // developer → lead-developer, no dispatch_id: must be accepted as a
+        // plain coordination message (no domain correlation is required).
+        let outcome = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "lead-developer".to_string(),
+                    message: "Перезвони клиенту: Иван, +79139849832, хочет сайт".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
-        assert!(outcome.is_error);
-        assert!(
-            outcome.value["error"]
-                .as_str()
-                .unwrap()
-                .contains("no peer executors")
-        );
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.value);
+        assert_eq!(outcome.value["ok"], json!(true));
+        assert_eq!(outcome.value["recipient"], json!("lead-developer"));
+
+        // Same again — idempotency replay must not flip it to an error.
+        let replay = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "lead-developer".to_string(),
+                    message: "Перезвони клиенту: Иван, +79139849832, хочет сайт".to_string(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!replay.is_error, "replay failed: {}", replay.value);
+        assert_eq!(replay.value["ok"], json!(true));
+
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -2469,29 +3144,31 @@ mod tests {
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
         let first = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "retry me".to_string(),
+                    message: "retry me".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("key-retry".to_string()),
                 },
             )
             .await;
         assert!(first.is_error);
         let first_status: String =
-            sqlx::query_scalar("SELECT status FROM dispatches WHERE sender='manager' AND kind='order' AND idempotency_key='key-retry'")
+            sqlx::query_scalar("SELECT status FROM dispatches WHERE sender='manager' AND kind='dispatch_to' AND idempotency_key='key-retry'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(first_status, "failed");
 
         // Retry with the SAME key re-executes: the failed dispatch released the key.
         let second = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "retry me".to_string(),
+                    message: "retry me".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("key-retry".to_string()),
                 },
             )
@@ -2499,21 +3176,255 @@ mod tests {
         assert!(!second.is_error, "retry must re-execute: {second:?}");
         assert_eq!(second.value["run_id"], json!("run-ok"));
         assert!(second.value.get("deduplicated").is_none());
-        let second_id = second.value["task_id"].as_str().expect("task id");
+        let second_id = second.value["dispatch_id"].as_str().expect("dispatch id");
 
         // A further call with the same key replays the accepted result.
         let third = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "retry me".to_string(),
+                    message: "retry me".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("key-retry".to_string()),
                 },
             )
             .await;
         assert_eq!(third.value["deduplicated"], json!(true));
-        assert_eq!(third.value["task_id"], json!(second_id));
+        assert_eq!(third.value["dispatch_id"], json!(second_id));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_hermes_dispatch_is_accepted_into_durable_fifo() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let behavior: testutil::MockHermes = Arc::new(move |_, _| {
+            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (429, json!({"error": "role busy"}))
+            } else {
+                (202, json!({"run_id": "run-after-busy"}))
+            }
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        let args = DispatchArgs {
+            agent: "developer".to_string(),
+            message: "SLC task task_fifo is ready".to_string(),
+            correlation_id: Some("task_fifo".to_string()),
+            idempotency_key: Some("fifo-wake".to_string()),
+        };
+        let outcome = dispatcher.dispatch_to("manager", args).await;
+        assert!(!outcome.is_error, "busy is queueable: {}", outcome.value);
+        assert_eq!(outcome.value["queued"], json!(true));
+        assert_eq!(outcome.value["queue_position"], json!(1));
+        let queue_id = outcome.value["queue_id"].as_str().unwrap().to_string();
+        let status: String = sqlx::query_scalar("SELECT status FROM delivery_outbox WHERE id=?")
+            .bind(&queue_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(status, "pending");
+
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0 WHERE id=?")
+            .bind(&queue_id)
+            .execute(store.pool())
+            .await?;
+        dispatcher.flush_delivery_queue().await?;
+        let delivered: (String, Option<String>) =
+            sqlx::query_as("SELECT status, run_id FROM delivery_outbox WHERE id=?")
+                .bind(&queue_id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(delivered.1.as_deref(), Some("run-after-busy"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_delivery_queue_exposes_only_one_fifo_head_per_role() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (429, json!({"error": "role busy"}))
+        }))
+        .await?;
+        for index in 1..=2 {
+            let outcome = dispatcher
+                .dispatch_to(
+                    "manager",
+                    DispatchArgs {
+                        agent: "developer".to_string(),
+                        message: format!("wake {index}"),
+                        correlation_id: Some(format!("task_fifo_{index}")),
+                        idempotency_key: Some(format!("fifo-wake-{index}")),
+                    },
+                )
+                .await;
+            assert!(!outcome.is_error);
+            assert_eq!(outcome.value["queue_position"], json!(index));
+        }
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0")
+            .execute(store.pool())
+            .await?;
+        let due = store.due_deliveries(10).await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, "dispatch_to");
+        assert_eq!(due[0].recipient, "developer");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a later wake must queue behind the first without overtaking it"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_delivery_can_be_cancelled_without_touching_later_fifo_work()
+    -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_mock(Arc::new(move |_, _| {
+            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (429, json!({"error": "role busy"}))
+            } else {
+                (202, json!({"run_id": "run-valid-tail"}))
+            }
+        }))
+        .await?;
+        let first = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "obsolete wake".to_string(),
+                    correlation_id: Some("obsolete_slc_item".to_string()),
+                    idempotency_key: Some("obsolete-wake".to_string()),
+                },
+            )
+            .await;
+        let second = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "valid wake".to_string(),
+                    correlation_id: Some("valid_slc_item".to_string()),
+                    idempotency_key: Some("valid-wake".to_string()),
+                },
+            )
+            .await;
+        let first_id = first.value["queue_id"].as_str().unwrap().to_string();
+        let second_id = second.value["queue_id"].as_str().unwrap().to_string();
+        assert_eq!(second.value["queue_position"], json!(2));
+
+        let unauthorized = dispatcher
+            .cancel_delivery(
+                "developer",
+                CancelDeliveryArgs {
+                    queue_id: first_id.clone(),
+                    reason: "recipient cannot discard inbound work".to_string(),
+                },
+            )
+            .await;
+        assert!(unauthorized.is_error);
+        assert!(
+            unauthorized.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("original sender or swarm manager")
+        );
+
+        let cancelled = dispatcher
+            .cancel_delivery(
+                "manager",
+                CancelDeliveryArgs {
+                    queue_id: first_id.clone(),
+                    reason: "canonical SLC work was cancelled before execution".to_string(),
+                },
+            )
+            .await;
+        assert!(!cancelled.is_error, "{}", cancelled.value);
+        assert_eq!(cancelled.value["status"], json!("cancelled"));
+        assert_eq!(cancelled.value["next_queue_id"], json!(second_id));
+        assert_eq!(cancelled.value["remaining_pending"], json!(1));
+
+        let replay = dispatcher
+            .cancel_delivery(
+                "manager",
+                CancelDeliveryArgs {
+                    queue_id: first_id,
+                    reason: "idempotent operator retry".to_string(),
+                },
+            )
+            .await;
+        assert!(!replay.is_error);
+        assert_eq!(replay.value["already_cancelled"], json!(true));
+
+        let due = store.due_deliveries(10).await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, second_id);
+        dispatcher.flush_delivery_queue().await?;
+        let delivered: (String, Option<String>) =
+            sqlx::query_as("SELECT status, run_id FROM delivery_outbox WHERE id=?")
+                .bind(&second_id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(delivered.1.as_deref(), Some("run-valid-tail"));
+
+        let too_late = dispatcher
+            .cancel_delivery(
+                "manager",
+                CancelDeliveryArgs {
+                    queue_id: second_id,
+                    reason: "cannot retract an accepted Hermes run".to_string(),
+                },
+            )
+            .await;
+        assert!(too_late.is_error);
+        assert!(
+            too_late.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("can no longer be cancelled")
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_manager_sender_can_cancel_only_its_own_queued_delivery() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (429, json!({"error": "role busy"})))).await?;
+        let queued = dispatcher
+            .message(
+                "developer",
+                MessageArgs {
+                    agent: "manager".to_string(),
+                    message: "eligible SLC wake".to_string(),
+                    correlation_id: Some("sender_owned_item".to_string()),
+                    idempotency_key: Some("sender-owned-wake".to_string()),
+                },
+            )
+            .await;
+        assert!(!queued.is_error);
+        let queue_id = queued.value["queue_id"].as_str().unwrap().to_string();
+
+        let cancelled = dispatcher
+            .cancel_delivery(
+                "developer",
+                CancelDeliveryArgs {
+                    queue_id,
+                    reason: "the originating SLC event is no longer runnable".to_string(),
+                },
+            )
+            .await;
+        assert!(!cancelled.is_error, "{}", cancelled.value);
+        assert_eq!(cancelled.value["sender"], json!("developer"));
+        assert_eq!(cancelled.value["status"], json!("cancelled"));
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -2529,21 +3440,23 @@ mod tests {
         let (dispatcher, _store, path) = dispatcher_with_mock(behavior).await?;
 
         let first = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "Implement the bounded task".to_string(),
+                    message: "Implement the bounded task".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         let replay = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "  Implement   the bounded task\n".to_string(),
+                    message: "  Implement   the bounded task\n".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2552,7 +3465,7 @@ mod tests {
         assert!(!first.is_error, "unexpected: {first:?}");
         assert!(!replay.is_error, "unexpected: {replay:?}");
         assert_eq!(replay.value["deduplicated"], json!(true));
-        assert_eq!(replay.value["task_id"], first.value["task_id"]);
+        assert_eq!(replay.value["dispatch_id"], first.value["dispatch_id"]);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         testutil::remove_db_files(&path).await;
@@ -2588,7 +3501,7 @@ mod tests {
         config.telegram_api_base_url = telegram_base.parse()?;
         let mock = testutil::spawn_mock_hermes(behavior).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
@@ -2597,17 +3510,25 @@ mod tests {
     }
 
     async fn spawn_mock_telegram_with(behavior: MockBot) -> String {
+        spawn_mock_telegram_with_files(behavior, Vec::new()).await
+    }
+
+    /// Mock with inbound-file support: `/getFile` resolves to a fixed
+    /// `file_path`, and `/file/bot{token}/{path}` serves `file_bytes` raw.
+    async fn spawn_mock_telegram_with_files(behavior: MockBot, file_bytes: Vec<u8>) -> String {
         use axum::{
             Json, Router,
+            body::Bytes,
             extract::{OriginalUri, State as AxumState},
             http::StatusCode,
             response::IntoResponse,
-            routing::post,
+            routing::{get, post},
         };
         let handler = move |AxumState(behavior): AxumState<MockBot>,
                             uri: OriginalUri,
-                            Json(body): Json<Value>| async move {
-            let (status, payload, retry_after) = behavior(uri.path(), &body.to_string());
+                            body: Bytes| async move {
+            let body = String::from_utf8_lossy(&body).to_string();
+            let (status, payload, retry_after) = behavior(uri.path(), &body);
             let mut response = (
                 StatusCode::from_u16(status).expect("mock status"),
                 Json(payload),
@@ -2621,8 +3542,28 @@ mod tests {
             }
             response
         };
+        let file_handler = move |uri: OriginalUri| async move {
+            let bytes = file_bytes.clone();
+            let mut response = (StatusCode::OK, bytes).into_response();
+            response.headers_mut().insert(
+                reqwest::header::CONTENT_TYPE,
+                "image/png".parse().expect("mime"),
+            );
+            let _ = uri;
+            response
+        };
+        let get_file_handler = move || async move {
+            Json(
+                json!({"ok": true, "result": {"file_id": "f1", "file_unique_id": "u1", "file_path": "photos/x.png"}}),
+            )
+        };
         let router = Router::new()
             .route("/bot{token}/sendMessage", post(handler))
+            .route("/bot{token}/sendChatAction", post(handler))
+            .route("/bot{token}/sendPhoto", post(handler))
+            .route("/bot{token}/sendDocument", post(handler))
+            .route("/bot{token}/getFile", get(get_file_handler))
+            .route("/file/bot{token}/{*path}", get(file_handler))
             .with_state(behavior);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2641,28 +3582,25 @@ mod tests {
         let (dispatcher, store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run-msg"})))).await?;
 
-        let assignment = dispatcher
-            .order(
+        let _assignment = dispatcher
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "Coordinate one implementation detail".to_string(),
+                    message: "Coordinate one implementation detail".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
 
         let outcome = dispatcher
             .message(
                 "developer",
                 MessageArgs {
                     agent: "lead-developer".to_string(),
-                    task_id,
                     message: " ping ".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2681,7 +3619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_rejects_non_peer_targets() -> anyhow::Result<()> {
+    async fn message_rejects_self_and_unknown_recipients() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "run"})))).await?;
         let outcome = dispatcher
@@ -2689,8 +3627,8 @@ mod tests {
                 "developer",
                 MessageArgs {
                     agent: "developer".to_string(),
-                    task_id: "task-self".to_string(),
                     message: "self".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2700,9 +3638,9 @@ mod tests {
             .message(
                 "developer",
                 MessageArgs {
-                    agent: "manager".to_string(),
-                    task_id: "task-not-peer".to_string(),
-                    message: "not a peer".to_string(),
+                    agent: "unknown-role".to_string(),
+                    message: "not configured".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2723,29 +3661,25 @@ mod tests {
         });
         let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
 
-        let assignment = dispatcher
-            .order(
+        let _assignment = dispatcher
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "Coordinate the assigned task".to_string(),
+                    message: "Coordinate the assigned task".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
-        let task_id = assignment.value["task_id"]
-            .as_str()
-            .expect("assigned task id")
-            .to_string();
-
         // The developer's only peer is lead-developer, whose server error is
         // indeterminate because the downstream may still have accepted it.
         let outcome = dispatcher
             .message_all(
                 "developer",
                 MessageAllArgs {
-                    task_id,
                     message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2767,14 +3701,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_all_all_server_failures_are_indeterminate() -> anyhow::Result<()> {
+    async fn dispatch_all_all_server_failures_are_indeterminate() -> anyhow::Result<()> {
         let (dispatcher, store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (500, json!({"error": "boom"})))).await?;
         let outcome = dispatcher
-            .order_all(
+            .dispatch_all(
                 "manager",
                 BroadcastArgs {
-                    command: "sync".to_string(),
+                    message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2785,7 +3720,7 @@ mod tests {
             outcome.value["results"]["developer"]["status"],
             json!("indeterminate")
         );
-        let dispatch_id = outcome.value["task_id"].as_str().expect("task id");
+        let dispatch_id = outcome.value["dispatch_id"].as_str().expect("dispatch id");
         let status: String = sqlx::query_scalar("SELECT status FROM dispatches WHERE id = ?")
             .bind(dispatch_id)
             .fetch_one(store.pool())
@@ -2858,18 +3793,865 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_telegram_inbound_is_not_copied_to_the_group_outbox() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-private"}))))
+                .await?;
+
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 6,
+                message_id: 101,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "private operator request".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 42,
+            })
+            .await;
+
+        assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
+        assert_eq!(outcome.value["telegram"]["queued"], json!(false));
+        assert_eq!(outcome.value["telegram"]["privacy"], json!("private_chat"));
+        let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            outbox, 0,
+            "private inbound text and dispatch metadata must not enter the shared group outbox"
+        );
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_telegram_reply_wire_payload_has_no_audit_header() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "run-private"}))),
+            Arc::new(move |_, body| {
+                sent_clone.lock().expect("sent").push(body.to_string());
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+
+        let inbound = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 7,
+                message_id: 102,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "private operator request".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 42,
+            })
+            .await;
+        assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
+
+        let reply_text = "Ответ без служебного заголовка";
+        let reply = dispatcher
+            .telegram_reply("developer", reply_text.to_string(), vec![])
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        dispatcher.flush_outbox().await?;
+
+        let payload: Value = {
+            let bodies = sent.lock().expect("sent");
+            assert_eq!(bodies.len(), 1, "only the private reply should be sent");
+            serde_json::from_str(&bodies[0])?
+        };
+        assert_eq!(payload["chat_id"], json!("42"));
+        assert_eq!(payload["text"], json!(reply_text));
+        assert!(
+            !payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("TELEGRAM_REPLY")
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_queues_attached_files() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        // Устанавливаем чат оператора диспатчем.
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 11,
+                message_id: 400,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let files = vec![
+            TelegramFileArgs {
+                filename: "cover_ru.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                content_b64: "aGVsbG8=".to_string(),
+                path: None,
+            },
+            TelegramFileArgs {
+                filename: "report.pdf".to_string(),
+                mime_type: None,
+                content_b64: "cGRm".to_string(),
+                path: None,
+            },
+        ];
+        let reply = dispatcher
+            .telegram_reply("developer", "Готово".to_string(), files)
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        let items = store.due_outbox(10).await?;
+        let item = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("reply with files must be queued");
+        assert_eq!(item.media.len(), 2);
+        assert_eq!(item.media[0].filename, "cover_ru.png");
+        assert_eq!(item.media[0].mime_type.as_deref(), Some("image/png"));
+        assert_eq!(item.media[1].filename, "report.pdf");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_allows_files_without_message() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 12,
+                message_id: 401,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let reply = dispatcher
+            .telegram_reply(
+                "developer",
+                String::new(),
+                vec![TelegramFileArgs {
+                    filename: "x.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    content_b64: "eA==".to_string(),
+                    path: None,
+                }],
+            )
+            .await;
+        assert!(
+            !reply.is_error,
+            "files-only reply must work: {:?}",
+            reply.value
+        );
+        let items = store.due_outbox(10).await?;
+        assert!(items.iter().any(|item| item.media.len() == 1));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_reads_files_from_the_shared_path() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        let shared_dir = dispatcher.config.shared_files_dir.clone();
+        std::fs::create_dir_all(&shared_dir)?;
+        let payload = b"\x89PNG-real-bytes-123";
+        std::fs::write(shared_dir.join("reply_cover.png"), payload)?;
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 15,
+                message_id: 404,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        // Абсолютный путь внутри общей папки.
+        let reply = dispatcher
+            .telegram_reply(
+                "developer",
+                "готово".to_string(),
+                vec![TelegramFileArgs {
+                    filename: "cover.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    content_b64: String::new(),
+                    path: Some(
+                        shared_dir
+                            .join("reply_cover.png")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                }],
+            )
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        // Относительный путь тоже работает.
+        let reply2 = dispatcher
+            .telegram_reply(
+                "developer",
+                "готово2".to_string(),
+                vec![TelegramFileArgs {
+                    filename: "cover2.png".to_string(),
+                    mime_type: None,
+                    content_b64: String::new(),
+                    path: Some("reply_cover.png".to_string()),
+                }],
+            )
+            .await;
+        assert!(!reply2.is_error, "unexpected: {:?}", reply2.value);
+        let items = store.due_outbox(10).await?;
+        let covers: Vec<_> = items
+            .iter()
+            .filter(|item| item.event == "TELEGRAM_REPLY")
+            .collect();
+        assert_eq!(covers.len(), 2);
+        let expected = base64::engine::general_purpose::STANDARD.encode(payload);
+        for cover in &covers {
+            assert_eq!(
+                cover.media[0].content_b64, expected,
+                "файл прочитан целиком"
+            );
+        }
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&shared_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_rejects_paths_outside_the_shared_dir() -> anyhow::Result<()> {
+        let (dispatcher, _store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                (200, json!({"id": "x", "choices": [{"message": {"role": "assistant", "content": ""}}]}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        let shared_dir = dispatcher.config.shared_files_dir.clone();
+        std::fs::create_dir_all(&shared_dir)?;
+        std::fs::write(shared_dir.join("secrets.txt"), b"secret")?;
+        for bad_path in ["/etc/hostname", "/opt/data/../etc/passwd"] {
+            let reply = dispatcher
+                .telegram_reply(
+                    "developer",
+                    "x".to_string(),
+                    vec![TelegramFileArgs {
+                        filename: "evil.png".to_string(),
+                        mime_type: None,
+                        content_b64: String::new(),
+                        path: Some(bad_path.to_string()),
+                    }],
+                )
+                .await;
+            assert!(
+                reply.is_error,
+                "path {bad_path} must be rejected: {:?}",
+                reply.value
+            );
+        }
+        // Отсутствующий файл внутри общей папки — тоже ошибка.
+        let reply = dispatcher
+            .telegram_reply(
+                "developer",
+                "x".to_string(),
+                vec![TelegramFileArgs {
+                    filename: "nope.png".to_string(),
+                    mime_type: None,
+                    content_b64: String::new(),
+                    path: Some("no_such_file.png".to_string()),
+                }],
+            )
+            .await;
+        assert!(
+            reply.is_error,
+            "missing file must be rejected: {:?}",
+            reply.value
+        );
+        testutil::remove_db_files(&path).await;
+        let _ = std::fs::remove_dir_all(&shared_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_delivery_resumes_after_a_mid_batch_failure() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let photo_calls = Arc::new(AtomicUsize::new(0));
+        let photo_count = photo_calls.clone();
+        let document_calls = Arc::new(AtomicUsize::new(0));
+        let document_count = document_calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |path, _| {
+                if path.ends_with("sendPhoto") {
+                    photo_count.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({"ok": true}), None)
+                } else if path.ends_with("sendDocument") {
+                    // Первый документ падает (retry_after=0, чтобы пункт
+                    // снова стал due) — доставка должна продолжиться со
+                    // второго файла без повтора фото.
+                    if document_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            500,
+                            json!({"ok": false, "description": "boom"}),
+                            Some("0".to_string()),
+                        )
+                    } else {
+                        (200, json!({"ok": true}), None)
+                    }
+                } else {
+                    (200, json!({"ok": true}), None)
+                }
+            }),
+        )
+        .await?;
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 13,
+                message_id: 402,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "draw".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let files = vec![
+            TelegramFileArgs {
+                filename: "a.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                content_b64: "YQ==".to_string(),
+                path: None,
+            },
+            TelegramFileArgs {
+                filename: "b.pdf".to_string(),
+                mime_type: None,
+                content_b64: "Yg==".to_string(),
+                path: None,
+            },
+            TelegramFileArgs {
+                filename: "c.pdf".to_string(),
+                mime_type: None,
+                content_b64: "Yw==".to_string(),
+                path: None,
+            },
+        ];
+        assert!(
+            !dispatcher
+                .telegram_reply("developer", "docs".to_string(), files)
+                .await
+                .is_error
+        );
+        // Первый прогон: фото ушло, первый документ упал → пункт остаётся
+        // (статус/чекпоинт читаем напрямую — пункт отложен по backoff).
+        dispatcher.flush_outbox().await?;
+        let row = sqlx::query(
+            "SELECT status, attempts, next_chunk FROM telegram_outbox WHERE event = 'TELEGRAM_REPLY'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 1);
+        assert_eq!(
+            row.get::<i64, _>("next_chunk"),
+            1,
+            "только фото зачекпоинчено"
+        );
+        assert_eq!(photo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(document_calls.load(Ordering::SeqCst), 1);
+        // Второй прогон после дефолтного backoff (2^attempts): два документа
+        // досылаются, фото не повторяется.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        dispatcher.flush_outbox().await?;
+        let items = store.due_outbox(10).await?;
+        assert!(
+            !items.iter().any(|item| item.event == "TELEGRAM_REPLY"),
+            "reply delivered"
+        );
+        assert_eq!(photo_calls.load(Ordering::SeqCst), 1, "фото не повторяется");
+        // 1 упавший вызов при первом прогоне + 2 досланных документа.
+        assert_eq!(document_calls.load(Ordering::SeqCst), 3);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_reply_worker_drops_expired_tracks_without_delivery() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/") {
+                (
+                    200,
+                    json!({
+                        "object": "hermes.run",
+                        "run_id": "run-old",
+                        "status": "running",
+                    }),
+                )
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        }))
+        .await?;
+        store
+            .track_run_reply("run-old", "developer", 424_242)
+            .await?;
+        // Ставим created_ms в прошлом на 7 часов (TTL = 6ч).
+        sqlx::query("UPDATE run_replies SET created_ms = ? WHERE run_id = 'run-old'")
+            .bind(Utc::now().timestamp_millis() - 7 * 3600 * 1000)
+            .execute(store.pool())
+            .await?;
+        dispatcher.flush_run_replies().await?;
+        assert!(
+            store.due_run_replies().await?.is_empty(),
+            "expired track dropped"
+        );
+        let items = store.due_outbox(10).await?;
+        assert!(!items.iter().any(|item| item.event == "TELEGRAM_REPLY"));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_falls_back_to_any_roles_operator_chat() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-x"})))).await?;
+        // Диспатч на developer устанавливает чат оператора.
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 14,
+                message_id: 403,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hi".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        // MCP-only роль (например designer) без собственного диспатча
+        // отвечает в тот же чат оператора.
+        let reply = dispatcher
+            .telegram_reply("designer", "proactive".to_string(), vec![])
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        let items = store.due_outbox(10).await?;
+        let item = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("reply queued");
+        assert_eq!(item.chat_id, Some(424_242));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_reply_worker_delivers_final_answer_to_source_chat() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/") {
+                (
+                    200,
+                    json!({
+                        "object": "hermes.run",
+                        "run_id": "run-tg",
+                        "status": "completed",
+                        "output": "Ответ от агента",
+                    }),
+                )
+            } else {
+                (202, json!({"run_id": "run-tg"}))
+            }
+        }))
+        .await?;
+
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 5,
+                message_id: 100,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
+        assert_eq!(store.due_run_replies().await?.len(), 1);
+
+        dispatcher.flush_run_replies().await?;
+
+        let items = store.due_outbox(10).await?;
+        let reply = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("the run reply must be enqueued");
+        assert_eq!(reply.text, "Ответ от агента");
+        assert_eq!(reply.chat_id, Some(424_242));
+
+        // The run is no longer tracked once delivered.
+        assert!(store.due_run_replies().await?.is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    /// Покеда агент думает — воркер должен держать «печатает…» живым:
+    /// на каждом тике flush шлётся `sendChatAction(chat_id)`.
+    #[tokio::test]
+    async fn flush_run_replies_keeps_typing_while_agent_runs() -> anyhow::Result<()> {
+        let seen: Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_bot = seen.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, body| {
+                if body.starts_with("GET /v1/runs/") {
+                    (
+                        200,
+                        json!({"object": "hermes.run", "run_id": "run-tg", "status": "running"}),
+                    )
+                } else {
+                    (202, json!({"run_id": "run-tg"}))
+                }
+            }),
+            Arc::new(move |path, body| {
+                seen_bot
+                    .lock()
+                    .unwrap()
+                    .push((path.to_string(), json!(body)));
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+
+        dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 7,
+                message_id: 101,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+
+        dispatcher.flush_run_replies().await?;
+
+        let calls = seen.lock().unwrap().clone();
+        let typing = calls
+            .iter()
+            .filter(|entry| entry.0.ends_with("sendChatAction"))
+            .collect::<Vec<_>>();
+        assert!(
+            !typing.is_empty(),
+            "heartbeat sendChatAction must fire while running: {calls:?}"
+        );
+        assert!(
+            typing[0].1.to_string().contains("424242"),
+            "typing must target the source chat: {typing:?}",
+        );
+        // Пузырь «печатает» ставится ровно один раз за тик (без спама sendMessage).
+        assert!(
+            !calls.iter().any(|entry| entry.0.ends_with("sendMessage")),
+            "heartbeat must not send messages: {calls:?}",
+        );
+        // Пока running — трек не снимается, ответ ещё не поставлен.
+        assert_eq!(store.due_run_replies().await?.len(), 1);
+        // Ответа ещё нет: в outbox не должно быть TELEGRAM_REPLY (audit-запись
+        // приёма — не считается).
+        assert!(
+            store
+                .due_outbox(10)
+                .await?
+                .iter()
+                .all(|item| item.event != "TELEGRAM_REPLY")
+        );
+        drop(calls);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_tracks_run_reply_to_senders_chat() -> anyhow::Result<()> {
+        // Менеджер получил приказ из Telegram-чата, затем dispatch_to
+        // контактеру — ответ контактера (вывод run) должен уйти в тот же чат.
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/") {
+                (
+                    200,
+                    json!({
+                        "object": "hermes.run",
+                        "run_id": "run-dt",
+                        "status": "completed",
+                        "output": "Отчёт контактера",
+                    }),
+                )
+            } else {
+                (202, json!({"run_id": "run-dt"}))
+            }
+        }))
+        .await?;
+        let inbound = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 77,
+                message_id: 501,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "приказ".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
+
+        let out = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "отчитайся о звонках".to_string(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!out.is_error, "unexpected: {:?}", out.value);
+        let tracks = store.due_run_replies().await?;
+        assert!(
+            tracks
+                .iter()
+                .any(|(run_id, role, chat_id, _)| run_id == "run-dt"
+                    && role == "developer"
+                    && *chat_id == 424_242),
+            "ответ run'а контактера должен отслеживаться для чата менеджера: {tracks:?}"
+        );
+
+        dispatcher.flush_run_replies().await?;
+        let items = store.due_outbox(10).await?;
+        let reply = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("the dispatch run reply must be enqueued");
+        assert_eq!(reply.text, "Отчёт контактера");
+        assert_eq!(reply.chat_id, Some(424_242));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_can_run_silently_without_inheriting_operator_chat() -> anyhow::Result<()> {
+        let (mut dispatcher, store, path) =
+            dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-silent"}))))
+                .await?;
+        Arc::make_mut(&mut dispatcher.config).telegram_track_dispatch_replies = false;
+
+        let inbound = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 88,
+                message_id: 601,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "operator request".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
+        // Direct Telegram runs keep their normal reply contract. Remove that
+        // fixture track so the assertion below observes only dispatch_to.
+        store.untrack_run_reply("run-silent").await?;
+        let out = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "silent internal wake".to_string(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+
+        assert!(!out.is_error, "unexpected: {:?}", out.value);
+        assert!(store.due_run_replies().await?.is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_role_is_initiated_via_chat_completions() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-openai");
+        let telegram_base =
+            spawn_mock_telegram_with(Arc::new(|_, _| (200, json!({"ok": true}), None))).await;
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = crate::config::TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(crate::config::Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        config.telegram_api_base_url = telegram_base.parse()?;
+        let initiated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = initiated.clone();
+        let mock = testutil::spawn_mock_hermes(Arc::new(move |_, body| {
+            if body.starts_with("POST /v1/chat/completions") {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                (
+                    200,
+                    json!({"id": "chatcmpl-1", "choices": [{"message": {"role": "assistant", "content": ""}}]}),
+                )
+            } else {
+                (404, json!({"error": "unexpected endpoint"}))
+            }
+        }))
+        .await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(mock.parse()?);
+        }
+        config
+            .agents
+            .get_mut("developer")
+            .expect("fixture has developer")
+            .api_kind = crate::config::ApiKind::OpenAi;
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 7,
+                message_id: 200,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
+        assert_eq!(
+            outcome.value["results"]["developer"]["initiated"],
+            json!("true")
+        );
+        assert!(initiated.load(std::sync::atomic::Ordering::SeqCst));
+        // OpenAI roles have no Hermes run to poll.
+        assert!(store.due_run_replies().await?.is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_only_role_rejects_dispatches_and_can_reply_proactively() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-mcp-only");
+        let telegram_base =
+            spawn_mock_telegram_with(Arc::new(|_, _| (200, json!({"ok": true}), None))).await;
+        let mut config = testutil::fixture_config(&path);
+        config.telegram_enabled = true;
+        config.telegram_bot_mode = crate::config::TelegramBotMode::Shared;
+        config.telegram_bot_token = Some(crate::config::Secret::new("test-bot-token".to_string()));
+        config.telegram_group_id = Some("-100123".to_string());
+        config.telegram_inbound_enabled = true;
+        config.telegram_inbound_targets = vec!["developer".to_string()];
+        config.telegram_allowed_users = BTreeSet::from([42]);
+        config.telegram_api_base_url = telegram_base.parse()?;
+        let mock = testutil::spawn_mock_hermes(Arc::new(|_, _| {
+            (404, json!({"error": "unexpected endpoint"}))
+        }))
+        .await;
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(mock.parse()?);
+        }
+        config
+            .agents
+            .get_mut("developer")
+            .expect("fixture has developer")
+            .api_kind = crate::config::ApiKind::Mcp;
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
+
+        // Proactive telegram_reply works for MCP-only roles: with no prior
+        // dispatch the message falls back to the group chat.
+        let reply = dispatcher
+            .telegram_reply("developer", "Инициатива снизу".to_string(), vec![])
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        let items = store.due_outbox(10).await?;
+        let item = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("reply must be queued");
+        assert_eq!(item.text, "Инициатива снизу");
+        assert_eq!(
+            item.chat_id, None,
+            "no dispatch yet — falls back to the group"
+        );
+
+        // A dispatch addressed to an MCP-only role is rejected with a clear
+        // error (the role initiates interaction itself).
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 9,
+                message_id: 300,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "hello".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+            })
+            .await;
+        let error = outcome.value["results"]["developer"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(error.contains("MCP-only"), "unexpected: {error}");
+        assert!(store.due_run_replies().await?.is_empty());
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn flush_outbox_delivers_queued_audits() -> anyhow::Result<()> {
         let (dispatcher, store, path) =
             dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-flush"}))))
                 .await?;
 
-        // An accepted order queues an audit message in the outbox.
+        // An accepted transport dispatch queues an audit message in the outbox.
         dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "audit me".to_string(),
+                    message: "audit me".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2903,11 +4685,12 @@ mod tests {
         )
         .await?;
         dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "audit after resume".to_string(),
+                    message: "audit after resume".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2931,7 +4714,7 @@ mod tests {
         dispatcher.flush_outbox().await?;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let held_status: String =
-            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='ORDER'")
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='DISPATCH'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(held_status, "pending");
@@ -2949,7 +4732,7 @@ mod tests {
         dispatcher.flush_outbox().await?;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let resumed_status: String =
-            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='ORDER'")
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE event='DISPATCH'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(resumed_status, "delivered");
@@ -2966,11 +4749,12 @@ mod tests {
         )
         .await?;
         dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "audit once".to_string(),
+                    message: "audit once".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -2979,7 +4763,7 @@ mod tests {
         dispatcher.flush_outbox().await?;
 
         let (status, attempts): (String, i64) =
-            sqlx::query_as("SELECT status, attempts FROM telegram_outbox WHERE event='ORDER'")
+            sqlx::query_as("SELECT status, attempts FROM telegram_outbox WHERE event='DISPATCH'")
                 .fetch_one(store.pool())
                 .await?;
         assert_eq!(status, "dead");
@@ -3007,11 +4791,12 @@ mod tests {
         .await?;
         for command in ["first audit", "second audit"] {
             dispatcher
-                .order(
+                .dispatch_to(
                     "manager",
-                    OrderArgs {
+                    DispatchArgs {
                         agent: "developer".to_string(),
-                        command: command.to_string(),
+                        message: command.to_string(),
+                        correlation_id: None,
                         idempotency_key: None,
                     },
                 )
@@ -3045,12 +4830,13 @@ mod tests {
         OutboxItem {
             id: "audit_x".to_string(),
             sender: "manager".to_string(),
-            event: "ORDER".to_string(),
+            event: "DISPATCH".to_string(),
             recipients: "developer".to_string(),
-            text: "task_1\nmake a mockup".repeat(300),
+            text: "dispatch_1\nmake a mockup".repeat(300),
             attempts: 0,
             next_chunk: 0,
             chat_id: None,
+            media: vec![],
         }
     }
 
@@ -3113,7 +4899,7 @@ mod tests {
         // The chunk checkpoint needs a real pending outbox row.
         sqlx::query(
             "INSERT INTO telegram_outbox(id,sender,event,recipients,text,status,attempts,next_chunk,next_attempt_ms,created_ms)
-             VALUES ('audit_x','manager','ORDER','developer',?,'pending',0,0,0,0)",
+             VALUES ('audit_x','manager','DISPATCH','developer',?,'pending',0,0,0,0)",
         )
         .bind(&item.text)
         .execute(store.pool())
@@ -3125,7 +4911,7 @@ mod tests {
             bodies[0].clone()
         };
         let expected_chunks = telegram_chunks(
-            "[ORDER] manager -> developer",
+            "[DISPATCH] manager -> developer",
             &item.text,
             dispatcher.config.telegram_message_limit,
         );
@@ -3171,17 +4957,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_rejects_invalid_arguments_and_oversized_text() -> anyhow::Result<()> {
+    async fn dispatch_rejects_invalid_arguments_and_oversized_text() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await?;
 
         // idempotency keys must match the identifier alphabet.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "x".to_string(),
+                    message: "x".to_string(),
+                    correlation_id: None,
                     idempotency_key: Some("bad key with spaces!".to_string()),
                 },
             )
@@ -3190,22 +4977,24 @@ mod tests {
 
         // commands are trimmed and bounded.
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "   ".to_string(),
+                    message: "   ".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
             .await;
         assert!(outcome.is_error);
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "x".repeat(20_000),
+                    message: "x".repeat(20_000),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3221,22 +5010,24 @@ mod tests {
         let mut config = testutil::fixture_config(&path);
         // The fixture bypasses startup template validation, so a broken template
         // reaches render time and must fail the dispatch durably.
-        config.order_template = "{task_id}|{sender}|{recipient}|{message}|{unknown}".to_string();
+        config.dispatch_template =
+            "{dispatch_id}|{sender}|{recipient}|{message}|{unknown}".to_string();
         let mock =
             testutil::spawn_mock_hermes(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await;
         for agent in config.agents.values_mut() {
-            agent.api_url = mock.parse()?;
+            agent.api_url = Some(mock.parse()?);
         }
         let config = Arc::new(config);
         let store = Store::connect(&config).await?;
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
 
         let outcome = dispatcher
-            .order(
+            .dispatch_to(
                 "manager",
-                OrderArgs {
+                DispatchArgs {
                     agent: "developer".to_string(),
-                    command: "do it".to_string(),
+                    message: "do it".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )
@@ -3253,14 +5044,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_all_requires_global_authority() -> anyhow::Result<()> {
+    async fn dispatch_all_requires_global_authority() -> anyhow::Result<()> {
         let (dispatcher, _store, path) =
             dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await?;
         let outcome = dispatcher
-            .order_all(
+            .dispatch_all(
                 "developer",
                 BroadcastArgs {
-                    command: "sync".to_string(),
+                    message: "sync".to_string(),
+                    correlation_id: None,
                     idempotency_key: None,
                 },
             )

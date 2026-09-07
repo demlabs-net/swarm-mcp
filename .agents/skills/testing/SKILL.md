@@ -5,7 +5,9 @@ description: How to write tests for the swarm-mcp Rust codebase. Use when adding
 
 # Testing swarm-mcp
 
-Tests live in `#[cfg(test)] mod tests` inside each module. `Cargo.toml` has no `[dev-dependencies]` — the main dependencies already provide what is needed (`tokio` macros, `sqlx`, `uuid`, `serde_json`). All tests must run offline.
+Tests live in `#[cfg(test)] mod tests` inside each module. The main dependencies
+provide most fixtures (`tokio`, `sqlx`, `uuid`, `serde_json`); `tower` is the
+small router-test dev dependency. All tests must run offline.
 
 ## Patterns by module
 
@@ -18,10 +20,25 @@ Tests live in `#[cfg(test)] mod tests` inside each module. `Cargo.toml` has no `
 
 Coverage gaps to fill (as of REVIEW-PLAN.md): `activity_snapshot` visibility filtering, `cleanup` retention, `recover_stale_pending`, `mark_outbox_failed` backoff/dead transition, `due_outbox` ordering, `finish_dispatch` audit insertion, `recent_operations` sender view.
 
+For `delivery_outbox`, assert insertion order through its integer `sequence`,
+only one due FIFO head per recipient, pause/resume under
+`clear_queue=false`, cancellation in both directions, and no direct Hermes
+call for a later delivery while an earlier head is pending.
+
 ### dispatch.rs
 - Pure functions are directly testable: `render_template`, `render_order_template`, `validate_identifier`/`validate_idempotency`, `telegram_chunks`, `fingerprint`, `parse_arguments` (bad/extra/unknown fields → `ToolOutcome` error), `telegram_chunks` unicode boundaries.
-- Tool flows (`order`, `report`, `msg_to`, `telegram_inbound`, broadcasts) call `start_run` → HTTP POST to `agent.api_url`. To test them without a real swarm, spin up a local mock Hermes server with axum (see below) and build a `Dispatcher` directly from a hand-made `Config` (fields are `pub`).
+- Tool flows (`dispatch_to`, `msg_to`, `telegram_inbound`, broadcasts) call
+  `start_run` → HTTP POST to `agent.api_url`. To test them without a real
+  swarm, spin up a local mock Hermes server with axum (see below) and build a
+  `Dispatcher` directly from a hand-made `Config` (fields are `pub`).
+- Lock the domain boundary with tests: a correlation id remains opaque, the
+  transport accepts the four-field delivery object emitted by SLC, and an
+  executor can wake its SLC task issuer (including the manager) without a
+  Swarm-side task lookup.
 - `TelegramFailure`/`RunFailure` status classification (rejected vs indeterminate) is unit-testable via the store + mock server.
+- Busy-Hermes tests return 429 once, assert the tool returns accepted
+  `queued=true`, then flush the worker into a 202 response. A second wake for
+  the same recipient must join the queue without another mock-server call.
 
 Mock Hermes server sketch:
 ```rust
@@ -40,7 +57,7 @@ Then point `agent.api_url` at `format!("http://{addr}")`.
 - Assert: wrong/absent tokens → 401 + `WWW-Authenticate: Bearer`; bad Host → 403; oversize body → 413; rate limit → 429; valid activity signal → 202 with `recorded` flags.
 
 ### mcp.rs (currently zero tests)
-- `tools()`, `resources()`, `hierarchy()`, `instructions()` are pure given a `Config` + `Store` — build a `RoleMcp::new(state, role)` with a test config and assert the catalog for manager vs executor vs lead-developer (targets enum, `order_all` presence, `swarm://activity`/`swarm://executors` visibility).
+- `tools()`, `resources()`, `hierarchy()`, `instructions()` are pure given a `Config` + `Store` — build a `RoleMcp::new(state, role)` with a test config and assert the catalog for manager vs executor vs dispatch authority (targets enum, `dispatch_all` presence, `swarm://activity`/`swarm://executors` visibility, and no task/report tools).
 - `call_tool` with unknown tool → `METHOD_NOT_FOUND`.
 
 ### telegram.rs
@@ -56,8 +73,14 @@ Then point `agent.api_url` at `format!("http://{addr}")`.
 
 ## Config fixture helper
 
-A hand-built `Config` (all fields `pub`) is the fastest fixture. Use `BTreeMap::from` for `order_acl`/`agents`/`activity_routes`, small durations, `Secret::new`-style values (wrap with `Secret(String::from(...))` — the struct is `pub`), and `state_db_path` pointing at a temp file. Remember config invariants only enforced in `from_env` are NOT re-checked in struct literals — tests must construct valid states themselves.
+A hand-built `Config` (all fields `pub`) is the fastest fixture. Use
+`BTreeMap::from` for `dispatch_acl`/`agents`/`activity_routes`, small
+durations, `Secret::new` values, and `state_db_path` pointing at a temp file.
+Remember config invariants only enforced in `from_env` are NOT re-checked in
+struct literals — tests must construct valid states themselves.
 
 ## CI
 
-`cargo test --locked --all-targets` runs the whole suite (17 tests as of REVIEW-PLAN.md). Keep runtime of the suite under a few seconds; store tests are already fast because they use a real temp SQLite file, not in-memory pools.
+`cargo test --locked --all-targets` currently runs 145 tests. Keep runtime of
+the suite under a few seconds after compilation; store tests use real temporary
+SQLite files and loopback mock servers only.

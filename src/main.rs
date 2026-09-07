@@ -132,7 +132,7 @@ mod tests {
             r#"{"developer":"Dev","lead-developer":"Lead"}"#.into(),
         );
         env.insert(
-            "SWARM_ORDER_ACL".into(),
+            "SWARM_DISPATCH_ACL".into(),
             r#"{"manager":["*"],"lead-developer":["developer"]}"#.into(),
         );
         env.insert(
@@ -162,28 +162,16 @@ mod tests {
             "http://localhost".into(),
         );
         env.insert(
-            "SWARM_REPORT_STATUSES".into(),
-            "completed,failed,in_progress".into(),
-        );
-        env.insert(
-            "SWARM_REPORT_WAKE_STATUSES".into(),
-            "completed,failed".into(),
-        );
-        env.insert(
             "SWARM_AUTHORITY_MCP_INSTRUCTIONS".into(),
-            "you order {role} {targets}".into(),
+            "you dispatch as {role} to {targets}".into(),
         );
         env.insert(
-            "SWARM_ORDER_PROMPT_TEMPLATE".into(),
-            "{task_id}|{sender}|{recipient}|{message}".into(),
-        );
-        env.insert(
-            "SWARM_REPORT_PROMPT_TEMPLATE".into(),
-            "{sender}|{recipient}|{task_id}|{status}|{message}".into(),
+            "SWARM_DISPATCH_PROMPT_TEMPLATE".into(),
+            "{dispatch_id}|{sender}|{recipient}|{correlation_id}|{message}".into(),
         );
         env.insert(
             "SWARM_PEER_PROMPT_TEMPLATE".into(),
-            "{message_id}|{sender}|{recipient}|{task_id}|{message}".into(),
+            "{message_id}|{sender}|{recipient}|{correlation_id}|{message}".into(),
         );
         env.insert(
             "SWARM_TELEGRAM_INBOUND_PROMPT_TEMPLATE".into(),
@@ -238,7 +226,6 @@ mod tests {
         env.insert("SWARM_MANAGER_MCP_INSTRUCTIONS".into(), "manager".into());
         env.insert("SWARM_EXECUTOR_MCP_INSTRUCTIONS".into(), "executor".into());
         env.insert("SWARM_EXECUTOR_RUN_INSTRUCTIONS".into(), "run it".into());
-        env.insert("SWARM_SUPERVISOR_REPORT_INSTRUCTIONS".into(), "read".into());
         env.insert("SWARM_PEER_RUN_INSTRUCTIONS".into(), "read".into());
         env.insert("SWARM_LOG_LEVEL".into(), "info".into());
         env

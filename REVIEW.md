@@ -1,5 +1,10 @@
 # Swarm MCP deep review and roadmap
 
+> Historical audit snapshot for the retired pre-0.5 task-aware interface.
+> Names such as `order`, `report`, task lineage, and task status below describe
+> removed behavior only. The current contract is in `README.md` and
+> `AGENTS.md`: SLC MCP owns workflow; Swarm MCP is transport and wake delivery.
+
 ## Executive assessment
 
 The retired Python server was a useful functional prototype: it separated role
@@ -83,8 +88,10 @@ Host/Origin/body guard ──► exact role MCP catalog
 SQLite is deliberately kept for a single-container deployment. Existing
 Python `activity_events` and `activity_state` tables are detected, renamed to
 `*_python_legacy`, and imported into the ordered Rust schema. A startup pass
-marks operations left `pending` by a previous process as `indeterminate`: the
-server will not blindly redeliver a side effect whose outcome is unknown.
+recovers a `pending` operation as accepted when its durable delivery-outbox row
+proves the wake was queued. Pending operations without that evidence become
+`indeterminate`: the server will not blindly redeliver a side effect whose
+outcome is unknown.
 
 ## Known limits that cannot be solved inside this server alone
 
@@ -230,3 +237,53 @@ and multiple active server replicas require a distributed outbox claim.
 - Activity reads and probes never start an agent or send Telegram.
 - `/ready` fails when SQLite is unavailable.
 - The service runs as non-root with a read-only root filesystem.
+
+## Transport FIFO review (2026-09-01, v0.6.1)
+
+Hermes correctly keeps `max_concurrent_runs=1` per role profile, but a second
+wake previously surfaced that protection as a caller-visible HTTP 429. Version
+0.6.1 keeps task ordering in SLC and adds only a transport retry boundary:
+
+- a definitive Hermes 429 persists the opaque wake in SQLite and finishes the
+  original transport operation as accepted with `queued=true`;
+- one integer sequence orders each recipient FIFO, and an in-process
+  per-recipient gate prevents newer calls from overtaking an existing head;
+- the worker retries only one head per recipient, honors `Retry-After`, and
+  records `delivered` or `dead` without interpreting correlation IDs;
+- messaging disable/clear pauses or cancels both Telegram audits and queued
+  wakes, with eligibility rechecked under the messaging gate;
+- final eligibility also rechecks due time and FIFO-head ownership, so a stale
+  worker snapshot cannot overtake after another worker changes the row;
+- enqueue verifies an existing queue ID has the identical still-pending
+  payload, and restart recovery finalizes queue-backed pending operations as
+  accepted, reconstructing the single-recipient queue ID/position rather than
+  exposing a retryable-looking indeterminate result;
+  incomplete or dead/cancelled multi-target evidence is finalized with
+  `ok=false,recovery_required=true` instead of being reported as success;
+- shutdown awaits the new worker, and `swarm://operations`/`messaging` expose
+  transport status without payload bodies or task state.
+
+Accepted limitation: like the existing Telegram outbox, a process/SQLite
+failure after downstream acceptance but before the delivered update can repeat
+the last wake. True exactly-once delivery still requires Hermes-side
+idempotency. The single-active-Swarm-MCP topology remains mandatory.
+
+## Per-item transport cancellation review (2026-09-01, v0.6.2)
+
+Live review exposed two gaps around the FIFO without moving any task semantics
+back into Swarm:
+
+- a sender could use a readiness/preflight `msg_to`, which starts a real Hermes
+  run before the SLC task exists and consumes the role's only run slot;
+- cancelling a queued/ready SLC task could leave its already-enqueued opaque
+  wake ahead of valid transport work, while the only existing cleanup control
+  cancelled every item for the role.
+
+Version 0.6.2 adds sender/manager-authorized `cancel_delivery(queue_id,
+reason)`. The operation is serialized against the delivery worker, accepts
+only pending/dead transport rows, is idempotent for an already-cancelled row,
+rejects a delivery that already started a Hermes run, and makes only the next
+item for that recipient immediately eligible. It never accepts a task ID,
+looks up SLC, or changes task readiness/status. Tool instructions and
+source-controlled role guidance now prohibit transport-based readiness,
+availability, preflight, and status probes.

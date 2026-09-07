@@ -29,8 +29,8 @@ pub(crate) async fn remove_db_files(path: &Path) {
 }
 
 /// Minimal but complete role hierarchy:
-/// - manager (global authority): orders developer and lead-developer
-/// - lead-developer: orders developer (supervisor of developer)
+/// - manager (global authority): dispatches to developer and lead-developer
+/// - lead-developer: dispatches to developer
 /// - developer: plain executor, emits activity to lead-developer
 pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
     let manager_role = "manager".to_string();
@@ -45,8 +45,10 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
             role.clone(),
             AgentConfig {
                 role: role.clone(),
-                api_url: "http://127.0.0.1:1".parse().expect("fixture URL"),
-                api_key: Secret::new(format!("fixture-api-key-{role}")),
+                api_url: Some("http://127.0.0.1:1".parse().expect("fixture URL")),
+                api_key: Some(Secret::new(format!("fixture-api-key-{role}"))),
+                api_kind: crate::config::ApiKind::Hermes,
+                api_model: None,
                 mcp_token: Secret::new(format!("fixture-mcp-token-{role}-0123456789")),
                 telegram_bot_token: None,
             },
@@ -73,7 +75,7 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
                 "Lead developer executor".to_string(),
             ),
         ]),
-        order_acl: BTreeMap::from([
+        dispatch_acl: BTreeMap::from([
             (
                 "manager".to_string(),
                 vec!["developer".to_string(), "lead-developer".to_string()],
@@ -109,12 +111,6 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         cleanup_interval: Duration::from_secs(300),
         mcp_request_rate_limit: 1_000,
         mcp_request_rate_window: Duration::from_secs(60),
-        report_statuses: vec![
-            "completed".to_string(),
-            "failed".to_string(),
-            "in_progress".to_string(),
-        ],
-        report_wake_statuses: BTreeSet::from(["completed".to_string(), "failed".to_string()]),
         telegram_enabled: false,
         telegram_bot_mode: TelegramBotMode::PerRole,
         telegram_bot_token: None,
@@ -128,6 +124,7 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         outbox_batch_size: 10,
         outbox_retention_days: 30,
         telegram_inbound_enabled: false,
+        telegram_track_dispatch_replies: true,
         telegram_allowed_users: BTreeSet::new(),
         telegram_inbound_targets: Vec::new(),
         telegram_poll_timeout: Duration::from_secs(25),
@@ -135,15 +132,20 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         telegram_backlog_mode: TelegramBacklogMode::Discard,
         telegram_inbound_instructions: "execute the Telegram request".to_string(),
         telegram_inbound_template: "update {update_id} from user {user_id}: {message}".to_string(),
+        // Уникальный каталог на тест (рядом с БД): общий /tmp/inbound у всех
+        // тестов приводил к гонкам при параллельном запуске.
+        shared_files_dir: state_db_path.with_extension("inbound"),
+        file_inbound_instructions: "Save the file to SLC context (slc_add_document, category: documentation) and link to the active task (slc_update_task).".to_string(),
+        file_inline_max_bytes: 50_000,
+        inbound_file_ttl: Duration::from_secs(86_400),
         manager_instructions: "You are the swarm manager.".to_string(),
         executor_instructions: "You are an executor.".to_string(),
-        authority_instructions: "You may order: {targets}".to_string(),
-        executor_run_instructions: "Carry out the order.".to_string(),
-        supervisor_report_instructions: "Read the report.".to_string(),
+        authority_instructions: "You may dispatch to: {targets}".to_string(),
+        executor_run_instructions: "Process the delivered message.".to_string(),
         peer_run_instructions: "Read the message.".to_string(),
-        order_template: "{task_id}|{sender}|{recipient}|{message}".to_string(),
-        report_template: "{sender}|{recipient}|{task_id}|{status}|{message}".to_string(),
-        peer_template: "{message_id}|{sender}|{recipient}|{message}".to_string(),
+        dispatch_template: "{dispatch_id}|{sender}|{recipient}|{correlation_id}|{message}"
+            .to_string(),
+        peer_template: "{message_id}|{sender}|{recipient}|{correlation_id}|{message}".to_string(),
         log_level: "info".to_string(),
     }
 }
@@ -153,27 +155,73 @@ pub(crate) type MockHermes = Arc<dyn Fn(&str, &str) -> (u16, Value) + Send + Syn
 
 /// Spawn a mock Hermes `/v1/runs` endpoint on an ephemeral port and return its base URL.
 pub(crate) async fn spawn_mock_hermes(behavior: MockHermes) -> String {
-    let router = axum::Router::new().route(
-        "/v1/runs",
-        axum::routing::post({
-            let behavior = behavior.clone();
-            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+    let router = axum::Router::new()
+        .route(
+            "/v1/runs",
+            axum::routing::post({
                 let behavior = behavior.clone();
-                async move {
-                    let bearer = headers
-                        .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string();
-                    let (status, payload) = behavior(&bearer, &body.to_string());
-                    (
-                        axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
-                        axum::Json(payload),
-                    )
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let behavior = behavior.clone();
+                    async move {
+                        let bearer = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (status, payload) = behavior(&bearer, &body.to_string());
+                        (
+                            axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
+                            axum::Json(payload),
+                        )
+                    }
                 }
-            }
-        }),
-    );
+            }),
+        )
+        .route(
+            "/v1/runs/{run_id}",
+            axum::routing::get({
+                let behavior = behavior.clone();
+                move |headers: axum::http::HeaderMap,
+                      axum::extract::Path(run_id): axum::extract::Path<String>| {
+                    let behavior = behavior.clone();
+                    async move {
+                        let bearer = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (status, payload) =
+                            behavior(&bearer, &format!("GET /v1/runs/{run_id}"));
+                        (
+                            axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
+                            axum::Json(payload),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let behavior = behavior.clone();
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let behavior = behavior.clone();
+                    async move {
+                        let bearer = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (status, payload) =
+                            behavior(&bearer, &format!("POST /v1/chat/completions {body}"));
+                        (
+                            axum::http::StatusCode::from_u16(status).expect("mock status is valid"),
+                            axum::Json(payload),
+                        )
+                    }
+                }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock Hermes");
