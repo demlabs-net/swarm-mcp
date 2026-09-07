@@ -156,6 +156,82 @@ Role commands are generated from the configured live roster. Disabled Compose
 profiles are not included in `SWARM_AGENT_ROLES`, cannot receive transport dispatches, and do
 not appear in `/roles` or the MCP hierarchy resource.
 
+### File attachments and chat context
+
+Messages may carry Telegram attachments of any kind (photo, document, video,
+audio, voice, video note, sticker, animation). The gateway downloads each file
+through the Bot API, saves it into `SWARM_SHARED_FILES_DIR` (default
+`/opt/data/inbound`, a volume shared with the agent containers) and appends the
+absolute path to the dispatch message, so the agent can read the file directly.
+Files larger than `SWARM_INBOUND_FILE_MAX_BYTES` (default 20 MiB — the Bot API
+download limit) are reported as undeliverable instead of being read into
+memory; a files-only message whose attachments cannot be downloaded gets a
+warning notice instead of vanishing silently. Small text files (up to
+`SWARM_FILE_INLINE_MAX_BYTES`, default 50 KB) are inlined into the dispatch
+message when the resulting text stays within `SWARM_MAX_MESSAGE_CHARS`.
+`SWARM_FILE_INBOUND_INSTRUCTIONS` is appended whenever at least one attachment
+arrived — use it to tell the agent how to store the file in SLC
+(`slc_add_document`) and link it to the active task. Downloads are memoized
+by file id (short TTL), so busy-recipient retries, repeated albums and caption
+edits never re-download the same file; inline text is re-derived for every
+message against its current length budget, never replayed from the cache.
+Files older than `SWARM_INBOUND_FILE_TTL_SECS` (default 24 h) are cleaned up
+after each inbound message.
+
+A message that replies to an earlier message (`reply_to_message`/`quote` in
+the Telegram update) exposes its context to the template: the optional
+`reply_message_id` and `reply_quote` placeholders render the replied-to message
+id and the quoted text (empty when absent). Existing templates keep working
+unchanged. Agent answers are delivered back to the source chat **as a reply**
+to the operator's original message, so each run's answer is visually threaded
+to its request. Delivery failures are explicit, never silent:
+
+- Telegram refuses the reply link itself (HTTP 400 whose error description
+  mentions the reply — source deleted or older than the 48-hour window): the
+  link is dropped once and the content is delivered as a plain message.
+- Any other permanent delivery failure of an answer dead-letters the outbox
+  row and sends a one-shot notice to the recipient chat explaining that the
+  message could not be delivered.
+- A tracked run whose status endpoint answers a definitive client error
+  (404/401/...) is reported as failed to the operator right away, with the
+  HTTP status. Transient errors (429/5xx/network) keep polling; if a run still
+  has no answer after the 6-hour TTL, the operator receives an explicit expiry
+  notice before the track is dropped.
+
+Message edits (`edited_message` updates) are dispatched like new messages with
+the corrected text/caption, so fixing a typo in a request resubmits it as
+written — note that Telegram also reports formatting-only edits, so SLC should
+deduplicate by `message_id` when needed. A media album (`media_group_id`) is
+collected into one dispatch: the gateway waits a short debounce window for all
+its parts and sends a single request carrying every attachment. A part that
+still arrives later (after the window) is dispatched separately and is
+explicitly marked in the message text as a late album part, so it is never
+mistaken for a fresh request. Messages from topic groups carry the topic in
+the optional `thread_id` template placeholder; help replies, queue/rejection
+notices and the typing indicator (including the run-reply heartbeat) are sent
+into the same topic, threaded answers stay in their topic automatically, and
+`telegram_reply` deliveries to a role whose last request came from a topic go
+into that topic as well (the topic is stored on the dispatch and carried on
+the outbox row). In topic groups only messages that reach the bot by the
+ordinary rules
+(mention, command, reply to a bot message) are processed, exactly as in a
+plain group.
+
+Delivery routing is explicit. The proactive `telegram_reply` tool addresses
+only the chat of the most recent Telegram dispatch that targeted the calling
+role (result fields `chat_id` and `chat_source`; `group` when the role has no
+Telegram history — it never borrows another role's or operator's chat).
+Answers of dispatched runs are routed to the sender role's own chat, else to
+the chat of the operator who last interacted with the swarm (the SLC manager
+itself usually has no Telegram chat), else to the shared group — each hop is
+logged.
+
+Outbound agent messages may attach files via the `telegram_reply` MCP tool
+(`files[]` with `path` inside the shared directory, or base64 `content_b64`).
+Images are sent as photos, everything else as a document; the message text is
+the caption of the first file, and any text beyond the 1024-character Telegram
+caption limit is delivered as follow-up messages rather than truncated.
+
 `SWARM_TELEGRAM_INBOUND_TARGETS` limits which configured roles these commands
 may address; `*` enables all roles. Each accepted Telegram update is reserved
 under the manager identity in the same durable operation ledger as MCP calls.
@@ -213,6 +289,7 @@ Important groups:
 | Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |
 | Telegram delivery | `SWARM_TELEGRAM_ENABLED`, `SWARM_TELEGRAM_BOT_MODE`, `SWARM_TELEGRAM_BOT_TOKEN`, `<ROLE>_TELEGRAM_BOT_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_PROXY_URL`, `SWARM_OUTBOX_*` |
 | Telegram inbound | `SWARM_TELEGRAM_INBOUND_ENABLED`, `TELEGRAM_ALLOWED_USERS`, `SWARM_TELEGRAM_INBOUND_TARGETS`, `SWARM_TELEGRAM_POLL_*`, `SWARM_TELEGRAM_PROCESS_BACKLOG`, `SWARM_TELEGRAM_INBOUND_*` |
+| Inbound files | `SWARM_SHARED_FILES_DIR`, `SWARM_INBOUND_FILE_MAX_BYTES`, `SWARM_INBOUND_FILE_TTL_SECS`, `SWARM_FILE_INLINE_MAX_BYTES`, `SWARM_FILE_INBOUND_INSTRUCTIONS` |
 | Prompts | `SWARM_*_INSTRUCTIONS`, `SWARM_*_PROMPT_TEMPLATE` |
 
 ## Local verification

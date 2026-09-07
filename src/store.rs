@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const TELEGRAM_OFFSET_KEY: &str = "telegram_update_offset";
 const TELEGRAM_POLL_SUCCESS_KEY: &str = "telegram_poll_success";
 
@@ -48,6 +48,11 @@ pub struct AuditMessage {
     pub text: String,
     /// Telegram chat to deliver to; None means the configured group.
     pub chat_id: Option<i64>,
+    /// Original Telegram message this delivery replies to (visual threading).
+    pub reply_to_message_id: Option<i64>,
+    /// Topic inside a forum group to deliver into (used when there is no
+    /// reply link — a reply anchors its topic by itself).
+    pub thread_id: Option<i64>,
     /// Optional file attachments (each sent as sendPhoto/sendDocument).
     pub media: Vec<MediaPayload>,
 }
@@ -63,6 +68,11 @@ pub struct OutboxItem {
     pub next_chunk: i64,
     /// Telegram chat to deliver to; None means the configured group.
     pub chat_id: Option<i64>,
+    /// Original Telegram message this delivery replies to (visual threading).
+    pub reply_to_message_id: Option<i64>,
+    /// Topic inside a forum group to deliver into (used when there is no
+    /// reply link — a reply anchors its topic by itself).
+    pub thread_id: Option<i64>,
     /// Optional file attachments (each sent as sendPhoto/sendDocument).
     pub media: Vec<MediaPayload>,
 }
@@ -166,8 +176,33 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+        if !Self::has_column(&mut tx, "telegram_outbox", "reply_to_message_id").await? {
+            sqlx::query("ALTER TABLE telegram_outbox ADD COLUMN reply_to_message_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "telegram_outbox", "thread_id").await? {
+            sqlx::query("ALTER TABLE telegram_outbox ADD COLUMN thread_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
         if !Self::has_column(&mut tx, "dispatches", "telegram_chat_id").await? {
             sqlx::query("ALTER TABLE dispatches ADD COLUMN telegram_chat_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "dispatches", "telegram_thread_id").await? {
+            sqlx::query("ALTER TABLE dispatches ADD COLUMN telegram_thread_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "run_replies", "message_id").await? {
+            sqlx::query("ALTER TABLE run_replies ADD COLUMN message_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "run_replies", "thread_id").await? {
+            sqlx::query("ALTER TABLE run_replies ADD COLUMN thread_id INTEGER")
                 .execute(&mut *tx)
                 .await?;
         }
@@ -740,11 +775,23 @@ impl Store {
         Ok(())
     }
 
-    /// Source Telegram chat of the most recent Telegram inbound dispatch
-    /// Source Telegram chat for a role's reply: the most recent Telegram
-    /// inbound dispatch targeting the role; falls back to the most recent
-    /// Telegram inbound dispatch of any role (the operator's chat) so that
-    /// MCP-only roles can initiate messages proactively.
+    pub async fn set_dispatch_telegram_thread(
+        &self,
+        id: &str,
+        thread_id: Option<i64>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE dispatches SET telegram_thread_id = ? WHERE id = ?")
+            .bind(thread_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Source Telegram chat of the most recent Telegram inbound dispatch that
+    /// targeted `role`. Strictly role-scoped: never silently borrow another
+    /// role's or another operator's chat — callers decide their explicit
+    /// fallback (the shared group) when this returns `None`.
     pub async fn telegram_chat_for_role(&self, role: &str) -> anyhow::Result<Option<i64>> {
         let chat_id: Option<i64> = sqlx::query_scalar(
             r#"SELECT d.telegram_chat_id
@@ -757,10 +804,36 @@ impl Store {
         .bind(role)
         .fetch_optional(&self.pool)
         .await?;
-        if chat_id.is_some() {
-            return Ok(chat_id);
-        }
-        let fallback: Option<i64> = sqlx::query_scalar(
+        Ok(chat_id)
+    }
+
+    /// Chat + topic of the most recent Telegram inbound dispatch targeting
+    /// `role` (same strict scope as `telegram_chat_for_role`).
+    pub async fn telegram_chat_and_thread_for_role(
+        &self,
+        role: &str,
+    ) -> anyhow::Result<Option<(i64, Option<i64>)>> {
+        let row = sqlx::query(
+            r#"SELECT d.telegram_chat_id, d.telegram_thread_id
+               FROM dispatches d
+               JOIN dispatch_targets t ON t.dispatch_id = d.id
+               WHERE t.target = ? AND d.kind = 'telegram_inbound'
+                 AND d.telegram_chat_id IS NOT NULL
+               ORDER BY d.created_ms DESC LIMIT 1"#,
+        )
+        .bind(role)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| (row.get("telegram_chat_id"), row.get("telegram_thread_id"))))
+    }
+
+    /// Chat of the operator who interacted with the swarm most recently — the
+    /// documented heuristic for routing *run answers of dispatches* (the SLC
+    /// manager role itself usually has no inbound Telegram chat of its own).
+    /// Deliberate and logged by the caller; never used by the proactive
+    /// `telegram_reply` tool (strictly role-scoped).
+    pub async fn telegram_latest_operator_chat(&self) -> anyhow::Result<Option<i64>> {
+        let chat_id: Option<i64> = sqlx::query_scalar(
             r#"SELECT telegram_chat_id
                FROM dispatches
                WHERE kind = 'telegram_inbound' AND telegram_chat_id IS NOT NULL
@@ -768,7 +841,7 @@ impl Store {
         )
         .fetch_optional(&self.pool)
         .await?;
-        Ok(fallback)
+        Ok(chat_id)
     }
 
     pub async fn enqueue_outbox(&self, audit: AuditMessage) -> anyhow::Result<()> {
@@ -1089,30 +1162,41 @@ impl Store {
     }
 
     /// Durable tracking of Telegram-dispatched Hermes runs awaiting their
-    /// final answer (survives restarts; see the run-reply worker).
+    /// final answer (survives restarts; see the run-reply worker). The source
+    /// message id lets the final answer be delivered as a Telegram reply to
+    /// the operator's original message.
     pub async fn track_run_reply(
         &self,
         run_id: &str,
         role: &str,
         chat_id: i64,
+        message_id: Option<i64>,
+        thread_id: Option<i64>,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO run_replies (run_id, role, chat_id, created_ms) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO run_replies (run_id, role, chat_id, message_id, thread_id, created_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
         .bind(role)
         .bind(chat_id)
+        .bind(message_id)
+        .bind(thread_id)
         .bind(Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// All tracked runs: `(run_id, role, chat_id, created_ms)`.
-    pub async fn due_run_replies(&self) -> anyhow::Result<Vec<(String, String, i64, i64)>> {
-        let rows = sqlx::query("SELECT run_id, role, chat_id, created_ms FROM run_replies")
-            .fetch_all(&self.pool)
-            .await?;
+    /// All tracked runs: `(run_id, role, chat_id, reply_to_message_id,
+    /// thread_id, created_ms)`.
+    pub async fn due_run_replies(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, i64, Option<i64>, Option<i64>, i64)>> {
+        let rows = sqlx::query(
+            "SELECT run_id, role, chat_id, message_id, thread_id, created_ms FROM run_replies",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -1120,6 +1204,8 @@ impl Store {
                     row.get("run_id"),
                     row.get("role"),
                     row.get("chat_id"),
+                    row.get("message_id"),
+                    row.get("thread_id"),
                     row.get("created_ms"),
                 )
             })
@@ -1489,7 +1575,8 @@ impl Store {
     pub async fn due_outbox(&self, limit: i64) -> anyhow::Result<Vec<OutboxItem>> {
         let rows = sqlx::query(
             r#"SELECT o.id, o.sender, o.event, o.recipients, o.text,
-                      o.attempts, o.next_chunk, o.chat_id, o.media_json
+                      o.attempts, o.next_chunk, o.chat_id, o.reply_to_message_id,
+                      o.thread_id, o.media_json
                FROM telegram_outbox o
                WHERE o.status = 'pending' AND o.next_attempt_ms <= ?
                  AND NOT EXISTS (
@@ -1520,6 +1607,8 @@ impl Store {
                 attempts: row.get("attempts"),
                 next_chunk: row.get("next_chunk"),
                 chat_id: row.get("chat_id"),
+                reply_to_message_id: row.get("reply_to_message_id"),
+                thread_id: row.get("thread_id"),
                 media: row
                     .get::<Option<String>, _>("media_json")
                     .and_then(|json| serde_json::from_str(&json).ok())
@@ -1608,6 +1697,28 @@ impl Store {
         .rows_affected();
         ensure!(updated == 1, "outbox item is not pending");
         Ok(next)
+    }
+
+    /// One-shot fallback for a delivery that failed permanently *because it was
+    /// a reply*: the source message may have been deleted or is older than the
+    /// Telegram reply window (48h). The reply link is dropped and the item
+    /// becomes due again immediately so the content itself is still delivered
+    /// as a plain message.
+    pub async fn clear_outbox_reply(&self, id: &str) -> anyhow::Result<()> {
+        let updated = sqlx::query(
+            r#"UPDATE telegram_outbox
+               SET reply_to_message_id = NULL,
+                   next_attempt_ms = ?,
+                   last_error = 'reply link dropped after a permanent delivery failure'
+               WHERE id=? AND status='pending'"#,
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        ensure!(updated == 1, "outbox item is not pending");
+        Ok(())
     }
 
     pub async fn defer_pending_outbox_until(
@@ -1772,8 +1883,8 @@ async fn insert_outbox(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"INSERT INTO telegram_outbox
-           (id, sender, event, recipients, text, status, attempts, next_chunk, next_attempt_ms, created_ms, chat_id, media_json)
-           VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?, ?)"#,
+           (id, sender, event, recipients, text, status, attempts, next_chunk, next_attempt_ms, created_ms, chat_id, reply_to_message_id, thread_id, media_json)
+           VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(&audit.id)
     .bind(&audit.sender)
@@ -1783,6 +1894,8 @@ async fn insert_outbox(
     .bind(now)
     .bind(now)
     .bind(audit.chat_id)
+    .bind(audit.reply_to_message_id)
+    .bind(audit.thread_id)
     .bind(if audit.media.is_empty() {
         None
     } else {
@@ -1937,6 +2050,8 @@ const SCHEMA: &[&str] = &[
          created_ms INTEGER NOT NULL,
          delivered_ms INTEGER,
          chat_id INTEGER,
+         reply_to_message_id INTEGER,
+         thread_id INTEGER,
          media_json TEXT
        )"#,
     "CREATE INDEX IF NOT EXISTS telegram_outbox_due_idx ON telegram_outbox(status, next_attempt_ms)",
@@ -1956,6 +2071,8 @@ const SCHEMA: &[&str] = &[
          run_id TEXT PRIMARY KEY,
          role TEXT NOT NULL,
          chat_id INTEGER NOT NULL,
+         message_id INTEGER,
+         thread_id INTEGER,
          created_ms INTEGER NOT NULL
        )"#,
 ];
@@ -2879,6 +2996,8 @@ mod tests {
                     recipients: "developer".to_string(),
                     text: "task".to_string(),
                     chat_id: None,
+                    reply_to_message_id: None,
+                    thread_id: None,
                     media: vec![],
                 }),
             )
@@ -3363,6 +3482,8 @@ mod tests {
                     recipients: "developer".to_string(),
                     text: "task".to_string(),
                     chat_id: None,
+                    reply_to_message_id: None,
+                    thread_id: None,
                     media: vec![],
                 }),
             )
