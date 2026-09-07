@@ -1,0 +1,27 @@
+# Sanitized service template; fill all placeholders before use. Build images separately.
+services:
+  swarm-mcp:
+    image: ${SWARM_IMAGE}
+    container_name: dev-swarm-mcp
+    restart: unless-stopped
+    env_file:
+    - ${SWARM_ENV_FILE_0}
+    read_only: true
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    mem_limit: ${SWARM_MEM_LIMIT}
+    cpus: ${SWARM_CPUS}
+    pids_limit: ${SWARM_PIDS_LIMIT}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${SWARM_LOGGING_OPTIONS_MAX_SIZE}
+        max-file: ${SWARM_LOGGING_OPTIONS_MAX_FILE}
+    volumes:
+    - ${SWARM_VOLUMES_0}
+    - ${SWARM_VOLUMES_1}
+    tmpfs:
+    - ${SWARM_TMPFS_0}
+    network_mode: host

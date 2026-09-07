@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+exec 9>/run/marketing-application-backup-pull.lock
+flock -n 9 || exit 0
+dest=/var/backups/marketing-swarm-1
+install -d -m 700 "$dest"
+host=root@192.168.122.93
+# Exact marketing VM address verified during installation; no other VM is touched.
+if [ "$#" -eq 1 ]; then
+  archive="$1" # Accept an already restore-validated archive for initial seeding.
+else
+  archive=$(ssh -o BatchMode=yes "$host" /usr/local/sbin/marketing-application-backup | tail -n 1)
+fi
+[[ "$archive" =~ ^/var/backups/marketing/marketing-[0-9]{8}T[0-9]{6}Z.tar.gz.enc$ ]]
+name=${archive##*/}
+scp -q "$host:$archive" "$dest/$name.partial"
+scp -q "$host:$archive.sha256" "$dest/$name.sha256.remote"
+expected=$(cut -d ' ' -f 1 "$dest/$name.sha256.remote")
+actual=$(sha256sum "$dest/$name.partial" | cut -d ' ' -f 1)
+[[ "$expected" = "$actual" ]]
+mv "$dest/$name.partial" "$dest/$name"
+printf '%s  %s\n' "$actual" "$name" > "$dest/$name.sha256"
+rm "$dest/$name.sha256.remote"
+# Escrow key separately from encrypted archives, root-only on this existing host.
+install -d -m 700 /root/marketing-backup-escrow
+scp -q "$host:/root/marketing-backup.key" /root/marketing-backup-escrow/key
+chmod 600 /root/marketing-backup-escrow/key
+# Keep 14 daily off-VM archives; VM retains only its newest validated archive.
+find "$dest" -maxdepth 1 -type f -name 'marketing-*.tar.gz.enc*' -mtime +14 -delete
+ssh -o BatchMode=yes "$host" "find /var/backups/marketing -maxdepth 1 -type f -name 'marketing-*.tar.gz.enc*' ! -name '$name' ! -name '$name.sha256' -mtime +1 -delete"
+printf 'Stored and checksum-verified marketing backup %s\n' "$name"

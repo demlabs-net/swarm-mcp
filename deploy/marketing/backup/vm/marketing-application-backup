@@ -1,0 +1,110 @@
+#!/bin/bash
+# Encrypted, consistent marketing-only application snapshot; never prints secrets.
+set -euo pipefail
+umask 077
+exec 9>/run/marketing-application-backup.lock
+flock -n 9 || exit 0
+base=/var/backups/marketing
+key=/root/marketing-backup.key
+install -d -m 700 "$base"
+test -s "$key"
+work=$(mktemp -d "$base/.snapshot.XXXXXX")
+paused=()
+cleanup() {
+  for container in "${paused[@]}"; do docker unpause "$container" >/dev/null 2>&1 || true; done
+  rm -rf "$work"
+}
+trap cleanup EXIT
+# Pause only marketing MCP processes to capture their state, including SQLite WAL.
+for container in slc-mcp dev-swarm-mcp; do
+  if [ "$(docker inspect -f '{{.State.Running}}' "$container")" = true ]; then
+    docker pause "$container" >/dev/null
+    paused+=("$container")
+  fi
+done
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+archive="$base/marketing-$stamp.tar.gz.enc"
+# First copy MCP state while paused; compression happens after resuming services.
+mkdir "$work/tree"
+cp -a --parents /opt/slc-vault /opt/slc-mcp/docker-compose.yml /opt/slc-mcp/.env \
+  /opt/slc-mcp/auth.env /opt/slc-mcp/ssh /opt/swarm-mcp/docker-compose.yml \
+  /opt/swarm-mcp/.env /opt/swarm-mcp/data "$work/tree"
+for container in "${paused[@]}"; do docker unpause "$container" >/dev/null; done
+paused=()
+# Only static Hermes deployment configuration, not live caches/sessions.
+cp -a --parents /opt/hermes/docker-compose.yml "$work/tree"
+while IFS= read -r -d '' file; do cp -a --parents "$file" "$work/tree"; done < <(
+  find /opt/hermes/agents -mindepth 2 -maxdepth 2 -type f \
+    \( -name '.env' -o -name 'provider.env' -o -name 'slc.env' \
+       -o -name 'config.yaml' -o -name 'SOUL.md' -o -name 'comfyui.json' \
+       -o -name 'primary.yaml' \) -print0
+)
+# Reproducibility inputs and installed skills; never include live sessions/caches.
+cp -a --parents /opt/hermes/tooling /opt/hermes/src/hooks \
+  /opt/hermes/agents/designer/bin/comfyui-client.py "$work/tree"
+for role in overseer writer editor communicator librarian thinker designer girl; do
+  test -s "/opt/hermes/agents/$role/slc.env"
+  if [ -d "/opt/hermes/agents/$role/skills" ]; then
+    cp -a --parents "/opt/hermes/agents/$role/skills" "$work/tree"
+  fi
+done
+# Save only images used by these marketing Compose projects, plus the local
+# designer base when present. Large by design: check free disk before scheduling.
+mkdir "$work/tree/runtime-images"
+image_ids=()
+for project in /opt/hermes /opt/slc-mcp /opt/swarm-mcp; do
+  # Capture separately so Compose failures cannot disappear in process substitution.
+  containers=$(docker compose --project-directory "$project" -f "$project/docker-compose.yml" ps -a -q)
+  [ -n "$containers" ] || { printf 'No containers for required project %s\n' "$project" >&2; exit 1; }
+  while IFS= read -r container; do
+    [ -n "$container" ] || continue
+    image_ids+=("$(docker inspect -f '{{.Image}}' "$container")")
+  done <<< "$containers"
+done
+base_image=hermes-agent:marketing-audit-base-0482e6e4a8b
+if docker image inspect "$base_image" >/dev/null 2>&1; then
+  image_ids+=("$base_image")
+fi
+[ "${#image_ids[@]}" -gt 0 ]
+printf '%s\n' "${image_ids[@]}" | sort -u > "$work/tree/runtime-images/references.txt"
+mapfile -t image_ids < "$work/tree/runtime-images/references.txt"
+docker image inspect --format '{{.Id}} {{json .RepoTags}} {{json .RepoDigests}}' "${image_ids[@]}" \
+  > "$work/tree/runtime-images/tag-map.txt"
+docker image save -o "$work/tree/runtime-images/images.tar" "${image_ids[@]}"
+# Only image IDs/tags are recorded, never container inspect output (env secrets).
+tar -C "$work/tree" -I 'gzip -1' -cf "$work/application.tar.gz" .
+rm -rf "$work/tree"
+openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -md sha256 \
+  -pass file:"$key" -in "$work/application.tar.gz" -out "$archive.partial"
+# Verify encrypted backup decrypts identically before publishing it.
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+  -pass file:"$key" -in "$archive.partial" -out "$work/restored.tar.gz"
+cmp "$work/application.tar.gz" "$work/restored.tar.gz"
+mkdir "$work/restore"
+tar -xzf "$work/restored.tar.gz" -C "$work/restore"
+python3 - "$work/restore" <<'PY'
+import pathlib, sqlite3, sys
+root = pathlib.Path(sys.argv[1])
+assert (root / 'opt/slc-vault/.git/HEAD').is_file()
+assert (root / 'opt/slc-mcp/.env').is_file()
+assert (root / 'opt/slc-mcp/auth.env').is_file()
+for role in ('overseer', 'writer', 'editor', 'communicator', 'librarian', 'thinker', 'designer', 'girl'):
+    assert (root / 'opt/hermes/agents' / role / 'slc.env').is_file()
+assert (root / 'runtime-images/images.tar').stat().st_size > 0
+assert (root / 'opt/hermes/tooling/Dockerfile.designer').is_file()
+checked = 0
+for p in (root / 'opt/swarm-mcp/data').rglob('*'):
+    if p.is_file():
+        with p.open('rb') as f:
+            header = f.read(16)
+        if header == b'SQLite format 3\x00':
+            db = sqlite3.connect(str(p))
+            assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+            db.close()
+            checked += 1
+assert checked, 'No swarm SQLite database found for restore validation'
+print(f'Restored application archive and validated {checked} SQLite database(s)')
+PY
+mv "$archive.partial" "$archive"
+sha256sum "$archive" > "$archive.sha256"
+printf '%s\n' "$archive"

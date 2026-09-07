@@ -1,0 +1,15 @@
+[Unit]
+Description=Encrypted off-VM marketing application backup and restore validation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/marketing-application-backup-pull
+User=root
+UMask=0077
+TimeoutStartSec=2h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/marketing-swarm-1 /root/marketing-backup-escrow /run

@@ -1,0 +1,53 @@
+# Merge into the installed Hermes config; deliberately excludes runtime history.
+# Render ${...} offline before installation; do not assume Hermes expands them.
+model:
+  default: ${MODEL_DEFAULT}
+  provider: ${MODEL_PROVIDER}
+  context_length: 131072
+fallback_model:
+  provider: ${FALLBACK_PROVIDER}
+  model: ${FALLBACK_MODEL}
+custom_providers:
+  - name: ${PROVIDER_NAME}
+    base_url: ${PROVIDER_BASE_URL}
+    key_env: ${PROVIDER_KEY_ENV}
+    model: ${PROVIDER_MODEL}
+mcp_servers:
+  slc:
+    url: ${SLC_MCP_URL}
+    headers:
+      X-Seat-ID: ${ROLE}
+      Authorization: Bearer ${SLC_MCP_TOKEN}
+    timeout: 120
+    connect_timeout: 30
+  swarm:
+    url: ${SWARM_MCP_URL}
+    headers:
+      Authorization: Bearer ${SWARM_ROLE_TOKEN}
+    timeout: 120
+    connect_timeout: 30
+hooks:
+  pre_llm_call: &context_hook
+    - command: python3 /opt/hermes/hooks/slc-context.py
+      env:
+        SLC_MCP_URL: ${SLC_MCP_URL}
+        SLC_SEAT_ID: ${ROLE}
+  post_llm_call: *context_hook
+  on_session_end: *context_hook
+  api_request_error: *context_hook
+  pre_api_request:
+    - command: python3 /opt/hermes/hooks/slc_timer_check.py
+      env:
+        SLC_MCP_URL: ${SLC_MCP_URL}
+        SEAT_ID: ${ROLE}
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: ${WEBHOOK_PORT}
+      routes:
+        manager-command:
+          secret: ${WEBHOOK_SECRET}
+          prompt: ${WEBHOOK_PROMPT}
+hooks_auto_accept: true

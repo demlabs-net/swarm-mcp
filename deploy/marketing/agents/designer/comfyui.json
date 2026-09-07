@@ -1,0 +1,13 @@
+{
+  "base_url": "http://192.168.122.1:8188",
+  "checkpoint": "sd_xl_base_1.0.safetensors",
+  "width": 512,
+  "height": 512,
+  "steps": 12,
+  "cfg": 6.0,
+  "sampler_name": "euler",
+  "scheduler": "normal",
+  "output_dir": "/opt/data/inbound/comfyui",
+  "minimum_free_vram_bytes": 8589934592,
+  "timeout_seconds": 300
+}

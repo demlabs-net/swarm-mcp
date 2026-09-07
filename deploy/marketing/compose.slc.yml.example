@@ -1,0 +1,30 @@
+# Sanitized service template; fill all placeholders before use. Build images separately.
+services:
+  slc-mcp:
+    image: ${SLC_IMAGE}
+    container_name: slc-mcp
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    pids_limit: 256
+    tmpfs:
+    - ${SLC_TMPFS_0}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: ${SLC_LOGGING_OPTIONS_MAX_FILE}
+    ports:
+    - ${SLC_PORTS_0}
+    env_file:
+    - ${SLC_ENV_FILE_0}
+    - ${SLC_ENV_FILE_1}
+    volumes:
+    - ${SLC_VOLUMES_0}
+    - ${SLC_VOLUMES_1}
+    extra_hosts:
+    - ${SLC_EXTRA_HOSTS_0}
+    - ${SLC_EXTRA_HOSTS_1}

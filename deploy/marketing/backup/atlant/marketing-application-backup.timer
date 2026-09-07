@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily marketing application backup to existing atlant host
+
+[Timer]
+OnCalendar=*-*-* 03:40:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+Unit=marketing-application-backup.service
+
+[Install]
+WantedBy=timers.target

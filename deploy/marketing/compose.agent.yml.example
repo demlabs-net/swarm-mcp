@@ -1,0 +1,24 @@
+# Render one service per role; this is not a complete eight-agent stack.
+# All runtime values belong in env_file; never override tokens with environment.
+services:
+  hermes-${ROLE}:
+    image: ${HERMES_IMAGE}
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ./agents/${ROLE}/.env
+      - ./agents/${ROLE}/provider.env
+      - ./agents/${ROLE}/slc.env
+    volumes:
+      - ./agents/${ROLE}:/opt/data
+      - /opt/hermes/inbound:/opt/data/inbound
+      - ./src/hooks:/opt/hermes/hooks:ro
+    command: [gateway, run]
+    mem_limit: 4g
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+# For designer only, add build: {context: ./tooling, dockerfile: Dockerfile.designer}.
+# provider.env is needed for provider-enabled roles; remove its entry for others.
