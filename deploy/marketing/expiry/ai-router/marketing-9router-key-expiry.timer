@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly expiry checks for marketing-only 9router API keys
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=60
+Unit=marketing-9router-key-expiry.service
+
+[Install]
+WantedBy=timers.target

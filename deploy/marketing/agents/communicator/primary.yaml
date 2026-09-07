@@ -1,0 +1,19 @@
+# Merge ONLY model.default/provider and add this custom provider.
+# Keep current fallback, other providers, SLC headers and hooks unchanged.
+# Compose env_file: ./agents/communicator/provider.env (secret, not committed).
+# Dedicated marketing-communicator key: router marketing expiry schema 2,
+# expires 2028-09-07T10:11:35.951Z (two calendar years).
+model:
+  default: alitp-intl/qwen3.8-flash
+  provider: custom:alitp-intl
+  context_length: 131072
+custom_providers:
+  - name: alitp-intl
+    base_url: https://ai-router.swarm.demlabs.net/v1
+    key_env: OPENAI_API_KEY
+    model: alitp-intl/qwen3.8-flash
+    models:
+      qwen3.8-flash:
+        supports_vision: false
+      alitp-intl/qwen3.8-flash:
+        supports_vision: false

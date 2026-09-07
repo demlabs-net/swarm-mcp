@@ -1,0 +1,17 @@
+[Unit]
+Description=Expire marketing-only 9router API keys at their recorded calendar expiry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/expire-9router-api-keys.py --metadata /opt/9router/data/marketing-secrets/expiry.json --router-env /opt/9router/9router.env
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true

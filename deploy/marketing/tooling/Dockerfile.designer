@@ -1,0 +1,14 @@
+# Base is the pre-audit marketing Hermes image; retain all existing agent tools.
+ARG HERMES_BASE=hermes-agent:marketing-audit-base-0482e6e4a8b
+FROM ${HERMES_BASE}
+USER root
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/designer-browsers
+RUN uv venv --python /opt/hermes/.venv/bin/python /opt/designer-tools \
+    && uv pip install --python /opt/designer-tools/bin/python playwright==1.55.0 CairoSVG==2.8.2 Pillow==11.3.0 \
+    && /opt/designer-tools/bin/python -m playwright install --with-deps chromium \
+    && printf '#!/bin/sh\nexec /opt/designer-tools/bin/python "$@"\n' > /usr/local/bin/designer-python \
+    && chmod 755 /usr/local/bin/designer-python \
+    && ln -s /opt/designer-tools/bin/playwright /usr/local/bin/playwright \
+    && ln -s /opt/designer-tools/bin/cairosvg /usr/local/bin/cairosvg \
+    && chmod -R a+rX /opt/designer-browsers \
+    && rm -rf /var/lib/apt/lists/*
