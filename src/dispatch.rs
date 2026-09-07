@@ -34,9 +34,12 @@ pub struct Dispatcher {
 enum RunOutcome {
     /// The run finished and produced this final answer.
     Completed(String),
-    /// The run finished without a usable answer (failed/cancelled/empty).
-    Failed,
-    /// The run is still in progress.
+    /// The run is definitively unusable: its API refused the status query or
+    /// the run ended failed/cancelled. `status` is the observed HTTP status
+    /// when known — nothing is ever left "running forever" silently.
+    Failed { status: Option<u16> },
+    /// The run is still in progress (or the status query hit a transient
+    /// error that will be retried on the next tick).
     Running,
 }
 
@@ -125,6 +128,10 @@ struct TelegramFailure {
     message: String,
     retry_after_seconds: Option<i64>,
     permanent: bool,
+    /// HTTP status of the refused request, when the Bot API answered HTTP.
+    status: Option<u16>,
+    /// The `description` field of the Bot API error payload (may be absent).
+    description: Option<String>,
 }
 
 impl TelegramFailure {
@@ -133,6 +140,8 @@ impl TelegramFailure {
             message: message.into(),
             retry_after_seconds,
             permanent: false,
+            status: None,
+            description: None,
         }
     }
 
@@ -141,7 +150,22 @@ impl TelegramFailure {
             message: message.into(),
             retry_after_seconds: None,
             permanent: true,
+            status: None,
+            description: None,
         }
+    }
+
+    /// Telegram refused the *reply link itself* (the source message was
+    /// deleted or is older than the 48-hour reply window) — the only case
+    /// where dropping the link and retrying the content plain is the correct
+    /// fix. Every other permanent failure is dead-lettered loudly.
+    fn is_reply_refusal(&self) -> bool {
+        self.permanent
+            && self.status == Some(400)
+            && self
+                .description
+                .as_deref()
+                .is_some_and(|description| description.to_ascii_lowercase().contains("reply"))
     }
 }
 
@@ -318,6 +342,14 @@ pub struct TelegramInboundArgs {
     pub targets: Vec<String>,
     /// Source Telegram chat: private chat id for DM, group/channel id otherwise.
     pub chat_id: i64,
+    /// The message this one replies to (Telegram reply threading); None for a
+    /// plain message. Available to SLC as the `reply_message_id` template var.
+    pub reply_message_id: Option<i64>,
+    /// Text of the Telegram quote attached to this message (user quoted a
+    /// fragment of an earlier message); truncated and optional.
+    pub reply_quote: Option<String>,
+    /// Topic of the source message in a forum group (None outside topics).
+    pub thread_id: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -483,16 +515,84 @@ impl Dispatcher {
     /// Зарегистрировать run получателя для доставки финального ответа в
     /// исходный Telegram-чат отправителя (см. `spawn_run_reply_worker`).
     /// Используется там, где у доставки нет собственного `chat_id`
-    /// (`dispatch_to`/`msg_to`): чат берётся как последний известный inbound-чат
-    /// роли-отправителя. Если чата нет — ответ не трекается (терять нечему).
+    /// (`dispatch_to`/`msg_to`). Адресация ответов явная и наблюдаемая:
+    /// 1) чат, в котором последний раз писали самой роли-отправителю;
+    /// 2) иначе — чат оператора, последним писавшего рою (эвристика для
+    ///    SLC-менеджера, у которого своего Telegram-чата обычно нет);
+    /// 3) иначе — общий чат с warn-логом. Молчаливая потеря невозможна.
     async fn track_reply_for_sender(&self, sender: &str, run_id: &str, recipient: &str) {
         if !self.config.telegram_track_dispatch_replies {
+            // Indirect runs (dispatch_to/msg_to) can opt out of publishing
+            // their terminal output into the sender's Telegram chat.
             return;
         }
-        let Ok(Some(chat_id)) = self.store.telegram_chat_for_role(sender).await else {
+        // Адресация ответов явная и наблюдаемая: 1) чат, в котором последний
+        // раз писали самой роли-отправителю; 2) иначе — чат оператора,
+        // последним писавшего роли (эвристика для SLC-менеджера, у которого
+        // своего Telegram-чата обычно нет); 3) иначе — общий чат с warn.
+        // Молчаливая потеря невозможна.
+        let chat_id = match self.store.telegram_chat_for_role(sender).await {
+            Ok(Some(chat_id)) => Some(chat_id),
+            Ok(None) => match self.store.telegram_latest_operator_chat().await {
+                Ok(Some(chat_id)) => {
+                    debug!(
+                        sender = %sender,
+                        recipient = %recipient,
+                        chat_id,
+                        "sender role has no own Telegram chat; run answer routed to the latest operator chat"
+                    );
+                    Some(chat_id)
+                }
+                Ok(None) => {
+                    let group = self
+                        .config
+                        .telegram_group_id
+                        .as_deref()
+                        .and_then(|group| group.parse::<i64>().ok());
+                    if let Some(group) = group {
+                        warn!(
+                            sender = %sender,
+                            recipient = %recipient,
+                            "no operator chat known; run answer will be delivered to the shared group"
+                        );
+                        Some(group)
+                    } else {
+                        warn!(
+                            sender = %sender,
+                            recipient = %recipient,
+                            "no operator chat and no shared group configured: run answer cannot be delivered"
+                        );
+                        None
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        sender = %sender,
+                        recipient = %recipient,
+                        error = %error,
+                        "tracking run reply failed"
+                    );
+                    return;
+                }
+            },
+            Err(error) => {
+                warn!(
+                    sender = %sender,
+                    recipient = %recipient,
+                    error = %error,
+                    "tracking run reply failed"
+                );
+                return;
+            }
+        };
+        let Some(chat_id) = chat_id else {
             return;
         };
-        if let Err(error) = self.store.track_run_reply(run_id, recipient, chat_id).await {
+        if let Err(error) = self
+            .store
+            .track_run_reply(run_id, recipient, chat_id, None, None)
+            .await
+        {
             warn!(
                 sender = %sender,
                 recipient = %recipient,
@@ -922,6 +1022,9 @@ impl Dispatcher {
             "message": message,
             "targets": targets,
             "chat_id": args.chat_id,
+            "reply_message_id": args.reply_message_id,
+            "reply_quote": args.reply_quote,
+            "thread_id": args.thread_id,
         }));
         let manager = self.config.manager_role.clone();
         if let Some(outcome) = self
@@ -944,10 +1047,19 @@ impl Dispatcher {
         {
             warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source chat failed");
         }
+        if let Err(error) = self
+            .store
+            .set_dispatch_telegram_thread(&dispatch_id, args.thread_id)
+            .await
+        {
+            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source thread failed");
+        }
 
         let update_id = args.update_id.to_string();
         let message_id = args.message_id.to_string();
         let user_id = args.user_id.to_string();
+        let reply_message_id = args.reply_message_id.map(|value| value.to_string());
+        let thread_id = args.thread_id.map(|value| value.to_string());
         let requests = targets.iter().map(|target| async {
             let body = render_template(
                 &self.config.telegram_inbound_template,
@@ -958,6 +1070,12 @@ impl Dispatcher {
                     ("username", args.username.as_str()),
                     ("recipient", target.as_str()),
                     ("message", message.as_str()),
+                    (
+                        "reply_message_id",
+                        reply_message_id.as_deref().unwrap_or(""),
+                    ),
+                    ("reply_quote", args.reply_quote.as_deref().unwrap_or("")),
+                    ("thread_id", thread_id.as_deref().unwrap_or("")),
                 ]),
             );
             let result = match body {
@@ -981,12 +1099,19 @@ impl Dispatcher {
             summary.push(target, result);
         }
         // Запоминаем запущенные раны (долговечно, в БД), чтобы их итоговый
-        // ответ доставился оператору в исходный чат (см. spawn_run_reply_worker).
+        // ответ доставился оператору в исходный чат реплаем на запрос
+        // (см. spawn_run_reply_worker).
         for (target, value) in &summary.results {
             if let Some(run_id) = value.get("run_id").and_then(Value::as_str)
                 && let Err(error) = self
                     .store
-                    .track_run_reply(run_id, target, args.chat_id)
+                    .track_run_reply(
+                        run_id,
+                        target,
+                        args.chat_id,
+                        Some(args.message_id),
+                        args.thread_id,
+                    )
                     .await
             {
                 warn!(run_id = %run_id, error = %error, "tracking run reply failed");
@@ -1082,9 +1207,9 @@ impl Dispatcher {
                     "error": "Telegram file must have a filename",
                 }));
             }
-            // Путь в общей папке — надёжный способ (base64 через tool-call
-            // модели обрезается лимитом выходных токенов).
             let content_b64 = if let Some(path) = file.path {
+                // Путь в общей папке — надёжный способ (base64 через tool-call
+                // модели обрезается лимитом выходных токенов).
                 match self.read_shared_file(&path).await {
                     Ok(content) => content,
                     Err(error) => {
@@ -1110,15 +1235,19 @@ impl Dispatcher {
                 content_b64,
             });
         }
-        // MCP-only roles may reply proactively with no prior dispatch: the
-        // chat falls back to the latest operator chat, then to the group.
-        let chat_id = match self.store.telegram_chat_for_role(sender).await {
-            Ok(chat_id) => chat_id,
-            Err(error) => {
-                warn!(role = %sender, error = %error, "Telegram reply chat lookup failed");
-                return tool_error_message(error);
-            }
-        };
+        // Явная адресация: чат (и топик, если последний запрос пришёл из
+        // топика) — только последний inbound-чат этой роли; без «последнего
+        // чата любой роли». Нет своего чата — сообщение уходит в общий чат,
+        // и источник адресации виден в результате.
+        let (chat_id, thread_id, chat_source) =
+            match self.store.telegram_chat_and_thread_for_role(sender).await {
+                Ok(Some((chat_id, thread_id))) => (Some(chat_id), thread_id, "role_chat"),
+                Ok(None) => (None, None, "group"),
+                Err(error) => {
+                    warn!(role = %sender, error = %error, "Telegram reply chat lookup failed");
+                    return tool_error_message(error);
+                }
+            };
         let audit = AuditMessage {
             id: format!("reply_{}", Uuid::new_v4().simple()),
             sender: sender.to_string(),
@@ -1126,6 +1255,8 @@ impl Dispatcher {
             recipients: "operator".to_string(),
             text: message,
             chat_id,
+            reply_to_message_id: None,
+            thread_id,
             media,
         };
         if let Err(error) = self.store.enqueue_outbox(audit).await {
@@ -1137,6 +1268,7 @@ impl Dispatcher {
                 "ok": true,
                 "queued": true,
                 "chat_id": chat_id,
+                "chat_source": chat_source,
             }),
             is_error: false,
         }
@@ -1332,24 +1464,33 @@ impl Dispatcher {
     async fn flush_run_replies(&self) -> anyhow::Result<()> {
         let ttl = Duration::from_secs(6 * 60 * 60);
         let now = Utc::now().timestamp_millis();
-        for (run_id, role, chat_id, created_ms) in self.store.due_run_replies().await? {
-            // Долгие задачи (медленные модели) живут до 6 часов; просроченные
-            // снимаются с трекинга, чтобы поллер не висел вечно.
+        for (run_id, role, chat_id, message_id, thread_id, created_ms) in
+            self.store.due_run_replies().await?
+        {
             if now - created_ms > i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX) {
-                self.store.untrack_run_reply(&run_id).await?;
+                // Никогда не бросаем оператора в тишине: просроченный трек
+                // снимается только после явного уведомления о том, что ответ
+                // так и не пришёл.
+                warn!(run_id = %run_id, role = %role, "run reply polling expired (6h); notifying the operator");
+                self.enqueue_expired_reply_notice(&run_id, &role, chat_id, message_id)
+                    .await;
+                if let Err(error) = self.store.untrack_run_reply(&run_id).await {
+                    warn!(run_id = %run_id, error = %error, "untracking expired run reply failed");
+                }
                 continue;
             }
             match self.fetch_run_outcome(&run_id, &role).await {
                 Ok(RunOutcome::Running) => {
                     // Агент ещё думает (локальные модели — минуты): держим
                     // «печатает…» живым на каждом тике (интервал ≈ 5 с,
-                    // пузырь Telegram живёт ~5–6 с).
-                    if let Err(error) = self.send_typing(Some(chat_id)).await {
+                    // пузырь Telegram живёт ~5–6 с). Топик запроса известен —
+                    // индикатор показывается в нём, а не в корне чата.
+                    if let Err(error) = self.send_typing(Some(chat_id), thread_id).await {
                         debug!(run_id = %run_id, error = %error, "typing heartbeat failed");
                     }
                 }
                 Ok(outcome) => {
-                    self.deliver_run_reply(&run_id, &role, chat_id, outcome)
+                    self.deliver_run_reply(&run_id, &role, chat_id, message_id, outcome)
                         .await;
                 }
                 // transient HTTP error: retry on the next tick
@@ -1359,6 +1500,33 @@ impl Dispatcher {
             }
         }
         Ok(())
+    }
+
+    /// Explicit notification that a tracked run never produced an answer
+    /// within the polling TTL (instead of silently dropping the track).
+    async fn enqueue_expired_reply_notice(
+        &self,
+        run_id: &str,
+        role: &str,
+        chat_id: i64,
+        message_id: Option<i64>,
+    ) {
+        let notice = AuditMessage {
+            id: format!("reply_expired_{}", Uuid::new_v4().simple()),
+            sender: role.to_string(),
+            event: "TELEGRAM_REPLY".to_string(),
+            recipients: "operator".to_string(),
+            text: format!(
+                "⚠️ Агент {role} не завершил обработку запроса за 6 часов — проверьте состояние агента (run {run_id})."
+            ),
+            chat_id: Some(chat_id),
+            reply_to_message_id: message_id,
+            thread_id: None,
+            media: vec![],
+        };
+        if let Err(error) = self.store.enqueue_outbox(notice).await {
+            warn!(run_id = %run_id, error = %error, "expired run reply notice enqueue failed");
+        }
     }
 
     async fn fetch_run_outcome(&self, run_id: &str, role: &str) -> anyhow::Result<RunOutcome> {
@@ -1382,10 +1550,42 @@ impl Dispatcher {
             .send()
             .await
             .map_err(|error| anyhow!("run status request failed: {error}"))?;
-        if !response.status().is_success() {
+        let status = response.status();
+        if status.is_client_error()
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        {
+            // The run is definitively gone or refused (404/401/...): polling
+            // for hours would only hide the loss — report it to the operator
+            // instead of pretending the agent is still running. 429 (overload)
+            // and 408 stay transient like 5xx.
+            return Ok(RunOutcome::Failed {
+                status: Some(status.as_u16()),
+            });
+        }
+        if !status.is_success() {
+            // 429/5xx/408: transient — keep polling until the TTL, after
+            // which the expiry notice is explicit.
             return Ok(RunOutcome::Running);
         }
-        let payload: Value = response.json().await?;
+        // Bounded read, mirroring `start_run`: run objects carry the output
+        // and must not be read without a cap.
+        let max_bytes = self.config.max_request_body_bytes;
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| anyhow!("read run status response: {error}"))?;
+            let next_len = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| anyhow!("run status response is too large"))?;
+            if next_len > max_bytes {
+                return Err(anyhow!("run status response is too large"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|error| anyhow!("decode Hermes run status response: {error}"))?;
         match payload.get("status").and_then(Value::as_str) {
             Some("completed") => Ok(RunOutcome::Completed(
                 payload
@@ -1394,20 +1594,30 @@ impl Dispatcher {
                     .unwrap_or("")
                     .to_string(),
             )),
-            Some("failed" | "cancelled") => Ok(RunOutcome::Failed),
+            Some("failed" | "cancelled") => Ok(RunOutcome::Failed { status: None }),
             _ => Ok(RunOutcome::Running),
         }
     }
 
-    async fn deliver_run_reply(&self, run_id: &str, role: &str, chat_id: i64, outcome: RunOutcome) {
+    async fn deliver_run_reply(
+        &self,
+        run_id: &str,
+        role: &str,
+        chat_id: i64,
+        message_id: Option<i64>,
+        outcome: RunOutcome,
+    ) {
         let text = match outcome {
             RunOutcome::Completed(output) if !output.is_empty() => output,
             RunOutcome::Completed(_) => {
                 format!("⚠️ Агент {role} ответил пустым сообщением.")
             }
-            RunOutcome::Failed => {
-                format!("⚠️ Агент {role} не смог обработать запрос.")
-            }
+            RunOutcome::Failed { status } => match status {
+                Some(status) => format!(
+                    "⚠️ Агент {role} не смог обработать запрос (run не найден/недоступен: HTTP {status})."
+                ),
+                None => format!("⚠️ Агент {role} не смог обработать запрос."),
+            },
             RunOutcome::Running => return,
         };
         let audit = AuditMessage {
@@ -1417,6 +1627,10 @@ impl Dispatcher {
             recipients: "operator".to_string(),
             text,
             chat_id: Some(chat_id),
+            // Ответ привязываем к исходному запросу оператора, чтобы в чате
+            // он выглядел реплаем на него (реплай сам остаётся в топике).
+            reply_to_message_id: message_id,
+            thread_id: None,
             media: vec![],
         };
         if let Err(error) = self.store.enqueue_outbox(audit).await {
@@ -1428,8 +1642,9 @@ impl Dispatcher {
         }
     }
 
-    /// «Печатает…» в целевой чат (— fallback: общий чат).
-    async fn send_typing(&self, chat: Option<i64>) -> anyhow::Result<()> {
+    /// «Печатает…» в целевой чат (None — общий чат); `thread_id` показывает
+    /// индикатор в топике, из которого пришёл запрос.
+    async fn send_typing(&self, chat: Option<i64>, thread_id: Option<i64>) -> anyhow::Result<()> {
         if !self.config.telegram_enabled {
             return Ok(());
         }
@@ -1441,6 +1656,10 @@ impl Dispatcher {
             (None, Some(group)) => group.clone(),
             (None, None) => return Ok(()),
         };
+        let mut payload = json!({"chat_id": chat_id, "action": "typing"});
+        if let Some(thread_id) = thread_id {
+            payload["message_thread_id"] = json!(thread_id);
+        }
         let api_base = self
             .config
             .telegram_api_base_url
@@ -1449,7 +1668,7 @@ impl Dispatcher {
         let response = self
             .telegram_client
             .post(format!("{api_base}/bot{}/sendChatAction", token.expose()))
-            .json(&json!({"chat_id": chat_id, "action": "typing"}))
+            .json(&payload)
             .send()
             .await
             .map_err(|_| anyhow!("Telegram sendChatAction request failed"))?;
@@ -1458,6 +1677,47 @@ impl Dispatcher {
             return Err(anyhow!("sendChatAction failed: HTTP {status}"));
         }
         Ok(())
+    }
+
+    /// Разовое (best-effort, без очереди и ретраев) уведомление получателю,
+    /// что его сообщение умерло перманентно: dead-строка в outbox не должна
+    /// оставаться единственным следом для оператора.
+    async fn notify_delivery_dead(&self, item: &OutboxItem, reason: &str) {
+        if !self.config.telegram_enabled {
+            return;
+        }
+        let Some(token) = self.config.telegram_token_for(&item.sender) else {
+            return;
+        };
+        let Some(group) = &self.config.telegram_group_id else {
+            return;
+        };
+        let chat_id = item
+            .chat_id
+            .map_or_else(|| group.clone(), |chat_id| chat_id.to_string());
+        let api_base = self
+            .config
+            .telegram_api_base_url
+            .as_str()
+            .trim_end_matches('/');
+        let text = format!(
+            "⚠️ Сообщение от роли {} не удалось доставить в этот чат: {}",
+            item.sender,
+            reason.chars().take(400).collect::<String>()
+        );
+        let response = self
+            .telegram_client
+            .post(format!("{api_base}/bot{}/sendMessage", token.expose()))
+            .json(&json!({
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": true,
+            }))
+            .send()
+            .await;
+        if let Err(error) = response {
+            warn!(outbox_id = %item.id, error = %error, "dead delivery notice could not be sent");
+        }
     }
 
     async fn flush_outbox(&self) -> anyhow::Result<()> {
@@ -1479,6 +1739,16 @@ impl Dispatcher {
                     info!(outbox_id = %item.id, "Telegram audit delivered");
                 }
                 Err(error) => {
+                    // Единственный случай автоматического снижения: Telegram
+                    // отказал именно реплаю (исходное сообщение удалено либо
+                    // старше 48-часового окна ответов). Снимаем привязку и
+                    // доставляем контент обычным сообщением. Любая другая
+                    // перманентная ошибка не маскируется.
+                    if error.is_reply_refusal() && item.reply_to_message_id.is_some() {
+                        warn!(outbox_id = %item.id, error = %error, "Telegram refused the reply link (source deleted or too old); delivering without the reply");
+                        self.store.clear_outbox_reply(&item.id).await?;
+                        continue;
+                    }
                     let attempts = if error.permanent {
                         self.config.outbox_max_attempts
                     } else {
@@ -1507,6 +1777,11 @@ impl Dispatcher {
                         // newly persisted transport backoff for rows already in
                         // this batch and hammer the same Telegram transport.
                         break;
+                    }
+                    // Fail fast, но не молча: ответ оператору, который
+                    // доставить не удалось, — разовое прямое уведомление.
+                    if error.permanent && item.event == "TELEGRAM_REPLY" {
+                        self.notify_delivery_dead(&item, &error.to_string()).await;
                     }
                 }
             }
@@ -1548,14 +1823,23 @@ impl Dispatcher {
             ));
         }
         for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
+            let mut payload = json!({
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": true,
+            });
+            if let Some(reply_to_message_id) = item.reply_to_message_id {
+                // Привязываем сообщение к тому, на которое оно отвечает
+                // (доступно только для сообщений в том же чате).
+                payload["reply_to_message_id"] = json!(reply_to_message_id);
+            } else if let Some(thread_id) = item.thread_id {
+                // Без реплая топик нужно указать явно.
+                payload["message_thread_id"] = json!(thread_id);
+            }
             let response = self
                 .telegram_client
                 .post(&url)
-                .json(&json!({
-                    "chat_id": chat_id,
-                    "text": chunk,
-                    "disable_web_page_preview": true,
-                }))
+                .json(&payload)
                 .send()
                 .await
                 .map_err(|_| TelegramFailure::new("Telegram request failed", None))?;
@@ -1570,13 +1854,13 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Deliver an attached file as a single sendPhoto (image/*) or
-    /// sendDocument message; the item text becomes the caption (≤1024 chars).
     /// Deliver attached files: one sendPhoto (image/*) or sendDocument message
-    /// per file; the item text is the caption of the first file (≤1024 chars).
-    /// The outbox chunk cursor tracks the number of files already sent, so a
-    /// retry after a mid-batch failure resumes without re-sending earlier
-    /// files.
+    /// per file, then the text that does not fit into the first-file caption
+    /// (Telegram caps captions at 1024 characters) as regular sendMessage
+    /// parts — nothing of the item text is dropped. The outbox chunk cursor
+    /// tracks the number of delivered parts (files first, then text chunks),
+    /// so a retry after a mid-batch failure resumes without re-sending
+    /// earlier parts.
     async fn send_telegram_media(
         &self,
         api_base: &str,
@@ -1585,9 +1869,19 @@ impl Dispatcher {
         item: &OutboxItem,
     ) -> Result<(), TelegramFailure> {
         use base64::Engine as _;
-        let caption: String = item.text.chars().take(1024).collect();
+        let caption_limit = 1024;
+        let characters = item.text.chars().collect::<Vec<_>>();
+        let caption: String = characters.iter().take(caption_limit).collect();
+        let text_parts: Vec<String> = characters
+            .iter()
+            .skip(caption_limit)
+            .collect::<Vec<&char>>()
+            .chunks(self.config.telegram_message_limit.max(1))
+            .map(|chunk| chunk.iter().copied().collect::<String>())
+            .collect();
+        let total_parts = item.media.len() + text_parts.len();
         let start = usize::try_from(item.next_chunk).unwrap_or(usize::MAX);
-        if start > item.media.len() {
+        if start > total_parts {
             return Err(TelegramFailure::permanent(
                 "Telegram media chunk cursor is invalid",
             ));
@@ -1613,7 +1907,7 @@ impl Dispatcher {
                 .map_err(|error| {
                     TelegramFailure::new(format!("media mime failed: {error}"), None)
                 })?;
-            let form = reqwest::multipart::Form::new()
+            let mut form = reqwest::multipart::Form::new()
                 .text("chat_id", chat_id.to_string())
                 .text(
                     "caption",
@@ -1624,6 +1918,11 @@ impl Dispatcher {
                     },
                 )
                 .part(field, part);
+            if let Some(reply_to_message_id) = item.reply_to_message_id {
+                form = form.text("reply_to_message_id", reply_to_message_id.to_string());
+            } else if let Some(thread_id) = item.thread_id {
+                form = form.text("message_thread_id", thread_id.to_string());
+            }
             let url = format!("{api_base}/bot{token}/{method}");
             let response = self
                 .telegram_client
@@ -1636,6 +1935,37 @@ impl Dispatcher {
             // Checkpoint per file so a retry resumes after this one.
             self.store
                 .mark_outbox_chunk_sent(&item.id, i64::try_from(index + 1).unwrap_or(i64::MAX))
+                .await
+                .map_err(|error| {
+                    TelegramFailure::new(format!("outbox checkpoint failed: {error}"), None)
+                })?;
+        }
+        let text_start = start.saturating_sub(item.media.len());
+        for (index, chunk) in text_parts.into_iter().enumerate().skip(text_start) {
+            let mut payload = json!({
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": true,
+            });
+            if let Some(reply_to_message_id) = item.reply_to_message_id {
+                payload["reply_to_message_id"] = json!(reply_to_message_id);
+            } else if let Some(thread_id) = item.thread_id {
+                payload["message_thread_id"] = json!(thread_id);
+            }
+            let url = format!("{api_base}/bot{token}/sendMessage");
+            let response = self
+                .telegram_client
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|_| TelegramFailure::new("Telegram request failed", None))?;
+            validate_telegram_response(response).await?;
+            self.store
+                .mark_outbox_chunk_sent(
+                    &item.id,
+                    i64::try_from(item.media.len() + index + 1).unwrap_or(i64::MAX),
+                )
                 .await
                 .map_err(|error| {
                     TelegramFailure::new(format!("outbox checkpoint failed: {error}"), None)
@@ -2232,6 +2562,8 @@ impl Dispatcher {
             recipients: recipients.to_string(),
             text: text.to_string(),
             chat_id,
+            reply_to_message_id: None,
+            thread_id: None,
             media: vec![],
         })
     }
@@ -2362,11 +2694,25 @@ async fn validate_telegram_response(response: reqwest::Response) -> Result<(), T
         .or(header_retry_after)
         .map(|seconds| seconds.clamp(1, 86_400));
     if !status.is_success() {
-        let message = format!("Telegram API returned HTTP {status}");
+        let description = payload
+            .as_ref()
+            .and_then(|value| value.get("description"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let message = match &description {
+            Some(description) => format!("Telegram API returned HTTP {status}: {description}"),
+            None => format!("Telegram API returned HTTP {status}"),
+        };
         if telegram_status_is_retryable(status) {
-            return Err(TelegramFailure::new(message, retry_after_seconds));
+            let mut failure = TelegramFailure::new(message, retry_after_seconds);
+            failure.status = Some(status.as_u16());
+            failure.description = description;
+            return Err(failure);
         }
-        return Err(TelegramFailure::permanent(message));
+        let mut failure = TelegramFailure::permanent(message);
+        failure.status = Some(status.as_u16());
+        failure.description = description;
+        return Err(failure);
     }
     if payload.as_ref().and_then(|value| value.get("ok")) != Some(&Value::Bool(true)) {
         return Err(TelegramFailure::permanent(
@@ -3844,6 +4190,9 @@ mod tests {
             message: "hello".to_string(),
             targets: vec!["developer".to_string()],
             chat_id: -100_123,
+            reply_message_id: None,
+            reply_quote: None,
+            thread_id: None,
         };
         let first = dispatcher.telegram_inbound(args).await;
         assert!(!first.is_error, "unexpected: {:?}", first.value);
@@ -3863,6 +4212,9 @@ mod tests {
                 message: "hello".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: -100_123,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         assert_eq!(second.value["deduplicated"], json!(true));
@@ -3877,6 +4229,9 @@ mod tests {
                 message: "hello".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: -100_123,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         assert!(invalid.is_error);
@@ -3963,6 +4318,9 @@ mod tests {
                 message: "private operator request".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 42,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
 
@@ -4003,6 +4361,9 @@ mod tests {
                 message: "private operator request".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 42,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
@@ -4051,6 +4412,9 @@ mod tests {
                 message: "draw".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         let files = vec![
@@ -4103,6 +4467,9 @@ mod tests {
                 message: "draw".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         let reply = dispatcher
@@ -4151,6 +4518,9 @@ mod tests {
                 message: "draw".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         // Абсолютный путь внутри общей папки.
@@ -4300,6 +4670,9 @@ mod tests {
                 message: "draw".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         let files = vec![
@@ -4362,7 +4735,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_reply_worker_drops_expired_tracks_without_delivery() -> anyhow::Result<()> {
+    async fn run_reply_worker_expired_tracks_notify_the_operator_explicitly() -> anyhow::Result<()>
+    {
         let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
             if body.starts_with("GET /v1/runs/") {
                 (
@@ -4379,7 +4753,7 @@ mod tests {
         }))
         .await?;
         store
-            .track_run_reply("run-old", "developer", 424_242)
+            .track_run_reply("run-old", "developer", 424_242, None, None)
             .await?;
         // Ставим created_ms в прошлом на 7 часов (TTL = 6ч).
         sqlx::query("UPDATE run_replies SET created_ms = ? WHERE run_id = 'run-old'")
@@ -4392,16 +4766,28 @@ mod tests {
             "expired track dropped"
         );
         let items = store.due_outbox(10).await?;
-        assert!(!items.iter().any(|item| item.event == "TELEGRAM_REPLY"));
+        let notice = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("expiry notice is queued, never silently dropped");
+        assert!(
+            notice
+                .text
+                .contains("не завершил обработку запроса за 6 часов"),
+            "уведомление объясняет причину: {}",
+            notice.text
+        );
+        assert_eq!(notice.chat_id, Some(424_242));
         testutil::remove_db_files(&path).await;
         Ok(())
     }
 
     #[tokio::test]
-    async fn telegram_reply_falls_back_to_any_roles_operator_chat() -> anyhow::Result<()> {
+    async fn telegram_reply_without_role_chat_goes_to_the_group_explicitly() -> anyhow::Result<()> {
         let (dispatcher, store, path) =
             dispatcher_with_telegram(Arc::new(|_, _| (202, json!({"run_id": "run-x"})))).await?;
-        // Диспатч на developer устанавливает чат оператора.
+        // Диспатч на developer устанавливает чат оператора, но НЕ чат роли
+        // designer: proactive-ответ строго адресуется и не «одалживает» чужой чат.
         dispatcher
             .telegram_inbound(TelegramInboundArgs {
                 update_id: 14,
@@ -4411,20 +4797,22 @@ mod tests {
                 message: "hi".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
-        // MCP-only роль (например designer) без собственного диспатча
-        // отвечает в тот же чат оператора.
         let reply = dispatcher
             .telegram_reply("designer", "proactive".to_string(), vec![])
             .await;
         assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        assert_eq!(reply.value["chat_source"], json!("group"));
         let items = store.due_outbox(10).await?;
         let item = items
             .iter()
             .find(|item| item.event == "TELEGRAM_REPLY")
             .expect("reply queued");
-        assert_eq!(item.chat_id, Some(424_242));
+        assert_eq!(item.chat_id, None, "общий чат — адресация по умолчанию");
         testutil::remove_db_files(&path).await;
         Ok(())
     }
@@ -4457,6 +4845,9 @@ mod tests {
                 message: "hello".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
@@ -4515,6 +4906,9 @@ mod tests {
                 message: "hello".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
 
@@ -4583,6 +4977,9 @@ mod tests {
                 message: "приказ".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
@@ -4603,7 +5000,7 @@ mod tests {
         assert!(
             tracks
                 .iter()
-                .any(|(run_id, role, chat_id, _)| run_id == "run-dt"
+                .any(|(run_id, role, chat_id, _, _, _)| run_id == "run-dt"
                     && role == "developer"
                     && *chat_id == 424_242),
             "ответ run'а контактера должен отслеживаться для чата менеджера: {tracks:?}"
@@ -4637,6 +5034,9 @@ mod tests {
                 message: "operator request".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
@@ -4710,6 +5110,9 @@ mod tests {
                 message: "hello".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         assert!(!outcome.is_error, "unexpected: {:?}", outcome.value);
@@ -4782,6 +5185,9 @@ mod tests {
                 message: "hello".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: None,
             })
             .await;
         let error = outcome.value["results"]["developer"]["error"]
@@ -4982,6 +5388,38 @@ mod tests {
         Ok(())
     }
 
+    /// Ставит сообщение в `telegram_outbox` и возвращает его как
+    /// `OutboxItem` — `send_telegram` чекпоинтит курсор в БД, поэтому строка
+    /// должна существовать.
+    async fn enqueue_outbox_item(
+        store: &Store,
+        id: &str,
+        text: String,
+        chat_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+        media: Vec<MediaPayload>,
+    ) -> anyhow::Result<OutboxItem> {
+        store
+            .enqueue_outbox(AuditMessage {
+                id: id.to_string(),
+                sender: "manager".to_string(),
+                event: "TELEGRAM_REPLY".to_string(),
+                recipients: "operator".to_string(),
+                text,
+                chat_id,
+                reply_to_message_id,
+                thread_id: None,
+                media,
+            })
+            .await?;
+        Ok(store
+            .due_outbox(10)
+            .await?
+            .into_iter()
+            .find(|item| item.id == id)
+            .expect("enqueued outbox item"))
+    }
+
     fn outbox_item() -> OutboxItem {
         OutboxItem {
             id: "audit_x".to_string(),
@@ -4992,6 +5430,8 @@ mod tests {
             attempts: 0,
             next_chunk: 0,
             chat_id: None,
+            reply_to_message_id: None,
+            thread_id: None,
             media: vec![],
         }
     }
@@ -5239,6 +5679,387 @@ mod tests {
         .await?;
         let error = dispatcher.send_telegram(&outbox_item()).await.unwrap_err();
         assert_eq!(error.retry_after_seconds, Some(15), "body retry_after wins");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_text_reply_carries_reply_to_message_id() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |_, body| {
+                sent_clone.lock().expect("sent").push(body.to_string());
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+        let item = enqueue_outbox_item(
+            &store,
+            "reply_text_1",
+            "короткий ответ".to_string(),
+            Some(424_242),
+            Some(900),
+            Vec::new(),
+        )
+        .await?;
+        dispatcher
+            .send_telegram(&item)
+            .await
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        let payload: Value = {
+            let body = sent.lock().expect("sent");
+            assert_eq!(body.len(), 1);
+            serde_json::from_str(&body[0])?
+        };
+        assert_eq!(
+            payload["reply_to_message_id"],
+            json!(900),
+            "ответ привязан к исходному сообщению"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_media_splits_long_text_after_the_caption() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |api_path, body| {
+                sent_clone
+                    .lock()
+                    .expect("sent")
+                    .push((api_path.to_string(), body.to_string()));
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+        let item = enqueue_outbox_item(
+            &store,
+            "reply_media_2",
+            "T".repeat(3000),
+            Some(424_242),
+            Some(55),
+            vec![MediaPayload {
+                filename: "a.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                content_b64: base64::engine::general_purpose::STANDARD.encode(b"png"),
+            }],
+        )
+        .await?;
+        dispatcher
+            .send_telegram(&item)
+            .await
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        let text_payload: Value = {
+            let sent = sent.lock().expect("sent");
+            assert_eq!(sent.len(), 2, "файл + остаток текста: {sent:?}");
+            let (media_path, media_body) = &sent[0];
+            assert!(media_path.ends_with("sendPhoto"));
+            assert!(
+                media_body.contains("name=\"caption\"") && media_body.contains(&"T".repeat(1024)),
+                "подпись — первые 1024 символа: {media_body}"
+            );
+            assert!(
+                media_body.contains("reply_to_message_id") && media_body.contains("55"),
+                "реплай в multipart: {media_body}"
+            );
+            let (text_path, text_body) = &sent[1];
+            assert!(text_path.ends_with("sendMessage"));
+            serde_json::from_str(text_body)?
+        };
+        assert_eq!(
+            text_payload["text"].as_str().map(str::len),
+            Some(3000 - 1024),
+            "остаток текста не теряется"
+        );
+        assert_eq!(text_payload["reply_to_message_id"], json!(55));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_telegram_media_resumes_at_text_parts_after_files() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |api_path, body| {
+                sent_clone
+                    .lock()
+                    .expect("sent")
+                    .push((api_path.to_string(), body.to_string()));
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+        let mut item = enqueue_outbox_item(
+            &store,
+            "reply_media_3",
+            "T".repeat(3000),
+            Some(424_242),
+            None,
+            vec![MediaPayload {
+                filename: "a.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                content_b64: base64::engine::general_purpose::STANDARD.encode(b"png"),
+            }],
+        )
+        .await?;
+        item.next_chunk = 1; // фото уже ушло; ретрай должен дослать текст
+        dispatcher
+            .send_telegram(&item)
+            .await
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        {
+            let sent = sent.lock().expect("sent");
+            assert_eq!(sent.len(), 1, "файл не пересылается повторно: {sent:?}");
+            assert!(sent[0].0.ends_with("sendMessage"));
+        }
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_reply_worker_threads_the_answer_to_the_source_message() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/run-1") {
+                (
+                    200,
+                    json!({"object": "hermes.run", "run_id": "run-1", "status": "completed", "output": "готово"}),
+                )
+            } else {
+                (202, json!({"run_id": "run-1"}))
+            }
+        }))
+        .await?;
+        store
+            .track_run_reply("run-1", "developer", 424_242, Some(900), None)
+            .await?;
+        dispatcher.flush_run_replies().await?;
+        let reply_to: Option<i64> = sqlx::query_scalar(
+            "SELECT reply_to_message_id FROM telegram_outbox WHERE event='TELEGRAM_REPLY'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(reply_to, Some(900), "ответ — реплай на запрос оператора");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permanent_reply_failure_retries_once_without_the_reply() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(|_, body| {
+                // 400 именно за реплай (источник удалён/устарел); без реплая
+                // доставка проходит.
+                if body.contains("reply_to_message_id") {
+                    (
+                        400,
+                        json!({"ok": false, "description": "reply message not found"}),
+                        None,
+                    )
+                } else {
+                    (200, json!({"ok": true}), None)
+                }
+            }),
+        )
+        .await?;
+        let mut item = enqueue_outbox_item(
+            &store,
+            "reply_fallback_1",
+            "важный ответ".to_string(),
+            Some(424_242),
+            Some(777),
+            Vec::new(),
+        )
+        .await?;
+        // Идемпотентный первый прогон: снапшот включает наш пункт.
+        item.reply_to_message_id = Some(777);
+        dispatcher.flush_outbox().await?;
+        let (reply_to, status): (Option<i64>, String) = sqlx::query_as(
+            "SELECT reply_to_message_id, status FROM telegram_outbox WHERE id='reply_fallback_1'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(status, "pending", "пункт жив после перманентного сбоя");
+        assert_eq!(reply_to, None, "реплай снят для повторной попытки");
+        dispatcher.flush_outbox().await?;
+        let (reply_to, status): (Option<i64>, String) = sqlx::query_as(
+            "SELECT reply_to_message_id, status FROM telegram_outbox WHERE id='reply_fallback_1'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(status, "delivered", "контент доставлен без реплая");
+        assert_eq!(reply_to, None);
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_status_404_fails_fast_with_an_explicit_message() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/run-gone") {
+                (404, json!({"error": "no such run"}))
+            } else {
+                (202, json!({"run_id": "run-gone"}))
+            }
+        }))
+        .await?;
+        store
+            .track_run_reply("run-gone", "developer", 424_242, Some(900), None)
+            .await?;
+        dispatcher.flush_run_replies().await?;
+        assert!(
+            store.due_run_replies().await?.is_empty(),
+            "run не найден — трек снят сразу, а не через 6 часов"
+        );
+        let items = store.due_outbox(10).await?;
+        let notice = items
+            .iter()
+            .find(|item| item.event == "TELEGRAM_REPLY")
+            .expect("failure message queued");
+        assert!(
+            notice.text.contains("HTTP 404"),
+            "оператор видит причину: {}",
+            notice.text
+        );
+        assert_eq!(notice.reply_to_message_id, Some(900));
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permanent_non_reply_failure_dead_letters_and_notifies() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |_, body| {
+                sent_clone.lock().expect("sent").push(body.to_string());
+                // 403 — перманентно, и это НЕ отказ реплая: уведомление о
+                // смерти пункта должно уйти, а сам пункт — стать dead.
+                (
+                    403,
+                    json!({"ok": false, "description": "bot was blocked"}),
+                    None,
+                )
+            }),
+        )
+        .await?;
+        enqueue_outbox_item(
+            &store,
+            "reply_dead_1",
+            "важный ответ".to_string(),
+            Some(424_242),
+            Some(777),
+            Vec::new(),
+        )
+        .await?;
+        dispatcher.flush_outbox().await?;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM telegram_outbox WHERE id='reply_dead_1'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(
+            status, "dead",
+            "не-реплайная перманентная ошибка не ретраится"
+        );
+        let notices = {
+            let sent = sent.lock().expect("sent");
+            sent.iter()
+                .filter(|body| body.contains("не удалось доставить"))
+                .count()
+        };
+        assert_eq!(notices, 1, "оператор уведомлён о недоставке");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_status_429_stays_transient_until_expiry() -> anyhow::Result<()> {
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(|_, body| {
+            if body.starts_with("GET /v1/runs/run-busy") {
+                (429, json!({"error": "overloaded"}))
+            } else {
+                (202, json!({"run_id": "run-busy"}))
+            }
+        }))
+        .await?;
+        store
+            .track_run_reply("run-busy", "developer", 424_242, Some(900), None)
+            .await?;
+        dispatcher.flush_run_replies().await?;
+        assert_eq!(
+            store.due_run_replies().await?.len(),
+            1,
+            "429 — перегрузка, а не потеря run: трек жив до TTL"
+        );
+        let items = store.due_outbox(10).await?;
+        assert!(
+            !items.iter().any(|item| item.event == "TELEGRAM_REPLY"),
+            "фейл-сообщение на 429 не отправляется"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_delivers_into_the_source_topic() -> anyhow::Result<()> {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sent_clone = sent.clone();
+        let (dispatcher, _store, path) = dispatcher_with_telegram_bot(
+            Arc::new(|_, _| (202, json!({"run_id": "r"}))),
+            Arc::new(move |_, body| {
+                sent_clone.lock().expect("sent").push(body.to_string());
+                (200, json!({"ok": true}), None)
+            }),
+        )
+        .await?;
+        // Оператор пишет роли developer из топика 77 группы.
+        let inbound = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 21,
+                message_id: 501,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "сделай".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: -100_123,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: Some(77),
+            })
+            .await;
+        assert!(!inbound.is_error, "unexpected: {:?}", inbound.value);
+        let reply = dispatcher
+            .telegram_reply("developer", "готово".to_string(), vec![])
+            .await;
+        assert!(!reply.is_error, "unexpected: {:?}", reply.value);
+        assert_eq!(reply.value["chat_source"], json!("role_chat"));
+        assert_eq!(reply.value["chat_id"], json!(-100_123));
+        dispatcher.flush_outbox().await?;
+        let payload: Value = {
+            let sent = sent.lock().expect("sent");
+            let body = sent
+                .iter()
+                .find(|body| body.contains("готово"))
+                .expect("reply sent");
+            serde_json::from_str(body)?
+        };
+        assert_eq!(
+            payload["message_thread_id"],
+            json!(77),
+            "ответ без реплая уходит в топик: {payload}"
+        );
+        assert!(
+            payload.get("reply_to_message_id").is_none(),
+            "thread хватает, реплай не нужен: {payload}"
+        );
         testutil::remove_db_files(&path).await;
         Ok(())
     }

@@ -153,6 +153,11 @@ pub struct Config {
     /// into the dispatch message. Files larger than this are referenced by
     /// path only. Default: `50_000` (~50 KB).
     pub file_inline_max_bytes: usize,
+    /// Maximum size (bytes) of a single inbound Telegram attachment that the
+    /// gateway downloads and saves into `shared_files_dir`. Larger files are
+    /// reported as undeliverable instead of being read into memory.
+    /// Default: 20 MiB (Telegram Bot API download limit).
+    pub inbound_file_max_bytes: usize,
     /// TTL for inbound files in `shared_files_dir`. Files older than this
     /// are cleaned up after each inbound message. Default: 86400 (24h).
     pub inbound_file_ttl: Duration,
@@ -612,6 +617,9 @@ impl Config {
                 "username",
                 "recipient",
                 "message",
+                "reply_message_id",
+                "reply_quote",
+                "thread_id",
             ],
             &["update_id", "user_id", "recipient", "message"],
         )?;
@@ -708,6 +716,9 @@ impl Config {
             file_inline_max_bytes: optional(env, "SWARM_FILE_INLINE_MAX_BYTES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50_000),
+            inbound_file_max_bytes: optional(env, "SWARM_INBOUND_FILE_MAX_BYTES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20 * 1024 * 1024),
             inbound_file_ttl: Duration::from_secs(
                 optional(env, "SWARM_INBOUND_FILE_TTL_SECS")
                     .and_then(|v| v.parse().ok())
