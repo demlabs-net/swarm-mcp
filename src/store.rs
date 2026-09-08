@@ -740,6 +740,21 @@ impl Store {
         Ok(())
     }
 
+    /// Exact source chat for one Telegram-originated dispatch. Unlike
+    /// `telegram_chat_for_role`, this never falls back to another command and
+    /// is therefore safe when a durable delivery is accepted after an outage.
+    pub async fn telegram_chat_for_dispatch(&self, id: &str) -> anyhow::Result<Option<i64>> {
+        let chat_id: Option<Option<i64>> = sqlx::query_scalar(
+            r#"SELECT telegram_chat_id
+               FROM dispatches
+               WHERE id = ? AND kind = 'telegram_inbound'"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(chat_id.flatten())
+    }
+
     /// Source Telegram chat of the most recent Telegram inbound dispatch
     /// Source Telegram chat for a role's reply: the most recent Telegram
     /// inbound dispatch targeting the role; falls back to the most recent

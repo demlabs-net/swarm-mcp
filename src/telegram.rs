@@ -485,10 +485,33 @@ impl TelegramGateway {
                     }
                     bail!("Telegram target is busy; update retained for retry");
                 }
-                self.queued_notices
-                    .lock()
-                    .expect("Telegram queue notice lock")
-                    .remove(&update.update_id);
+                let transport_queued = outcome
+                    .value
+                    .get("results")
+                    .and_then(Value::as_object)
+                    .is_some_and(|results| {
+                        results.values().any(|result| {
+                            result.get("queued").and_then(Value::as_bool) == Some(true)
+                        })
+                    });
+                if transport_queued {
+                    let first_notice = self
+                        .queued_notices
+                        .lock()
+                        .expect("Telegram queue notice lock")
+                        .insert(update.update_id);
+                    if first_notice {
+                        let notice = "⏳ Запрос сохранён и ждёт восстановления менеджера. Отвечу автоматически; повторять сообщение не нужно.";
+                        if let Err(error) = self.send_text(message.chat.id, notice).await {
+                            warn!(error = %error, "send Telegram durable queue notice failed");
+                        }
+                    }
+                } else {
+                    self.queued_notices
+                        .lock()
+                        .expect("Telegram queue notice lock")
+                        .remove(&update.update_id);
+                }
                 let audit_queued = outcome
                     .value
                     .pointer("/telegram/queued")
@@ -1288,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_target_retains_update_and_sends_one_queue_notice() -> anyhow::Result<()> {
+    async fn busy_target_durably_queues_update_and_sends_one_notice() -> anyhow::Result<()> {
         let sent = Arc::new(Mutex::new(Vec::<String>::new()));
         let (gateway, store, path) = gateway_with_mocks_and_hermes(
             TelegramBacklogMode::Process,
@@ -1297,36 +1320,37 @@ mod tests {
         )
         .await?;
 
-        let first = gateway.poll_once().await;
-        assert!(
-            first.is_err(),
-            "busy target must retain the Telegram update"
-        );
+        gateway.poll_once().await?;
         assert_eq!(
             store.telegram_update_offset().await?,
-            None,
-            "the durable offset must not advance before target admission"
+            Some(6),
+            "the update advances only after its wake is durably queued"
         );
         let status: String =
             sqlx::query_scalar("SELECT status FROM dispatches WHERE id='telegram_5'")
                 .fetch_one(store.pool())
                 .await?;
-        assert_eq!(status, "failed", "the failed reservation is retryable");
+        assert_eq!(status, "accepted", "the durable wake is accepted");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE dispatch_id='telegram_5' AND status='pending'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(pending, 1, "the busy role wake must survive in the FIFO");
         let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox")
             .fetch_one(store.pool())
             .await?;
         assert_eq!(
-            outbox, 0,
-            "transient queue pressure must not spam the shared audit group"
+            outbox, 1,
+            "the accepted group command has one normal audit record"
         );
         assert_eq!(sent.lock().expect("sent").len(), 1);
         assert!(
-            sent.lock().expect("sent")[0].contains("ждёт свободного слота"),
+            sent.lock().expect("sent")[0].contains("ждёт восстановления менеджера"),
             "operator receives a queue notice"
         );
 
-        let second = gateway.poll_once().await;
-        assert!(second.is_err());
+        gateway.poll_once().await?;
         assert_eq!(
             sent.lock().expect("sent").len(),
             1,
