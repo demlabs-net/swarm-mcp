@@ -1042,17 +1042,15 @@ impl Dispatcher {
         }
         if let Err(error) = self
             .store
-            .set_dispatch_telegram_chat(&dispatch_id, args.chat_id)
+            .set_dispatch_telegram_source(
+                &dispatch_id,
+                args.chat_id,
+                args.message_id,
+                args.thread_id,
+            )
             .await
         {
-            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source chat failed");
-        }
-        if let Err(error) = self
-            .store
-            .set_dispatch_telegram_thread(&dispatch_id, args.thread_id)
-            .await
-        {
-            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source thread failed");
+            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source failed");
         }
 
         let update_id = args.update_id.to_string();
@@ -1371,13 +1369,19 @@ impl Dispatcher {
                     {
                         match self
                             .store
-                            .telegram_chat_for_dispatch(&item.dispatch_id)
+                            .telegram_reply_target_for_dispatch(&item.dispatch_id)
                             .await
                         {
-                            Ok(Some(chat_id)) => {
+                            Ok(Some((chat_id, message_id, thread_id))) => {
                                 if let Err(error) = self
                                     .store
-                                    .track_run_reply(run_id, &item.recipient, chat_id)
+                                    .track_run_reply(
+                                        run_id,
+                                        &item.recipient,
+                                        chat_id,
+                                        message_id,
+                                        thread_id,
+                                    )
                                     .await
                                 {
                                     warn!(
@@ -4268,6 +4272,9 @@ mod tests {
                 message: "queue this during maintenance".to_string(),
                 targets: vec!["developer".to_string()],
                 chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: Some(17),
             })
             .await;
 
@@ -4295,9 +4302,17 @@ mod tests {
         assert_eq!(delivered.0, "delivered");
         assert_eq!(delivered.1.as_deref(), Some("run-delayed-telegram"));
         let replies = store.due_run_replies().await?;
-        assert!(replies.iter().any(|(run_id, role, chat_id, _)| {
-            run_id == "run-delayed-telegram" && role == "developer" && *chat_id == 424_242
-        }));
+        assert!(
+            replies
+                .iter()
+                .any(|(run_id, role, chat_id, message_id, thread_id, _)| {
+                    run_id == "run-delayed-telegram"
+                        && role == "developer"
+                        && *chat_id == 424_242
+                        && *message_id == Some(103)
+                        && *thread_id == Some(17)
+                })
+        );
 
         testutil::remove_db_files(&path).await;
         Ok(())

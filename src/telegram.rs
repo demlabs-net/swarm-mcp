@@ -2495,7 +2495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_retry_reuses_already_downloaded_attachments() -> anyhow::Result<()> {
+    async fn busy_target_durably_queues_already_downloaded_attachments() -> anyhow::Result<()> {
         let mut update = allowed_update();
         update["message"]["text"] = Value::Null;
         update["message"]["document"] = json!({
@@ -2513,8 +2513,8 @@ mod tests {
                 let mut calls = calls.lock().expect("calls");
                 calls.push(1);
                 if calls.len() == 1 {
-                    // Первая попытка: получатель занят → gateway откатится и
-                    // повторит обработку того же update.
+                    // Получатель занят: wake и уже скачанное вложение должны
+                    // сохраниться в durable delivery FIFO без повторного poll.
                     (429, json!({"error": "busy"}))
                 } else {
                     (202, json!({"run_id": "run-1"}))
@@ -2525,10 +2525,23 @@ mod tests {
         let inbound_dir = gateway.state.config.shared_files_dir.clone();
         let _ = std::fs::remove_dir_all(&inbound_dir);
         std::fs::create_dir_all(&inbound_dir)?;
-        assert!(gateway.poll_once().await.is_err(), "busy попытка");
-        assert_eq!(store.telegram_update_offset().await?, None);
         gateway.poll_once().await?;
         assert_eq!(store.telegram_update_offset().await?, Some(6));
+        gateway.poll_once().await?;
+        assert_eq!(
+            hermes_calls.lock().expect("calls").len(),
+            1,
+            "durably queued update is not dispatched again by Telegram polling"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE dispatch_id='telegram_5' AND status='pending'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(
+            pending, 1,
+            "attachment wake is retained in the durable FIFO"
+        );
         let files = std::fs::read_dir(&inbound_dir)?;
         let names: Vec<_> = files
             .flatten()
@@ -2537,7 +2550,7 @@ mod tests {
         assert_eq!(
             names.len(),
             1,
-            "вложение скачано один раз, несмотря на retry: {names:?}"
+            "вложение скачано один раз и сохранено для queued wake: {names:?}"
         );
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&inbound_dir);

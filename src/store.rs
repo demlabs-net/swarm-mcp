@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const TELEGRAM_OFFSET_KEY: &str = "telegram_update_offset";
 const TELEGRAM_POLL_SUCCESS_KEY: &str = "telegram_poll_success";
 
@@ -188,6 +188,11 @@ impl Store {
         }
         if !Self::has_column(&mut tx, "dispatches", "telegram_chat_id").await? {
             sqlx::query("ALTER TABLE dispatches ADD COLUMN telegram_chat_id INTEGER")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "dispatches", "telegram_message_id").await? {
+            sqlx::query("ALTER TABLE dispatches ADD COLUMN telegram_message_id INTEGER")
                 .execute(&mut *tx)
                 .await?;
         }
@@ -766,21 +771,18 @@ impl Store {
         Ok(())
     }
 
-    pub async fn set_dispatch_telegram_chat(&self, id: &str, chat_id: i64) -> anyhow::Result<()> {
-        sqlx::query("UPDATE dispatches SET telegram_chat_id = ? WHERE id = ?")
-            .bind(chat_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_dispatch_telegram_thread(
+    pub async fn set_dispatch_telegram_source(
         &self,
         id: &str,
+        chat_id: i64,
+        message_id: i64,
         thread_id: Option<i64>,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE dispatches SET telegram_thread_id = ? WHERE id = ?")
+        sqlx::query(
+            "UPDATE dispatches SET telegram_chat_id = ?, telegram_message_id = ?, telegram_thread_id = ? WHERE id = ?",
+        )
+            .bind(chat_id)
+            .bind(message_id)
             .bind(thread_id)
             .bind(id)
             .execute(&self.pool)
@@ -788,19 +790,29 @@ impl Store {
         Ok(())
     }
 
-    /// Exact source chat for one Telegram-originated dispatch. Unlike
-    /// `telegram_chat_for_role`, this never falls back to another command and
-    /// is therefore safe when a durable delivery is accepted after an outage.
-    pub async fn telegram_chat_for_dispatch(&self, id: &str) -> anyhow::Result<Option<i64>> {
-        let chat_id: Option<Option<i64>> = sqlx::query_scalar(
-            r#"SELECT telegram_chat_id
+    /// Exact reply target for one Telegram-originated dispatch. Unlike the
+    /// role-level lookup, this never falls back to another command and is safe
+    /// when a durable delivery is accepted after an outage.
+    pub async fn telegram_reply_target_for_dispatch(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<(i64, Option<i64>, Option<i64>)>> {
+        let row = sqlx::query(
+            r#"SELECT telegram_chat_id, telegram_message_id, telegram_thread_id
                FROM dispatches
-               WHERE id = ? AND kind = 'telegram_inbound'"#,
+               WHERE id = ? AND kind = 'telegram_inbound'
+                 AND telegram_chat_id IS NOT NULL"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(chat_id.flatten())
+        Ok(row.map(|row| {
+            (
+                row.get("telegram_chat_id"),
+                row.get("telegram_message_id"),
+                row.get("telegram_thread_id"),
+            )
+        }))
     }
 
     /// Source Telegram chat of the most recent Telegram inbound dispatch that
@@ -2009,7 +2021,9 @@ const SCHEMA: &[&str] = &[
          result_json TEXT,
          created_ms INTEGER NOT NULL,
          updated_ms INTEGER NOT NULL,
-         telegram_chat_id INTEGER
+         telegram_chat_id INTEGER,
+         telegram_message_id INTEGER,
+         telegram_thread_id INTEGER
        )"#,
     "CREATE UNIQUE INDEX IF NOT EXISTS dispatches_idempotency_idx ON dispatches(sender, kind, idempotency_key) WHERE idempotency_key IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS dispatches_sender_idx ON dispatches(sender, created_ms DESC)",
