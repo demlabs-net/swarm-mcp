@@ -95,6 +95,8 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         state_db_path: state_db_path.to_path_buf(),
         db_max_connections: 4,
         db_busy_timeout: Duration::from_secs(2),
+        operator_hold: false,
+        quarantine_on_start: false,
         activity_enabled: true,
         activity_retention_days: 30,
         activity_history_limit: 50,

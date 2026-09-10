@@ -717,10 +717,34 @@ impl TelegramGateway {
                     }
                     bail!("Telegram target is busy; update retained for retry");
                 }
-                self.queued_notices
-                    .lock()
-                    .expect("Telegram queue notice lock")
-                    .remove(&update_id);
+                let transport_queued = outcome
+                    .value
+                    .get("results")
+                    .and_then(Value::as_object)
+                    .is_some_and(|results| {
+                        results.values().any(|result| {
+                            result.get("queued").and_then(Value::as_bool) == Some(true)
+                        })
+                    });
+                if transport_queued {
+                    let first_notice = self
+                        .queued_notices
+                        .lock()
+                        .expect("Telegram queue notice lock")
+                        .insert(update_id);
+                    if first_notice {
+                        let notice = "⏳ Запрос сохранён и ждёт восстановления менеджера. Отвечу автоматически; повторять сообщение не нужно.";
+                        if let Err(error) = self.send_text(message.chat.id, notice, thread_id).await
+                        {
+                            warn!(error = %error, "send Telegram durable queue notice failed");
+                        }
+                    }
+                } else {
+                    self.queued_notices
+                        .lock()
+                        .expect("Telegram queue notice lock")
+                        .remove(&update_id);
+                }
                 let audit_queued = outcome
                     .value
                     .pointer("/telegram/queued")
@@ -1737,7 +1761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_target_retains_update_and_sends_one_queue_notice() -> anyhow::Result<()> {
+    async fn busy_target_durably_queues_update_and_sends_one_notice() -> anyhow::Result<()> {
         let sent = Arc::new(Mutex::new(Vec::<String>::new()));
         let (gateway, store, path) = gateway_with_mocks_and_hermes(
             TelegramBacklogMode::Process,
@@ -1746,36 +1770,37 @@ mod tests {
         )
         .await?;
 
-        let first = gateway.poll_once().await;
-        assert!(
-            first.is_err(),
-            "busy target must retain the Telegram update"
-        );
+        gateway.poll_once().await?;
         assert_eq!(
             store.telegram_update_offset().await?,
-            None,
-            "the durable offset must not advance before target admission"
+            Some(6),
+            "the update advances only after its wake is durably queued"
         );
         let status: String =
             sqlx::query_scalar("SELECT status FROM dispatches WHERE id='telegram_5'")
                 .fetch_one(store.pool())
                 .await?;
-        assert_eq!(status, "failed", "the failed reservation is retryable");
+        assert_eq!(status, "accepted", "the durable wake is accepted");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE dispatch_id='telegram_5' AND status='pending'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(pending, 1, "the busy role wake must survive in the FIFO");
         let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_outbox")
             .fetch_one(store.pool())
             .await?;
         assert_eq!(
-            outbox, 0,
-            "transient queue pressure must not spam the shared audit group"
+            outbox, 1,
+            "the accepted group command has one normal audit record"
         );
         assert_eq!(sent.lock().expect("sent").len(), 1);
         assert!(
-            sent.lock().expect("sent")[0].contains("ждёт свободного слота"),
+            sent.lock().expect("sent")[0].contains("ждёт восстановления менеджера"),
             "operator receives a queue notice"
         );
 
-        let second = gateway.poll_once().await;
-        assert!(second.is_err());
+        gateway.poll_once().await?;
         assert_eq!(
             sent.lock().expect("sent").len(),
             1,
@@ -2470,7 +2495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_retry_reuses_already_downloaded_attachments() -> anyhow::Result<()> {
+    async fn busy_target_durably_queues_already_downloaded_attachments() -> anyhow::Result<()> {
         let mut update = allowed_update();
         update["message"]["text"] = Value::Null;
         update["message"]["document"] = json!({
@@ -2488,8 +2513,8 @@ mod tests {
                 let mut calls = calls.lock().expect("calls");
                 calls.push(1);
                 if calls.len() == 1 {
-                    // Первая попытка: получатель занят → gateway откатится и
-                    // повторит обработку того же update.
+                    // Получатель занят: wake и уже скачанное вложение должны
+                    // сохраниться в durable delivery FIFO без повторного poll.
                     (429, json!({"error": "busy"}))
                 } else {
                     (202, json!({"run_id": "run-1"}))
@@ -2500,10 +2525,23 @@ mod tests {
         let inbound_dir = gateway.state.config.shared_files_dir.clone();
         let _ = std::fs::remove_dir_all(&inbound_dir);
         std::fs::create_dir_all(&inbound_dir)?;
-        assert!(gateway.poll_once().await.is_err(), "busy попытка");
-        assert_eq!(store.telegram_update_offset().await?, None);
         gateway.poll_once().await?;
         assert_eq!(store.telegram_update_offset().await?, Some(6));
+        gateway.poll_once().await?;
+        assert_eq!(
+            hermes_calls.lock().expect("calls").len(),
+            1,
+            "durably queued update is not dispatched again by Telegram polling"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE dispatch_id='telegram_5' AND status='pending'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(
+            pending, 1,
+            "attachment wake is retained in the durable FIFO"
+        );
         let files = std::fs::read_dir(&inbound_dir)?;
         let names: Vec<_> = files
             .flatten()
@@ -2512,7 +2550,7 @@ mod tests {
         assert_eq!(
             names.len(),
             1,
-            "вложение скачано один раз, несмотря на retry: {names:?}"
+            "вложение скачано один раз и сохранено для queued wake: {names:?}"
         );
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&inbound_dir);

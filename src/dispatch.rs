@@ -1042,10 +1042,15 @@ impl Dispatcher {
         }
         if let Err(error) = self
             .store
-            .set_dispatch_telegram_chat(&dispatch_id, args.chat_id)
+            .set_dispatch_telegram_source(
+                &dispatch_id,
+                args.chat_id,
+                args.message_id,
+                args.thread_id,
+            )
             .await
         {
-            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source chat failed");
+            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source failed");
         }
         if let Err(error) = self
             .store
@@ -1080,8 +1085,15 @@ impl Dispatcher {
             );
             let result = match body {
                 Ok(body) => {
-                    self.dispatch_role(target, &body, &self.config.telegram_inbound_instructions)
-                        .await
+                    self.dispatch_role_or_queue(
+                        &dispatch_id,
+                        &manager,
+                        "telegram_inbound",
+                        target,
+                        &body,
+                        &self.config.telegram_inbound_instructions,
+                    )
+                    .await
                 }
                 Err(error) => Err(RunFailure::rejected(error)),
             };
@@ -1335,6 +1347,9 @@ impl Dispatcher {
     }
 
     async fn flush_delivery_queue(&self) -> anyhow::Result<()> {
+        if self.config.operator_hold {
+            return Ok(());
+        }
         for item in self
             .store
             .due_deliveries(self.config.outbox_batch_size)
@@ -1359,6 +1374,47 @@ impl Dispatcher {
                         ),
                     };
                     self.store.mark_delivery_delivered(&item.id, run_id).await?;
+                    if item.kind == "telegram_inbound"
+                        && let Some(run_id) = run_id
+                    {
+                        match self
+                            .store
+                            .telegram_reply_target_for_dispatch(&item.dispatch_id)
+                            .await
+                        {
+                            Ok(Some((chat_id, message_id, thread_id))) => {
+                                if let Err(error) = self
+                                    .store
+                                    .track_run_reply(
+                                        run_id,
+                                        &item.recipient,
+                                        chat_id,
+                                        message_id,
+                                        thread_id,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        queue_id = %item.id,
+                                        run_id,
+                                        error = %error,
+                                        "tracking delayed Telegram run reply failed"
+                                    );
+                                }
+                            }
+                            Ok(None) => warn!(
+                                queue_id = %item.id,
+                                dispatch_id = %item.dispatch_id,
+                                "delayed Telegram delivery has no source chat"
+                            ),
+                            Err(error) => warn!(
+                                queue_id = %item.id,
+                                dispatch_id = %item.dispatch_id,
+                                error = %error,
+                                "reading delayed Telegram source chat failed"
+                            ),
+                        }
+                    }
                     info!(
                         queue_id = %item.id,
                         dispatch_id = %item.dispatch_id,
@@ -1944,6 +2000,11 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<DispatchHandle, RunFailure> {
+        if self.config.operator_hold {
+            return Err(RunFailure::rejected(anyhow!(
+                "operator hold is active; fresh operator authorization is required"
+            )));
+        }
         let role_gate = self.role_delivery_gate(role).await;
         let _role_guard = role_gate.lock().await;
         if self
@@ -2040,6 +2101,11 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<DispatchHandle, RunFailure> {
+        if self.config.operator_hold {
+            return Err(RunFailure::rejected(anyhow!(
+                "operator hold is active; executor initiation is disabled"
+            )));
+        }
         let agent = self
             .config
             .agents
@@ -2099,9 +2165,7 @@ impl Dispatcher {
             }))
             .send()
             .await
-            .map_err(|error| {
-                RunFailure::indeterminate(anyhow!("openai initiate to {}: {error}", agent.role))
-            })?;
+            .map_err(|error| role_transport_failure("openai initiate", &agent.role, error))?;
         if !response.status().is_success() {
             let status = response.status();
             return Err(RunFailure::rejected(anyhow!(
@@ -2147,9 +2211,7 @@ impl Dispatcher {
             }))
             .send()
             .await
-            .map_err(|error| {
-                RunFailure::indeterminate(anyhow!("dispatch run to {role}: {error}"))
-            })?;
+            .map_err(|error| role_transport_failure("dispatch run", role, error))?;
         if response.status() != reqwest::StatusCode::ACCEPTED {
             let status = response.status();
             let retry_after_seconds = response
@@ -2690,6 +2752,20 @@ fn telegram_status_is_retryable(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
+/// A TCP/DNS/connect failure happens before the role can observe the request,
+/// so it is safe to retain the wake in the durable FIFO. Timeouts and body
+/// errors remain indeterminate because the remote gateway may already have
+/// accepted the run.
+fn role_transport_failure(action: &str, role: &str, error: reqwest::Error) -> RunFailure {
+    let is_connect = error.is_connect();
+    let failure = anyhow!("{action} to {role}: {error}");
+    if is_connect {
+        RunFailure::retryable(failure, 1)
+    } else {
+        RunFailure::indeterminate(failure)
+    }
+}
+
 pub fn parse_arguments<T: for<'de> Deserialize<'de>>(
     arguments: Option<Map<String, Value>>,
 ) -> Result<T, ToolOutcome> {
@@ -2993,6 +3069,31 @@ mod tests {
         let store = Store::connect(&config).await?;
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
         Ok((dispatcher, store, path))
+    }
+
+    #[tokio::test]
+    async fn operator_hold_blocks_initiation_and_restart_retires_old_wakes() -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes = Arc::new(|_, _| panic!("held work must never reach Hermes"));
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        let mut config = (*dispatcher.config).clone();
+        config.operator_hold = true;
+        let held = Dispatcher::new(Arc::new(config.clone()), store.clone())?;
+        held.queue_role_delivery("old", "manager", "dispatch_to", "developer", "old order", "opaque", Duration::ZERO, "busy").await?;
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0").execute(store.pool()).await?;
+        held.flush_delivery_queue().await?;
+        assert!(store.has_pending_delivery("developer").await?);
+        assert!(held.dispatch_role("developer", "new order", "opaque").await.is_err());
+        assert!(held.dispatch_role_or_queue("new", "manager", "dispatch_to", "developer", "new order", "opaque").await.is_err());
+        let ordinary_restart = Store::connect(&config).await?;
+        assert!(ordinary_restart.has_pending_delivery("developer").await?);
+        config.operator_hold = false;
+        config.quarantine_on_start = true;
+        let restarted = Store::connect(&config).await?;
+        assert!(!restarted.has_pending_delivery("developer").await?);
+        let retained: (String, String) = sqlx::query_as("SELECT status,body FROM delivery_outbox WHERE id='delivery_old_developer'").fetch_one(restarted.pool()).await?;
+        assert_eq!(retained, ("cancelled".to_string(), "old order".to_string()));
+        testutil::remove_db_files(&path).await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3588,6 +3689,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_hermes_role_is_accepted_into_durable_fifo() -> anyhow::Result<()> {
+        let path = testutil::temp_db_path("dispatch-unavailable");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let unavailable = format!("http://{}", listener.local_addr()?);
+        drop(listener);
+
+        let mut config = testutil::fixture_config(&path);
+        config.api_timeout = Duration::from_secs(1);
+        for agent in config.agents.values_mut() {
+            agent.api_url = Some(unavailable.parse()?);
+        }
+        let config = Arc::new(config);
+        let store = Store::connect(&config).await?;
+        let dispatcher = Dispatcher::new(config, store.clone())?;
+
+        let outcome = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "wake after maintenance".to_string(),
+                    correlation_id: Some("task_after_maintenance".to_string()),
+                    idempotency_key: Some("wake-after-maintenance".to_string()),
+                },
+            )
+            .await;
+
+        assert!(
+            !outcome.is_error,
+            "connect failure must be queued: {}",
+            outcome.value
+        );
+        assert_eq!(outcome.value["queued"], json!(true));
+        assert_eq!(outcome.value["queue_position"], json!(1));
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_outbox WHERE status='pending' AND recipient='developer'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(pending, 1);
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn busy_delivery_queue_exposes_only_one_fifo_head_per_role() -> anyhow::Result<()> {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_clone = calls.clone();
@@ -4143,6 +4290,75 @@ mod tests {
             .fetch_one(store.pool())
             .await?;
         assert_eq!(outbox, 1, "one audit entry for the accepted update");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_inbound_busy_role_is_durable_and_tracks_delayed_reply() -> anyhow::Result<()>
+    {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (dispatcher, store, path) = dispatcher_with_telegram(Arc::new(move |_, _| {
+            if calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (429, json!({"error": "role busy"}))
+            } else {
+                (202, json!({"run_id": "run-delayed-telegram"}))
+            }
+        }))
+        .await?;
+
+        let outcome = dispatcher
+            .telegram_inbound(TelegramInboundArgs {
+                update_id: 8,
+                message_id: 103,
+                user_id: 42,
+                username: "alice".to_string(),
+                message: "queue this during maintenance".to_string(),
+                targets: vec!["developer".to_string()],
+                chat_id: 424_242,
+                reply_message_id: None,
+                reply_quote: None,
+                thread_id: Some(17),
+            })
+            .await;
+
+        assert!(
+            !outcome.is_error,
+            "queueing must accept inbound: {outcome:?}"
+        );
+        assert_eq!(outcome.value["results"]["developer"]["queued"], json!(true));
+        let queue_id = outcome.value["results"]["developer"]["queue_id"]
+            .as_str()
+            .expect("queue id")
+            .to_string();
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0 WHERE id=?")
+            .bind(&queue_id)
+            .execute(store.pool())
+            .await?;
+
+        dispatcher.flush_delivery_queue().await?;
+
+        let delivered: (String, Option<String>) =
+            sqlx::query_as("SELECT status, run_id FROM delivery_outbox WHERE id=?")
+                .bind(&queue_id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(delivered.1.as_deref(), Some("run-delayed-telegram"));
+        let replies = store.due_run_replies().await?;
+        assert!(
+            replies
+                .iter()
+                .any(|(run_id, role, chat_id, message_id, thread_id, _)| {
+                    run_id == "run-delayed-telegram"
+                        && role == "developer"
+                        && *chat_id == 424_242
+                        && *message_id == Some(103)
+                        && *thread_id == Some(17)
+                })
+        );
+
         testutil::remove_db_files(&path).await;
         Ok(())
     }

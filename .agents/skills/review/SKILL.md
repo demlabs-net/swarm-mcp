@@ -43,7 +43,7 @@ States: `pending` → `accepted | partial | failed | indeterminate` (recovery pa
 
 ## 3. Store & migrations
 
-- `store.rs::migrate` is transactional, uses `PRAGMA user_version` (`SCHEMA_VERSION = 6`), refuses newer schemas, and migrates legacy Python tables (`*_python_legacy`) by rename+import. Any schema change: bump `SCHEMA_VERSION`, add a statement to `SCHEMA` or an idempotent `ALTER`/`has_column` guard, and keep it idempotent for fresh and existing DBs.
+- `store.rs::migrate` is transactional, uses `PRAGMA user_version` (`SCHEMA_VERSION = 8`), refuses newer schemas, and migrates legacy Python tables (`*_python_legacy`) by rename+import. Any schema change: bump `SCHEMA_VERSION`, add a statement to `SCHEMA` or an idempotent `ALTER`/`has_column` guard, and keep it idempotent for fresh and existing DBs.
 - `role_messaging` is fail-open only for an absent row (the normal pre-control default). Store read errors fail closed in dispatch. Disable/clear must cancel undelivered Telegram audits and role wakes involving the role in either direction; enabling must never revive `cancelled` rows. With `clear_queue=false`, preserved rows must be excluded from due batches while either endpoint is disabled and become eligible only after re-enable.
 - `delivery_outbox.sequence` is the recipient FIFO order; wall-clock time and
   UUID lexical order must never choose the head. At most one due head per
