@@ -284,6 +284,7 @@ Important groups:
 | Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_DISPATCH_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
 | Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_KIND` (`hermes`/`openai`/`mcp`), `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY`, `<ROLE>_API_MODEL` |
 | Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS` |
+| Operator fence | `SWARM_OPERATOR_HOLD` (default **true** — no run is initiated, Telegram inbound answers with a hold notice, durable wakes stay queued; inspection and outbound replies keep working), `SWARM_QUARANTINE_ON_START` (default false — when true, a startup retires every `pending`/`dead` wake as `cancelled`; ordinary restarts preserve the FIFO) |
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |
 | Activity | `SWARM_ACTIVITY_ENABLED`, `SWARM_ACTIVITY_ROUTES`, `SWARM_ACTIVITY_CLOCK_SKEW_SECONDS`, `SWARM_ACTIVITY_*` |

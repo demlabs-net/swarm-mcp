@@ -119,11 +119,19 @@ impl Store {
     }
 
     async fn retire_restart_backlog(&self) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query("INSERT OR IGNORE INTO service_state (key,value_int,updated_ms) VALUES ('operator_quarantine_v1',1,?)")
+            .bind(Utc::now().timestamp_millis()).execute(&mut *tx).await?.rows_affected();
+        if claimed == 0 {
+            tx.commit().await?;
+            return Ok(0);
+        }
         let result = sqlx::query(
-            "UPDATE delivery_outbox SET status='cancelled', last_error='operator safety: pre-start wake retired; fresh authorization required' WHERE status IN ('pending','dead')",
+            "UPDATE delivery_outbox SET status='cancelled', last_error='operator safety quarantine_v1: pre-start wake retired; fresh authorization required' WHERE status IN ('pending','dead')",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
