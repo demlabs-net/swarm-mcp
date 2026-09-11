@@ -127,29 +127,62 @@ impl Store {
         )
         .await?;
         store.generation = config.delivery_generation.clone();
-        store.configure_generation(config.quarantine_on_start).await?;
+        store
+            .configure_generation(config.quarantine_on_start)
+            .await?;
         store.recover_pending_dispatches().await?;
         Ok(store)
     }
 
     /// Local operator action only: never exposed as an MCP tool.
-    pub async fn rotate_delivery_generation(config: &Config, expected: Option<&str>) -> anyhow::Result<()> {
-        ensure!(config.operator_hold, "generation rotation requires SWARM_OPERATOR_HOLD=true");
-        let next = config.delivery_generation.as_deref().context("configure a new SWARM_DELIVERY_GENERATION")?;
-        ensure!(Some(next) != expected, "rotation requires a fresh incident token");
-        let store = Self::connect_path(&config.state_db_path, config.db_max_connections, config.db_busy_timeout).await?;
+    pub async fn rotate_delivery_generation(
+        config: &Config,
+        expected: Option<&str>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            config.operator_hold,
+            "generation rotation requires SWARM_OPERATOR_HOLD=true"
+        );
+        let next = config
+            .delivery_generation
+            .as_deref()
+            .context("configure a new SWARM_DELIVERY_GENERATION")?;
+        ensure!(
+            Some(next) != expected,
+            "rotation requires a fresh incident token"
+        );
+        let store = Self::connect_path(
+            &config.state_db_path,
+            config.db_max_connections,
+            config.db_busy_timeout,
+        )
+        .await?;
         store.rotate_generation(expected, next).await
     }
 
     async fn rotate_generation(&self, expected: Option<&str>, next: &str) -> anyhow::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let changed = sqlx::query("UPDATE delivery_control SET generation=? WHERE id=1 AND generation IS ?")
-            .bind(next).bind(expected).execute(&mut *tx).await?.rows_affected();
-        ensure!(changed == 1, "operator generation CAS mismatch; startup cannot rotate");
-        let used = sqlx::query("INSERT OR IGNORE INTO delivery_generation_history(generation) VALUES (?)")
-            .bind(next).execute(&mut *tx).await?.rows_affected();
+        let changed =
+            sqlx::query("UPDATE delivery_control SET generation=? WHERE id=1 AND generation IS ?")
+                .bind(next)
+                .bind(expected)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        ensure!(
+            changed == 1,
+            "operator generation CAS mismatch; startup cannot rotate"
+        );
+        let used =
+            sqlx::query("INSERT OR IGNORE INTO delivery_generation_history(generation) VALUES (?)")
+                .bind(next)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
         ensure!(used == 1, "operator incident token was already used");
-        sqlx::query("UPDATE dispatches SET generation_revoked=1").execute(&mut *tx).await?;
+        sqlx::query("UPDATE dispatches SET generation_revoked=1")
+            .execute(&mut *tx)
+            .await?;
         Self::preserve_revoked_keys(&mut tx).await?;
         sqlx::query("UPDATE delivery_outbox SET status='cancelled',last_error='operator generation rotation' WHERE status IN ('pending','dead')").execute(&mut *tx).await?;
         tx.commit().await?;
@@ -162,27 +195,47 @@ impl Store {
         let rows = sqlx::query("SELECT sender,kind,idempotency_key FROM dispatches WHERE generation_revoked=1 AND idempotency_key IS NOT NULL")
             .fetch_all(&mut **tx).await?;
         for row in rows {
-            let hash = Self::key_hash(row.get("sender"), row.get("kind"), row.get("idempotency_key"));
-            sqlx::query("INSERT OR IGNORE INTO revoked_delivery_keys(key_hash) VALUES (?)").bind(hash).execute(&mut **tx).await?;
+            let hash = Self::key_hash(
+                row.get("sender"),
+                row.get("kind"),
+                row.get("idempotency_key"),
+            );
+            sqlx::query("INSERT OR IGNORE INTO revoked_delivery_keys(key_hash) VALUES (?)")
+                .bind(hash)
+                .execute(&mut **tx)
+                .await?;
         }
         Ok(())
     }
 
     fn key_hash(sender: &str, kind: &str, key: &str) -> Vec<u8> {
         let mut hash = Sha256::new();
-        for part in [sender, kind, key] { hash.update(part.len().to_be_bytes()); hash.update(part.as_bytes()); }
+        for part in [sender, kind, key] {
+            hash.update(part.len().to_be_bytes());
+            hash.update(part.as_bytes());
+        }
         hash.finalize().to_vec()
     }
 
     async fn configure_generation(&self, quarantine: bool) -> anyhow::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("INSERT INTO delivery_control(id,generation) VALUES (1,?) ON CONFLICT(id) DO NOTHING")
-            .bind(&self.generation).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO delivery_control(id,generation) VALUES (1,?) ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&self.generation)
+        .execute(&mut *tx)
+        .await?;
         self.check_generation(&mut tx).await?;
         if let Some(generation) = &self.generation {
-            sqlx::query("INSERT OR IGNORE INTO delivery_generation_history(generation) VALUES (?)").bind(generation).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO delivery_generation_history(generation) VALUES (?)")
+                .bind(generation)
+                .execute(&mut *tx)
+                .await?;
         }
-        sqlx::query("UPDATE dispatches SET generation_revoked=1 WHERE generation IS NOT ?").bind(&self.generation).execute(&mut *tx).await?;
+        sqlx::query("UPDATE dispatches SET generation_revoked=1 WHERE generation IS NOT ?")
+            .bind(&self.generation)
+            .execute(&mut *tx)
+            .await?;
         // NULL remains legacy, never silently relabel historical work as current.
         sqlx::query("UPDATE delivery_outbox SET status='cancelled',last_error='stale operator delivery generation' WHERE status IN ('pending','dead') AND generation IS NOT ?")
             .bind(&self.generation).execute(&mut *tx).await?;
@@ -216,7 +269,8 @@ impl Store {
         let active: Option<String> =
             sqlx::query_scalar("SELECT generation FROM delivery_control WHERE id=1")
                 .fetch_optional(&mut **tx)
-                .await?.flatten();
+                .await?
+                .flatten();
         ensure!(
             active == self.generation,
             "stale operator delivery generation"
@@ -227,6 +281,17 @@ impl Store {
     pub async fn delivery_generation_current(&self) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         self.check_generation(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn consume_telegram_inputs(&self, ids: &[i64]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_generation(&mut tx).await?;
+        for id in ids {
+            sqlx::query("INSERT INTO telegram_input_generation(update_id,generation,consumed) VALUES (?,?,1) ON CONFLICT(update_id) DO UPDATE SET consumed=1")
+                .bind(id).bind(&self.generation).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -402,8 +467,14 @@ impl Store {
             sqlx::query("ALTER TABLE telegram_input_generation ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0").execute(&mut *tx).await?;
         }
         sqlx::query("CREATE TRIGGER IF NOT EXISTS stamp_telegram_outbox_generation AFTER INSERT ON telegram_outbox BEGIN UPDATE telegram_outbox SET generation=(SELECT generation FROM delivery_control WHERE id=1) WHERE id=NEW.id; END").execute(&mut *tx).await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS revoked_delivery_keys(key_hash BLOB PRIMARY KEY)").execute(&mut *tx).await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS delivery_generation_history(generation TEXT PRIMARY KEY)").execute(&mut *tx).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS revoked_delivery_keys(key_hash BLOB PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS delivery_generation_history(generation TEXT PRIMARY KEY)",
+        )
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("INSERT OR IGNORE INTO delivery_generation_history SELECT generation FROM delivery_control WHERE generation IS NOT NULL").execute(&mut *tx).await?;
         Self::import_python_activity_tables(&mut tx).await?;
         sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -816,9 +887,15 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         self.check_generation(&mut tx).await?;
         if let Some(key) = idempotency_key {
-            let revoked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM revoked_delivery_keys WHERE key_hash=?")
-                .bind(Self::key_hash(sender, kind, key)).fetch_one(&mut *tx).await?;
-            ensure!(revoked == 0, "revoked delivery idempotency key requires fresh authorization");
+            let revoked: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM revoked_delivery_keys WHERE key_hash=?")
+                    .bind(Self::key_hash(sender, kind, key))
+                    .fetch_one(&mut *tx)
+                    .await?;
+            ensure!(
+                revoked == 0,
+                "revoked delivery idempotency key requires fresh authorization"
+            );
             let stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches WHERE sender=? AND kind=? AND idempotency_key=? AND (generation IS NOT ? OR generation_revoked=1)")
                 .bind(sender).bind(kind).bind(key).bind(&self.generation).fetch_one(&mut *tx).await?;
             ensure!(
@@ -2351,6 +2428,128 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn stale_restart_cannot_rotate_and_revoked_keys_survive_retention() -> anyhow::Result<()>
+    {
+        let path = std::env::temp_dir().join(format!("swarm-cas-{}.db", Uuid::new_v4()));
+        let mut config = crate::testutil::fixture_config(&path);
+        config.delivery_generation = Some("a".into());
+        let a = Store::connect(&config).await?;
+        a.reserve_dispatch(
+            "old",
+            "manager",
+            "wake",
+            &["developer".into()],
+            Some("retained-key"),
+            "opaque",
+            100,
+            Duration::from_secs(60),
+        )
+        .await?;
+        config.delivery_generation = Some("b".into());
+        assert!(Store::connect(&config).await.is_err(), "env cannot rotate");
+        assert!(
+            Store::rotate_delivery_generation(&config, Some("a"))
+                .await
+                .is_err(),
+            "hold required"
+        );
+        config.operator_hold = true;
+        assert!(
+            Store::rotate_delivery_generation(&config, Some("wrong"))
+                .await
+                .is_err()
+        );
+        Store::rotate_delivery_generation(&config, Some("a")).await?;
+        let b = Store::connect(&config).await?;
+        b.reserve_dispatch(
+            "current",
+            "manager",
+            "wake",
+            &["developer".into()],
+            Some("current-key"),
+            "current",
+            100,
+            Duration::from_secs(60),
+        )
+        .await?;
+        b.enqueue_delivery(
+            &DeliveryQueueItem {
+                id: "current-q".into(),
+                dispatch_id: "current".into(),
+                sender: "manager".into(),
+                kind: "wake".into(),
+                recipient: "developer".into(),
+                body: "opaque".into(),
+                instructions: "opaque".into(),
+                attempts: 0,
+            },
+            Duration::from_secs(1),
+            "busy",
+        )
+        .await?;
+        config.delivery_generation = Some("a".into());
+        assert!(
+            Store::connect(&config).await.is_err(),
+            "stale startup cannot takeover"
+        );
+        assert!(
+            Store::rotate_delivery_generation(&config, Some("b"))
+                .await
+                .is_err(),
+            "old token cannot be reused"
+        );
+        b.delivery_generation_current().await?;
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0")
+            .execute(b.pool())
+            .await?;
+        assert!(b.delivery_eligible("current-q").await?);
+        sqlx::query(
+            "UPDATE dispatches SET status='failed',created_ms=0,updated_ms=0 WHERE id='old'",
+        )
+        .execute(b.pool())
+        .await?;
+        b.cleanup(1, 1, 1, Duration::from_secs(60), Duration::from_secs(300))
+            .await?;
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches WHERE id='old'")
+            .fetch_one(b.pool())
+            .await?;
+        assert_eq!(remaining, 0);
+        assert!(
+            b.reserve_dispatch(
+                "resurrection",
+                "manager",
+                "wake",
+                &["developer".into()],
+                Some("retained-key"),
+                "opaque",
+                100,
+                Duration::from_secs(60)
+            )
+            .await
+            .is_err()
+        );
+        b.observe_telegram_inputs(&[11, 12, 13]).await?;
+        b.consume_telegram_inputs(&[11, 12, 13]).await?;
+        b.advance_telegram_update_offset(12).await?;
+        config.delivery_generation = Some("b".into());
+        config.operator_hold = false;
+        let resumed = Store::connect(&config).await?;
+        assert_eq!(
+            resumed.claim_telegram_input(12).await?,
+            TelegramClaim::AlreadyConsumed
+        );
+        assert_eq!(
+            resumed.claim_telegram_input(13).await?,
+            TelegramClaim::AlreadyConsumed
+        );
+        a.pool.close().await;
+        b.pool.close().await;
+        resumed.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn operator_generations_fence_replay_and_preserve_same_epoch_fifo() -> anyhow::Result<()>
     {
         let path = std::env::temp_dir().join(format!("swarm-epoch-{}.db", uuid::Uuid::new_v4()));
@@ -2437,7 +2636,9 @@ mod tests {
         assert!(store.delivery_eligible("q-new").await?);
         assert_eq!(store.due_deliveries(10).await?.len(), 1);
         let old_process = store.clone();
-        store.rotate_generation(Some("incident-a"), "incident-b").await?;
+        store
+            .rotate_generation(Some("incident-a"), "incident-b")
+            .await?;
         store.generation = Some("incident-b".into());
         store.configure_generation(true).await?;
         assert!(old_process.delivery_generation_current().await.is_err());
@@ -2730,7 +2931,7 @@ mod tests {
             .await?;
         store.pool.close().await;
 
-        let recovered = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let recovered = Store::connect(&crate::testutil::fixture_config(&path)).await?;
         let (status, result_json): (String, String) =
             sqlx::query_as("SELECT status,result_json FROM dispatches WHERE id='recover_dispatch'")
                 .fetch_one(recovered.pool())
@@ -2790,7 +2991,7 @@ mod tests {
             .await?;
         store.pool.close().await;
 
-        let recovered = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let recovered = Store::connect(&crate::testutil::fixture_config(&path)).await?;
         let (status, result_json): (String, String) = sqlx::query_as(
             "SELECT status,result_json FROM dispatches WHERE id='partial_recover_dispatch'",
         )

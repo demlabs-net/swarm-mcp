@@ -16,6 +16,17 @@ struct Cli {
 enum Command {
     /// Run the role-aware MCP HTTP server.
     Serve,
+    /// Rotate the durable delivery incident while operator HOLD is configured.
+    GenerationRotate {
+        #[arg(
+            long,
+            required_unless_present = "expected_legacy",
+            conflicts_with = "expected_legacy"
+        )]
+        expected_generation: Option<String>,
+        #[arg(long)]
+        expected_legacy: bool,
+    },
     /// Verify tool/resource catalogs and cross-role token isolation.
     Probe {
         /// HTTP origin of the running server. Defaults to loopback and `SWARM_MCP_PORT`.
@@ -53,6 +64,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Command::Serve => {
                     let state = Arc::new(AppState::initialize((*config).clone()).await?);
                     http::serve(state).await
+                }
+                Command::GenerationRotate {
+                    expected_generation,
+                    ..
+                } => {
+                    swarm_mcp::store::Store::rotate_delivery_generation(
+                        &config,
+                        expected_generation.as_deref(),
+                    )
+                    .await
                 }
                 Command::Probe { base_url } => run_probe(config, base_url).await,
                 Command::ActivityProbe { base_url } => run_activity_probe(config, base_url).await,

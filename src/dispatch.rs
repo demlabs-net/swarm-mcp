@@ -2155,10 +2155,15 @@ impl Dispatcher {
             .api_model
             .clone()
             .unwrap_or_else(|| self.config.hermes_model_alias.clone());
-        let response = self
-            .hermes_client
-            .post(&url)
-            .bearer_auth(api_key.expose())
+        self.store
+            .delivery_generation_current()
+            .await
+            .map_err(RunFailure::rejected)?;
+        let mut request = self.hermes_client.post(&url).bearer_auth(api_key.expose());
+        if let Some(generation) = &self.config.delivery_generation {
+            request = request.header("X-Hermes-Operator-Generation", generation);
+        }
+        let response = request
             .json(&json!({
                 "model": model,
                 "messages": [

@@ -319,6 +319,21 @@ token/endpoint combination. `activity-probe` checks every configured route and
 also proves the event is absent from non-target authority resources. Neither
 probe invokes an agent tool.
 
+Operator incident rotation is a local, CAS-guarded command — never an MCP tool,
+and it requires `SWARM_OPERATOR_HOLD=true` plus a fresh token in
+`SWARM_DELIVERY_GENERATION`:
+
+```bash
+swarm-mcp generation-rotate --expected-generation "$OLD_TOKEN"   # or --expected-legacy
+```
+
+It changes the persisted epoch only if the expected one still matches, records
+the new token in `delivery_generation_history` (one token is used once), revokes
+in-flight dispatches, preserves their idempotency keys in `revoked_delivery_keys`
+so a revoked key can never be replayed, and retires pending/dead wakes. Watchdog
+checks read `delivery_generation_current`, so a process left on the old epoch
+fails closed instead of publishing stale work.
+
 ## Docker
 
 Перед сборкой runtime-образа создайте пакет из текущего checkout:
