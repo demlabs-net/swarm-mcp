@@ -2106,6 +2106,10 @@ impl Dispatcher {
                 "operator hold is active; executor initiation is disabled"
             )));
         }
+        self.store
+            .delivery_generation_current()
+            .await
+            .map_err(RunFailure::rejected)?;
         let agent = self
             .config
             .agents
@@ -2199,11 +2203,16 @@ impl Dispatcher {
             .await
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is saturated")))?
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is shutting down")))?;
+        self.store
+            .delivery_generation_current()
+            .await
+            .map_err(RunFailure::rejected)?;
         let url = format!("{}/v1/runs", api_url.as_str().trim_end_matches('/'));
-        let response = self
-            .hermes_client
-            .post(url)
-            .bearer_auth(api_key.expose())
+        let mut request = self.hermes_client.post(url).bearer_auth(api_key.expose());
+        if let Some(generation) = &self.config.delivery_generation {
+            request = request.header("X-Hermes-Operator-Generation", generation);
+        }
+        let response = request
             .json(&json!({
                 "model": self.config.hermes_model_alias,
                 "input": message,

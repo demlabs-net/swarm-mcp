@@ -557,13 +557,18 @@ impl TelegramGateway {
             .await
             .map_err(|_| anyhow!("Telegram getUpdates request failed"))?;
         let payload = telegram_payload(response).await?;
-        serde_json::from_value(
+        let updates: Vec<TelegramUpdate> = serde_json::from_value(
             payload
                 .get("result")
                 .cloned()
                 .context("Telegram getUpdates result is missing")?,
         )
-        .context("decode Telegram updates")
+        .context("decode Telegram updates")?;
+        self.state
+            .store
+            .observe_telegram_inputs(&updates.iter().map(|u| u.update_id).collect::<Vec<_>>())
+            .await?;
+        Ok(updates)
     }
 
     /// Диспатчит одну единицу входящих сообщений: обычный update либо весь
@@ -577,6 +582,10 @@ impl TelegramGateway {
         messages: &[&TelegramMessage],
         late_album_part: bool,
     ) -> anyhow::Result<()> {
+        if !self.state.store.claim_telegram_input(update_id).await? {
+            // An old observed update is consumed even if a notice cannot be sent.
+            return Ok(());
+        }
         let Some(message) = messages.first() else {
             return Ok(());
         };
@@ -597,6 +606,7 @@ impl TelegramGateway {
             .iter()
             .find_map(|message| message.message_thread_id);
         if self.state.config.operator_hold {
+            self.state.store.consume_telegram_input(update_id).await?;
             if let Err(error) = self.send_text(
                 message.chat.id,
                 "Operator HOLD is active. No agent was started and this message will not be replayed. Inspection remains available; only the operator can resume execution.",

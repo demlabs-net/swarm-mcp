@@ -668,7 +668,9 @@ impl Config {
             db_busy_timeout: seconds(env, "SWARM_DB_BUSY_TIMEOUT_SECONDS")?,
             operator_hold: bool_env(env, "SWARM_OPERATOR_HOLD", true)?,
             quarantine_on_start: bool_env(env, "SWARM_QUARANTINE_ON_START", false)?,
-            delivery_generation: env.get("SWARM_DELIVERY_GENERATION").map(|value| value.trim().to_string()).filter(|value| !value.is_empty()),
+            delivery_generation: env("SWARM_DELIVERY_GENERATION")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             activity_enabled: bool_env(env, "SWARM_ACTIVITY_ENABLED", false)?,
             activity_retention_days: positive(env, "SWARM_ACTIVITY_RETENTION_DAYS")?,
             activity_history_limit: positive(env, "SWARM_ACTIVITY_HISTORY_LIMIT")?,
@@ -782,6 +784,15 @@ impl Config {
             config.max_inflight_dispatches <= 256,
             "SWARM_MAX_INFLIGHT_DISPATCHES must not exceed 256"
         );
+        if let Some(generation) = &config.delivery_generation {
+            ensure!(
+                generation.len() <= 128
+                    && generation
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)),
+                "SWARM_DELIVERY_GENERATION must be a 1..128 character ASCII operator token (letters, digits, -_.:)"
+            );
+        }
         ensure!(
             config.rate_limit <= 10_000,
             "SWARM_DISPATCH_RATE_LIMIT must not exceed 10000"
