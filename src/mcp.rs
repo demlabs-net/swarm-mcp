@@ -336,6 +336,9 @@ impl RoleMcp {
                 "correlation_id": "opaque"
             },
             "safeguards": {
+                "operator_hold": config.operator_hold,
+                "operator_dispatch_allowed": !config.operator_hold,
+                "quarantine_on_start": config.quarantine_on_start,
                 "durable_operations": true,
                 "busy_recipient_delivery_fifo": true,
                 "delivery_fifo_scope": "recipient",
@@ -568,12 +571,18 @@ impl ServerHandler for RoleMcp {
                 )
                 .await
                 .map_err(internal_error)?,
-            "swarm://messaging" => self
-                .state
-                .store
-                .messaging_snapshot(&self.state.config.agent_roles)
-                .await
-                .map_err(internal_error)?,
+            "swarm://messaging" => {
+                let mut snapshot = self
+                    .state
+                    .store
+                    .messaging_snapshot(&self.state.config.agent_roles)
+                    .await
+                    .map_err(internal_error)?;
+                snapshot["operator_hold"] = json!(self.state.config.operator_hold);
+                snapshot["operator_dispatch_allowed"] = json!(!self.state.config.operator_hold);
+                snapshot["quarantine_on_start"] = json!(self.state.config.quarantine_on_start);
+                snapshot
+            }
             _ => unreachable!("resource availability was checked above"),
         };
         let text = serde_json::to_string_pretty(&value).map_err(internal_error)?;

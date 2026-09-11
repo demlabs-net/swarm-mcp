@@ -596,6 +596,17 @@ impl TelegramGateway {
         let thread_id = messages
             .iter()
             .find_map(|message| message.message_thread_id);
+        if self.state.config.operator_hold {
+            if let Err(error) = self.send_text(
+                message.chat.id,
+                "Operator HOLD is active. No agent was started and this message will not be replayed. Inspection remains available; only the operator can resume execution.",
+                thread_id,
+            )
+            .await {
+                warn!(error = %error, "held inbound notice failed; update will still be acknowledged");
+            }
+            return Ok(());
+        }
         // Текст единицы: text/caption каждой части (у альбома подпись обычно
         // на одной из них), склеенные в порядке следования. Сообщения с
         // одними файлами (без текста) тоже обрабатываются.
@@ -2098,6 +2109,38 @@ mod tests {
         )
         .await?;
         gateway.poll_once().await?;
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn held_inbound_is_acknowledged_even_if_notice_fails() -> anyhow::Result<()> {
+        let update = allowed_update();
+        let (mut gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            Arc::new(move |path, _| {
+                if path.ends_with("getUpdates") {
+                    (200, json!({"ok": true, "result": [update.clone()]}), None)
+                } else {
+                    (500, json!({"ok": false}), None)
+                }
+            }),
+        )
+        .await?;
+        let mut config = (*gateway.state.config).clone();
+        config.operator_hold = true;
+        let config = Arc::new(config);
+        gateway.state = Arc::new(AppState {
+            dispatcher: crate::dispatch::Dispatcher::new(config.clone(), store.clone())?,
+            config,
+            store: store.clone(),
+        });
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(count, 0);
         testutil::remove_db_files(&path).await;
         Ok(())
     }

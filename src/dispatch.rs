@@ -1052,6 +1052,13 @@ impl Dispatcher {
         {
             warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source failed");
         }
+        if let Err(error) = self
+            .store
+            .set_dispatch_telegram_thread(&dispatch_id, args.thread_id)
+            .await
+        {
+            warn!(dispatch_id = %dispatch_id, error = %error, "persisting Telegram source thread failed");
+        }
 
         let update_id = args.update_id.to_string();
         let message_id = args.message_id.to_string();
@@ -1340,6 +1347,9 @@ impl Dispatcher {
     }
 
     async fn flush_delivery_queue(&self) -> anyhow::Result<()> {
+        if self.config.operator_hold {
+            return Ok(());
+        }
         for item in self
             .store
             .due_deliveries(self.config.outbox_batch_size)
@@ -1990,6 +2000,11 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<DispatchHandle, RunFailure> {
+        if self.config.operator_hold {
+            return Err(RunFailure::rejected(anyhow!(
+                "operator hold is active; fresh operator authorization is required"
+            )));
+        }
         let role_gate = self.role_delivery_gate(role).await;
         let _role_guard = role_gate.lock().await;
         if self
@@ -2086,6 +2101,11 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<DispatchHandle, RunFailure> {
+        if self.config.operator_hold {
+            return Err(RunFailure::rejected(anyhow!(
+                "operator hold is active; executor initiation is disabled"
+            )));
+        }
         let agent = self
             .config
             .agents
@@ -3049,6 +3069,114 @@ mod tests {
         let store = Store::connect(&config).await?;
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
         Ok((dispatcher, store, path))
+    }
+
+    #[tokio::test]
+    async fn operator_hold_blocks_initiation_and_restart_retires_old_wakes() -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes =
+            Arc::new(|_, _| panic!("held work must never reach Hermes"));
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        let mut config = (*dispatcher.config).clone();
+        config.operator_hold = true;
+        let held = Dispatcher::new(Arc::new(config.clone()), store.clone())?;
+        store
+            .reserve_dispatch(
+                "old",
+                "manager",
+                "dispatch_to",
+                &["developer".to_string()],
+                None,
+                "old-fingerprint",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        held.queue_role_delivery(
+            "old",
+            "manager",
+            "dispatch_to",
+            "developer",
+            "old order",
+            "opaque",
+            Duration::ZERO,
+            "busy",
+        )
+        .await
+        .expect("queue old wake");
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0")
+            .execute(store.pool())
+            .await?;
+        held.flush_delivery_queue().await?;
+        assert!(store.has_pending_delivery("developer").await?);
+        assert!(
+            held.dispatch_role("developer", "new order", "opaque")
+                .await
+                .is_err()
+        );
+        assert!(
+            held.dispatch_role_or_queue(
+                "new",
+                "manager",
+                "dispatch_to",
+                "developer",
+                "new order",
+                "opaque"
+            )
+            .await
+            .is_err()
+        );
+        let ordinary_restart = Store::connect(&config).await?;
+        assert!(ordinary_restart.has_pending_delivery("developer").await?);
+        config.operator_hold = false;
+        config.quarantine_on_start = true;
+        let restarted = Store::connect(&config).await?;
+        assert!(!restarted.has_pending_delivery("developer").await?);
+        let retained: (String, String) = sqlx::query_as(
+            "SELECT status,body FROM delivery_outbox WHERE id='delivery_old_developer'",
+        )
+        .fetch_one(restarted.pool())
+        .await?;
+        assert_eq!(retained, ("cancelled".to_string(), "old order".to_string()));
+        // A consumed quarantine flag must not retire legitimate post-quarantine work.
+        restarted
+            .reserve_dispatch(
+                "fresh",
+                "manager",
+                "dispatch_to",
+                &["developer".to_string()],
+                None,
+                "fresh-fingerprint",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        let fresh = Dispatcher::new(Arc::new(config.clone()), restarted.clone())?;
+        fresh
+            .queue_role_delivery(
+                "fresh",
+                "manager",
+                "dispatch_to",
+                "developer",
+                "fresh order",
+                "opaque",
+                Duration::ZERO,
+                "busy",
+            )
+            .await
+            .expect("queue legitimate wake");
+        let second_restart = Store::connect(&config).await?;
+        assert!(second_restart.has_pending_delivery("developer").await?);
+        let preserved: (String, String) = sqlx::query_as(
+            "SELECT status,body FROM delivery_outbox WHERE id='delivery_fresh_developer'",
+        )
+        .fetch_one(second_restart.pool())
+        .await?;
+        assert_eq!(
+            preserved,
+            ("pending".to_string(), "fresh order".to_string())
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
     }
 
     #[tokio::test]
