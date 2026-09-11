@@ -520,8 +520,16 @@ impl TelegramGateway {
             let late_part = group
                 .as_deref()
                 .is_some_and(|group_id| self.is_late_album_part(group_id));
-            self.process_dispatch_unit(pending[index].update_id, &unit, late_part)
-                .await?;
+            self.process_dispatch_unit(
+                pending[index].update_id,
+                &unit,
+                late_part,
+                &pending[index..run_end]
+                    .iter()
+                    .map(|u| u.update_id)
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
             for update in &pending[index..run_end] {
                 self.state
                     .store
@@ -583,6 +591,7 @@ impl TelegramGateway {
         update_id: i64,
         messages: &[&TelegramMessage],
         late_album_part: bool,
+        unit_ids: &[i64],
     ) -> anyhow::Result<()> {
         match self.state.store.claim_telegram_input(update_id).await? {
             TelegramClaim::Fresh => {}
@@ -620,7 +629,7 @@ impl TelegramGateway {
             .iter()
             .find_map(|message| message.message_thread_id);
         if self.state.config.operator_hold {
-            self.state.store.consume_telegram_input(update_id).await?;
+            self.state.store.consume_telegram_inputs(unit_ids).await?;
             if let Err(error) = self.send_text(
                 message.chat.id,
                 "Operator HOLD is active. No agent was started and this message will not be replayed. Inspection remains available; only the operator can resume execution.",
