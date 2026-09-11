@@ -101,6 +101,10 @@ pub struct Config {
     pub state_db_path: PathBuf,
     pub db_max_connections: u32,
     pub db_busy_timeout: Duration,
+    /// Operator-only safety fence; no model-facing tool may override it.
+    pub operator_hold: bool,
+    /// Explicit operator incident boundary; retire old wakes on this startup only.
+    pub quarantine_on_start: bool,
     pub activity_enabled: bool,
     pub activity_retention_days: i64,
     pub activity_history_limit: i64,
@@ -660,6 +664,8 @@ impl Config {
             state_db_path: PathBuf::from(required(env, "SWARM_STATE_DB_PATH")?),
             db_max_connections: positive(env, "SWARM_DB_MAX_CONNECTIONS")?,
             db_busy_timeout: seconds(env, "SWARM_DB_BUSY_TIMEOUT_SECONDS")?,
+            operator_hold: bool_env(env, "SWARM_OPERATOR_HOLD", true)?,
+            quarantine_on_start: bool_env(env, "SWARM_QUARANTINE_ON_START", false)?,
             activity_enabled: bool_env(env, "SWARM_ACTIVITY_ENABLED", false)?,
             activity_retention_days: positive(env, "SWARM_ACTIVITY_RETENTION_DAYS")?,
             activity_history_limit: positive(env, "SWARM_ACTIVITY_HISTORY_LIMIT")?,
