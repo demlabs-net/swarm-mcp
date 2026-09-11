@@ -13,7 +13,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::{AppState, config::TelegramBacklogMode, dispatch::TelegramInboundArgs};
+use crate::{
+    AppState, config::TelegramBacklogMode, dispatch::TelegramInboundArgs, store::TelegramClaim,
+};
 
 const MAX_TELEGRAM_RESPONSE_BYTES: usize = 1024 * 1024;
 static FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -582,9 +584,21 @@ impl TelegramGateway {
         messages: &[&TelegramMessage],
         late_album_part: bool,
     ) -> anyhow::Result<()> {
-        if !self.state.store.claim_telegram_input(update_id).await? {
-            // An old observed update is consumed even if a notice cannot be sent.
-            return Ok(());
+        match self.state.store.claim_telegram_input(update_id).await? {
+            TelegramClaim::Fresh => {}
+            TelegramClaim::OldEpoch => {
+                // Никогда не теряем сообщение оператора молча: объясняем,
+                // почему запрос не будет обработан.
+                if let Some(message) = messages.first() {
+                    let thread_id = messages.iter().find_map(|m| m.message_thread_id);
+                    let notice = "⚠️ The operator delivery fence changed while this update was queued, so it was NOT processed. Please send the request again.";
+                    if let Err(error) = self.send_text(message.chat.id, notice, thread_id).await {
+                        warn!(error = %error, "old-epoch Telegram input notice failed");
+                    }
+                }
+                return Ok(());
+            }
+            TelegramClaim::AlreadyConsumed => return Ok(()),
         }
         let Some(message) = messages.first() else {
             return Ok(());
@@ -3105,6 +3119,40 @@ mod tests {
         }
         testutil::remove_db_files(&path).await;
         let _ = std::fs::remove_dir_all(&inbound_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_epoch_input_is_not_processed_and_the_operator_is_told() -> anyhow::Result<()> {
+        let updates = json!([allowed_update()]);
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (gateway, store, path) = gateway_with_mocks(
+            TelegramBacklogMode::Process,
+            canned_bot(updates, sent.clone()),
+        )
+        .await?;
+        // Апдейт уже наблюдался в прежней операторской эпохе.
+        sqlx::query(
+            "INSERT INTO telegram_input_generation(update_id,generation,consumed) VALUES (5,'other-epoch',0)",
+        )
+        .execute(store.pool())
+        .await?;
+        gateway.poll_once().await?;
+        assert_eq!(store.telegram_update_offset().await?, Some(6));
+        let dispatches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(dispatches, 0, "вход старой эпохи не авторизуется");
+        {
+            let sent = sent.lock().expect("sent");
+            assert_eq!(sent.len(), 1, "ровно одно уведомление: {sent:?}");
+            assert!(
+                sent[0].contains("delivery fence changed"),
+                "оператор получает явную причину: {}",
+                sent[0]
+            );
+        }
+        testutil::remove_db_files(&path).await;
         Ok(())
     }
 }
