@@ -2106,6 +2106,10 @@ impl Dispatcher {
                 "operator hold is active; executor initiation is disabled"
             )));
         }
+        self.store
+            .delivery_generation_current()
+            .await
+            .map_err(RunFailure::rejected)?;
         let agent = self
             .config
             .agents
@@ -2199,11 +2203,16 @@ impl Dispatcher {
             .await
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is saturated")))?
             .map_err(|_| RunFailure::rejected(anyhow!("dispatcher is shutting down")))?;
+        self.store
+            .delivery_generation_current()
+            .await
+            .map_err(RunFailure::rejected)?;
         let url = format!("{}/v1/runs", api_url.as_str().trim_end_matches('/'));
-        let response = self
-            .hermes_client
-            .post(url)
-            .bearer_auth(api_key.expose())
+        let mut request = self.hermes_client.post(url).bearer_auth(api_key.expose());
+        if let Some(generation) = &self.config.delivery_generation {
+            request = request.header("X-Hermes-Operator-Generation", generation);
+        }
+        let response = request
             .json(&json!({
                 "model": self.config.hermes_model_alias,
                 "input": message,
@@ -2545,9 +2554,13 @@ impl Dispatcher {
             }))),
             Err(error) => {
                 error!(%sender, %kind, error = %error, "dispatch reservation failed");
+                // The stable marker stays for transport callers, but the
+                // operator fence reason (stale generation, stale idempotency
+                // key) is surfaced instead of being hidden in the log only.
                 Some(tool_error(json!({
                     "ok": false,
                     "error": "persistent dispatch reservation failed",
+                    "reason": error.to_string(),
                 })))
             }
         }
@@ -6202,6 +6215,43 @@ mod tests {
         assert!(
             payload.get("reply_to_message_id").is_none(),
             "thread хватает, реплай не нужен: {payload}"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_operator_generation_surfaces_its_reason() -> anyhow::Result<()> {
+        let (dispatcher, store, path) =
+            dispatcher_with_mock(Arc::new(|_, _| (202, json!({"run_id": "r"})))).await?;
+        // Имитируем смену операторской эпохи в БД: in-memory генерация у
+        // диспетчера осталась прежней, персистентная — новая.
+        sqlx::query("UPDATE delivery_control SET generation='other-epoch' WHERE id=1")
+            .execute(store.pool())
+            .await?;
+        let out = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "held".to_string(),
+                    correlation_id: None,
+                    idempotency_key: Some("held-key".to_string()),
+                },
+            )
+            .await;
+        assert!(out.is_error, "fence refusal must fail closed: {out:?}");
+        assert_eq!(
+            out.value["error"],
+            json!("persistent dispatch reservation failed"),
+            "стабильный маркер сохранён"
+        );
+        assert!(
+            out.value["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("stale operator delivery generation")),
+            "причина отказа видна вызывающему: {}",
+            out.value
         );
         testutil::remove_db_files(&path).await;
         Ok(())
