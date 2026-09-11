@@ -105,6 +105,8 @@ pub struct Config {
     pub operator_hold: bool,
     /// Explicit operator incident boundary; retire old wakes on this startup only.
     pub quarantine_on_start: bool,
+    /// Stable operator-issued incident token; never supplied by a model tool.
+    pub delivery_generation: Option<String>,
     pub activity_enabled: bool,
     pub activity_retention_days: i64,
     pub activity_history_limit: i64,
@@ -666,6 +668,7 @@ impl Config {
             db_busy_timeout: seconds(env, "SWARM_DB_BUSY_TIMEOUT_SECONDS")?,
             operator_hold: bool_env(env, "SWARM_OPERATOR_HOLD", true)?,
             quarantine_on_start: bool_env(env, "SWARM_QUARANTINE_ON_START", false)?,
+            delivery_generation: env.get("SWARM_DELIVERY_GENERATION").map(|value| value.trim().to_string()).filter(|value| !value.is_empty()),
             activity_enabled: bool_env(env, "SWARM_ACTIVITY_ENABLED", false)?,
             activity_retention_days: positive(env, "SWARM_ACTIVITY_RETENTION_DAYS")?,
             activity_history_limit: positive(env, "SWARM_ACTIVITY_HISTORY_LIMIT")?,
