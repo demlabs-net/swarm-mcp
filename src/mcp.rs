@@ -346,6 +346,7 @@ impl RoleMcp {
                 "rate_limit": config.rate_limit,
                 "rate_window_seconds": config.rate_window.as_secs(),
                 "duplicate_window_seconds": config.duplicate_window.as_secs(),
+                "duplicate_consumed_window_seconds": config.duplicate_consumed_window.as_secs(),
                 "messaging_reenable_cooldown_seconds": config.messaging_reenable_cooldown.as_secs(),
                 "max_inflight_dispatches": config.max_inflight_dispatches,
                 "telegram_outbox": config.telegram_enabled,
@@ -384,8 +385,10 @@ impl RoleMcp {
         }
         pieces.push(
             format!(
-                "Swarm MCP is transport only. SLC MCP owns task FIFO position, readiness, status, lineage, reports, and task messages. Call dispatch_to/msg_to only for an SLC envelope with wake_recommended=true and pass its task id as opaque correlation_id; never send readiness, availability, preflight, or status probes because each delivery starts a real run. A busy Hermes profile (HTTP 429 from max_concurrent_runs) is accepted into a durable per-recipient transport FIFO; queued=true is success, so do not retry or create another task. If an undelivered wake becomes obsolete, its original sender (or the manager) may cancel only its exact queue_id with cancel_delivery; this never changes the SLC task. Use one stable idempotency_key per logical delivery. Content-identical deliveries are suppressed for {} seconds. Delivery records are retained for {} days; read swarm://operations for queued/delivered/dead/cancelled transport state.",
-                config.duplicate_window.as_secs(), config.operation_retention_days
+                "Swarm MCP is transport only. SLC MCP owns task FIFO position, readiness, status, lineage, reports, and task messages. Call dispatch_to/msg_to only for an SLC envelope with wake_recommended=true and pass its task id as opaque correlation_id; never send readiness, availability, preflight, or status probes because each delivery starts a real run. A busy Hermes profile (HTTP 429 from max_concurrent_runs) is accepted into a durable per-recipient transport FIFO; queued=true is success, so do not retry or create another task. If an undelivered wake becomes obsolete, its original sender (or the manager) may cancel only its exact queue_id with cancel_delivery; this never changes the SLC task. Use one stable idempotency_key per logical delivery. A content-identical delivery is suppressed only while the earlier one is still in flight (at most {} seconds) or within a {} second double-send guard; once it was consumed, an identical wake creates a new dispatch and a new run. Delivery records are retained for {} days; read swarm://operations for queued/delivered/dead/cancelled transport state.",
+                config.duplicate_window.as_secs(),
+                config.duplicate_consumed_window.as_secs(),
+                config.operation_retention_days
             )
         );
         if self.role == config.manager_role {

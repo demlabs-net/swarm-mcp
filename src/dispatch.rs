@@ -2526,6 +2526,7 @@ impl Dispatcher {
                 self.config.rate_limit,
                 self.config.rate_window,
                 self.config.duplicate_window,
+                self.config.duplicate_consumed_window,
             )
             .await
         {
@@ -4061,6 +4062,60 @@ mod tests {
         assert_eq!(replay.value["deduplicated"], json!(true));
         assert_eq!(replay.value["dispatch_id"], first.value["dispatch_id"]);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    /// End-to-end regression for the roy1 wake starvation (2026-09-14): the
+    /// manager woke the same recipient twice about new SLC events with the same
+    /// static wake body. The first run finished, and the second wake returned
+    /// the first dispatch's stored result instead of starting a run, so the
+    /// executor was never woken. A consumed wake must now produce a new
+    /// dispatch and a new run.
+    #[tokio::test]
+    async fn identical_wake_after_a_finished_run_starts_a_new_run() -> anyhow::Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let behavior: testutil::MockHermes = Arc::new(move |_, _| {
+            let call = calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (202, json!({"run_id": format!("run-{call}")}))
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        // The SLC wake body is static: every wake about new events of the same
+        // task renders to the same fingerprint.
+        let args = || {
+            DispatchArgs {
+            agent: "developer".to_string(),
+            message: "SLC task task_1 has a new message event. Read list_task_events for the task and continue.".to_string(),
+            correlation_id: Some("task_1".to_string()),
+            idempotency_key: None,
+        }
+        };
+
+        let first = dispatcher.dispatch_to("manager", args()).await;
+        assert!(!first.is_error, "unexpected: {first:?}");
+        let first_id = first.value["dispatch_id"]
+            .as_str()
+            .expect("dispatch id")
+            .to_string();
+        assert_eq!(first.value["run_id"], json!("run-0"));
+        // The first run finished and its wake is older than the short
+        // double-send guard, but still inside the 600 s content window.
+        sqlx::query("UPDATE dispatches SET created_ms = created_ms - 200000 WHERE id = ?")
+            .bind(&first_id)
+            .execute(store.pool())
+            .await?;
+
+        let second = dispatcher.dispatch_to("manager", args()).await;
+        assert!(!second.is_error, "unexpected: {second:?}");
+        assert!(
+            second.value.get("deduplicated").is_none(),
+            "a consumed wake must not be replayed: {second:?}"
+        );
+        assert_ne!(second.value["dispatch_id"], json!(first_id));
+        assert_eq!(second.value["run_id"], json!("run-1"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         testutil::remove_db_files(&path).await;
         Ok(())

@@ -117,6 +117,10 @@ pub struct Config {
     pub rate_limit: i64,
     pub rate_window: Duration,
     pub duplicate_window: Duration,
+    /// Short unconditional double-send guard for identical content: suppresses a
+    /// repeat even when the earlier delivery was already consumed. Optional env
+    /// with a code default so existing deployments keep working unchanged.
+    pub duplicate_consumed_window: Duration,
     pub messaging_reenable_cooldown: Duration,
     pub max_inflight_dispatches: usize,
     pub pending_stale_after: Duration,
@@ -681,6 +685,11 @@ impl Config {
             rate_limit: positive(env, "SWARM_DISPATCH_RATE_LIMIT")?,
             rate_window: seconds(env, "SWARM_DISPATCH_RATE_WINDOW_SECONDS")?,
             duplicate_window: seconds(env, "SWARM_DUPLICATE_WINDOW_SECONDS")?,
+            duplicate_consumed_window: seconds_or_default(
+                env,
+                "SWARM_DUPLICATE_CONSUMED_WINDOW_SECONDS",
+                60,
+            )?,
             messaging_reenable_cooldown: seconds(env, "SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS")?,
             max_inflight_dispatches: positive(env, "SWARM_MAX_INFLIGHT_DISPATCHES")?,
             pending_stale_after: seconds(env, "SWARM_PENDING_STALE_SECONDS")?,
@@ -804,6 +813,10 @@ impl Config {
         ensure!(
             config.duplicate_window <= Duration::from_secs(86_400),
             "SWARM_DUPLICATE_WINDOW_SECONDS must not exceed 86400"
+        );
+        ensure!(
+            config.duplicate_consumed_window <= Duration::from_secs(86_400),
+            "SWARM_DUPLICATE_CONSUMED_WINDOW_SECONDS must not exceed 86400"
         );
         ensure!(
             config.messaging_reenable_cooldown <= Duration::from_secs(86_400),
@@ -949,6 +962,22 @@ where
 
 fn seconds(env: &dyn Fn(&str) -> Option<String>, name: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(positive::<u64>(env, name)?))
+}
+
+/// Optional seconds knob with a code default. Unlike [`seconds`], an existing
+/// deployment that does not know the variable starts with the documented
+/// default instead of failing fast; an explicitly set value is still validated.
+fn seconds_or_default(
+    env: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+) -> anyhow::Result<Duration> {
+    let Some(value) = optional(env, name) else {
+        return Ok(Duration::from_secs(default));
+    };
+    let parsed: u64 = value.parse().with_context(|| format!("parse {name}"))?;
+    ensure!(parsed > 0, "{name} must be positive");
+    Ok(Duration::from_secs(parsed))
 }
 
 fn bool_env(
@@ -1292,6 +1321,38 @@ mod tests {
         assert_eq!(
             config.dispatch_sources("developer"),
             vec!["manager", "lead-developer"]
+        );
+    }
+
+    #[test]
+    fn duplicate_consumed_window_is_optional_with_a_safe_default() {
+        // Backward compatible defaults: a deployment that predates the knob
+        // (marketing/dev/accounting) keeps a 60 s double-send guard and must not
+        // start double-waking.
+        let config = load(&valid_env()).unwrap();
+        assert_eq!(config.duplicate_window, Duration::from_secs(600));
+        assert_eq!(config.duplicate_consumed_window, Duration::from_secs(60));
+
+        let mut env = valid_env();
+        env.insert(
+            "SWARM_DUPLICATE_CONSUMED_WINDOW_SECONDS".into(),
+            "15".into(),
+        );
+        let config = load(&env).unwrap();
+        assert_eq!(config.duplicate_consumed_window, Duration::from_secs(15));
+
+        let mut env = valid_env();
+        env.insert(
+            "SWARM_DUPLICATE_CONSUMED_WINDOW_SECONDS".into(),
+            "90000".into(),
+        );
+        assert!(load(&env).is_err(), "an oversized guard is rejected");
+
+        let mut env = valid_env();
+        env.insert("SWARM_DUPLICATE_CONSUMED_WINDOW_SECONDS".into(), "0".into());
+        assert!(
+            load(&env).is_err(),
+            "zero is rejected (unset means default)"
         );
     }
 

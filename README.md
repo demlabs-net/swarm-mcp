@@ -106,7 +106,15 @@ inviting a duplicate wake. If queue rows cover only part
 of a multi-target operation or contain a dead/cancelled outcome, the same
 idempotency key remains finalized but replays `ok=false` with
 `recovery_required=true`; it is never silently presented as complete. A separate
-content-duplicate window suppresses accidental repeated delivery.
+content-duplicate guard suppresses accidental repeated delivery: an identical
+fingerprint is ignored only while the earlier delivery is still in flight (its
+operation is pending, or its queue row is still `pending`) and inside
+`SWARM_DUPLICATE_WINDOW_SECONDS`; a short unconditional double-send window
+(`SWARM_DUPLICATE_CONSUMED_WINDOW_SECONDS`, default 60 s) also covers an
+already-consumed repeat. Once the earlier delivery was consumed — the run was
+handed over and finished — an identical wake creates a new dispatch and a new
+run, so a static wake body (an SLC "read list_task_events" stub for a new event)
+can never starve the executor.
 
 Messaging circuit breakers block both directions through this adapter and can
 hold or cancel undelivered role wakes and Telegram audit records. They do not
@@ -283,7 +291,7 @@ Important groups:
 | Network | `SWARM_MCP_HOST`, `SWARM_MCP_PORT`, `SWARM_MCP_ALLOWED_HOSTS`, `SWARM_MCP_ALLOWED_ORIGINS`, `SWARM_MCP_MAX_REQUEST_BODY_BYTES` |
 | Hierarchy | `SWARM_AGENT_ROLES`, `SWARM_MANAGER_ROLE`, `SWARM_DISPATCH_ACL`, `SWARM_EXECUTOR_DESCRIPTIONS` |
 | Role credentials | `<ROLE>_SWARM_MCP_TOKEN`, `<ROLE>_API_KIND` (`hermes`/`openai`/`mcp`), `<ROLE>_API_URL`, `<ROLE>_AGENT_API_KEY`, `<ROLE>_API_MODEL` |
-| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS`, `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS` |
+| Dispatch guards | `SWARM_DISPATCH_RATE_LIMIT`, `SWARM_DISPATCH_RATE_WINDOW_SECONDS`, `SWARM_DUPLICATE_WINDOW_SECONDS` (content window that suppresses an identical fingerprint only while the earlier delivery is still unconsumed), `SWARM_DUPLICATE_CONSUMED_WINDOW_SECONDS` (optional, default **60** — unconditional double-send guard that suppresses an identical fingerprint even after the earlier delivery was consumed), `SWARM_MESSAGING_REENABLE_COOLDOWN_SECONDS`, `SWARM_MAX_INFLIGHT_DISPATCHES`, `SWARM_PENDING_STALE_SECONDS` |
 | Operator fence | `SWARM_OPERATOR_HOLD` (default **true** — no run is initiated, Telegram inbound answers with a hold notice, durable wakes stay queued; inspection and outbound replies keep working), `SWARM_QUARANTINE_ON_START` (default false — when true, a startup retires every `pending`/`dead` wake as `cancelled`; ordinary restarts preserve the FIFO), `SWARM_DELIVERY_GENERATION` (unset by default — an operator epoch token of 1..128 ASCII characters `[A-Za-z0-9-_.:]`; persisted in `delivery_control` and stamped on dispatches, role wakes and Telegram outbox rows, so a new token cancels wakes from any other epoch, stale idempotency keys and stale dispatches cannot replay or enqueue, and Telegram input observed under an older epoch is acknowledged without authorization; an unchanged token keeps the recipient FIFO across restarts) |
 | HTTP admission | `SWARM_MCP_REQUEST_RATE_LIMIT`, `SWARM_MCP_REQUEST_RATE_WINDOW_SECONDS` |
 | State | `SWARM_STATE_DB_PATH`, `SWARM_DB_MAX_CONNECTIONS`, `SWARM_DB_BUSY_TIMEOUT_SECONDS`, `SWARM_RECENT_OPERATIONS_LIMIT`, `SWARM_OPERATION_RETENTION_DAYS`, `SWARM_CLEANUP_INTERVAL_SECONDS` |

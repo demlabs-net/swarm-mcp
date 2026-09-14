@@ -866,10 +866,18 @@ impl Store {
             rate_limit,
             rate_window,
             Duration::ZERO,
+            Duration::ZERO,
         )
         .await
     }
 
+    /// Reserve a dispatch with both duplicate guards.
+    ///
+    /// `duplicate_window` (long) answers "is an earlier identical delivery for
+    /// this fingerprint still *unconsumed*?" — that is the only reason to
+    /// suppress a repeat inside it. `duplicate_consumed_window` (short) is the
+    /// unconditional transport double-send guard: it suppresses an identical
+    /// fingerprint even when the earlier delivery was already consumed.
     #[allow(clippy::too_many_arguments)]
     pub async fn reserve_dispatch_guarded(
         &self,
@@ -882,6 +890,7 @@ impl Store {
         rate_limit: i64,
         rate_window: Duration,
         duplicate_window: Duration,
+        duplicate_consumed_window: Duration,
     ) -> anyhow::Result<Reservation> {
         let _guard = self.reservation_lock.lock().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -945,33 +954,55 @@ impl Store {
         if !duplicate_window.is_zero() {
             let duplicate_window_ms =
                 i64::try_from(duplicate_window.as_millis()).unwrap_or(i64::MAX);
-            let duplicate_cutoff = now.saturating_sub(duplicate_window_ms);
+            let consumed_window_ms =
+                i64::try_from(duplicate_consumed_window.as_millis()).unwrap_or(i64::MAX);
+            // One lookup covers both guards: the long content window and the
+            // short unconditional double-send window. A candidate from another
+            // operator generation is never a duplicate candidate: its result
+            // must not be replayed, and it must not refuse a fresh wake either.
+            let duplicate_cutoff = now.saturating_sub(duplicate_window_ms.max(consumed_window_ms));
+            let consumed_cutoff = now.saturating_sub(consumed_window_ms);
             if let Some(row) = sqlx::query(
-                r#"SELECT id, result_json, generation, generation_revoked FROM dispatches
-                   WHERE sender = ? AND kind = ? AND fingerprint = ?
-                     AND status != 'failed' AND created_ms >= ?
-                   ORDER BY created_ms DESC LIMIT 1"#,
+                r#"SELECT d.id, d.result_json, d.created_ms,
+                          CASE WHEN d.status = 'pending' OR EXISTS (
+                            SELECT 1 FROM delivery_outbox q
+                            WHERE q.dispatch_id = d.id AND q.status = 'pending'
+                          ) THEN 1 ELSE 0 END AS unconsumed
+                   FROM dispatches d
+                   WHERE d.sender = ? AND d.kind = ? AND d.fingerprint = ?
+                     AND d.status != 'failed' AND d.created_ms >= ?
+                     AND d.generation IS ? AND d.generation_revoked = 0
+                   ORDER BY d.created_ms DESC LIMIT 1"#,
             )
             .bind(sender)
             .bind(kind)
             .bind(fingerprint)
             .bind(duplicate_cutoff)
+            .bind(&self.generation)
             .fetch_optional(&mut *tx)
             .await?
             {
-                ensure!(
-                    row.get::<Option<String>, _>("generation") == self.generation
-                        && row.get::<i64, _>("generation_revoked") == 0,
-                    "stale operator delivery generation replay refused"
-                );
-                let existing_id = row.get::<String, _>("id");
-                let result = row.try_get::<Option<String>, _>("result_json")?;
-                return Ok(match result {
-                    Some(value) => Reservation::Existing(serde_json::from_str(&value)?),
-                    None => Reservation::Pending {
-                        dispatch_id: existing_id,
-                    },
-                });
+                // Suppress a repeat only while the earlier wake is still in
+                // flight (its operation is pending, or its delivery still sits
+                // in the durable per-recipient FIFO unconsumed): the executor
+                // has not been woken by it yet, so a second identical wake
+                // would only duplicate the same wake-up. Once it is consumed
+                // (run handed over / delivery delivered) a new identical wake
+                // about a new SLC event must produce a new dispatch + run — the
+                // old blanket window replayed the finished run's result and
+                // starved the queue (roy1, 2026-09-14).
+                let unconsumed = row.get::<i64, _>("unconsumed") == 1;
+                let recent = row.get::<i64, _>("created_ms") >= consumed_cutoff;
+                if unconsumed || recent {
+                    let existing_id = row.get::<String, _>("id");
+                    let result = row.try_get::<Option<String>, _>("result_json")?;
+                    return Ok(match result {
+                        Some(value) => Reservation::Existing(serde_json::from_str(&value)?),
+                        None => Reservation::Pending {
+                            dispatch_id: existing_id,
+                        },
+                    });
+                }
             }
         }
         let window_ms = i64::try_from(rate_window.as_millis()).unwrap_or(i64::MAX);
@@ -4087,6 +4118,382 @@ mod tests {
             "chunk checkpoint on a delivered item is rejected"
         );
 
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    /// Regression for the 2026-09-14 roy1 wake starvation: the manager woke the
+    /// same recipient twice about new SLC events. Both wakes carry the same
+    /// static body, so their fingerprints are identical. The first wake ran and
+    /// finished, yet the second was swallowed by the 600 s fingerprint window and
+    /// replayed the finished run's result — the executor never woke again.
+    #[tokio::test]
+    async fn identical_wake_after_consumed_run_is_not_swallowed() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-wake-starvation-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let targets = vec!["developer".to_string()];
+        // The SLC wake body is a static stub: every wake about new events of the
+        // same task renders to the same fingerprint.
+        let fingerprint = "static-slc-task-message-wake";
+
+        // Wake #1 goes straight to the executor (no queued delivery) and its run
+        // finishes, so nothing about it is left unconsumed.
+        assert!(matches!(
+            store
+                .reserve_dispatch_guarded(
+                    "dispatch_wake_1",
+                    "manager",
+                    "dispatch_to",
+                    &targets,
+                    None,
+                    fingerprint,
+                    100,
+                    Duration::from_secs(60),
+                    Duration::from_secs(600),
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Reserved
+        ));
+        store
+            .finish_dispatch(
+                "dispatch_wake_1",
+                "accepted",
+                &json!({"ok": true, "run_id": "run_wake_1"}),
+                None,
+            )
+            .await?;
+        // Age the finished wake: still inside the 600 s content window, outside
+        // the 60 s unconditional double-send window.
+        sqlx::query(
+            "UPDATE dispatches SET created_ms = created_ms - 200000 WHERE id='dispatch_wake_1'",
+        )
+        .execute(store.pool())
+        .await?;
+
+        // A new wake about a NEW SLC event must create a new dispatch + run.
+        let second = store
+            .reserve_dispatch_guarded(
+                "dispatch_wake_2",
+                "manager",
+                "dispatch_to",
+                &targets,
+                None,
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        assert!(
+            matches!(second, Reservation::Reserved),
+            "a consumed wake must not swallow the next identical wake: {second:?}"
+        );
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    /// The double-send guard stays: an identical wake sent right after a
+    /// consumed one (inside `duplicate_consumed_window`) is still suppressed,
+    /// so a transport-level retry cannot start a second run.
+    #[tokio::test]
+    async fn identical_wake_inside_the_double_send_guard_is_still_suppressed() -> anyhow::Result<()>
+    {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-double-send-guard-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let targets = vec!["developer".to_string()];
+        let fingerprint = "static-slc-task-message-wake";
+        store
+            .reserve_dispatch_guarded(
+                "dispatch_guard_1",
+                "manager",
+                "dispatch_to",
+                &targets,
+                None,
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .finish_dispatch(
+                "dispatch_guard_1",
+                "accepted",
+                &json!({"ok": true, "run_id": "run_guard_1"}),
+                None,
+            )
+            .await?;
+
+        // Immediately repeated (consumed, but inside the 60 s guard).
+        let repeated = store
+            .reserve_dispatch_guarded(
+                "dispatch_guard_2",
+                "manager",
+                "dispatch_to",
+                &targets,
+                None,
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        assert!(
+            matches!(repeated, Reservation::Existing(_)),
+            "a double-send inside the guard must not start a second run: {repeated:?}"
+        );
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    /// An earlier identical wake that is still unconsumed (its delivery sits in
+    /// the durable per-recipient FIFO) keeps suppressing repeats for the whole
+    /// long content window: the executor will be woken by it anyway.
+    #[tokio::test]
+    async fn unconsumed_identical_wake_is_suppressed_for_the_content_window() -> anyhow::Result<()>
+    {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-unconsumed-wake-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let targets = vec!["developer".to_string()];
+        let fingerprint = "static-slc-task-message-wake";
+        store
+            .reserve_dispatch_guarded(
+                "dispatch_queued_1",
+                "manager",
+                "dispatch_to",
+                &targets,
+                None,
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .enqueue_delivery(
+                &DeliveryQueueItem {
+                    id: "delivery_queued_1_developer".to_string(),
+                    dispatch_id: "dispatch_queued_1".to_string(),
+                    sender: "manager".to_string(),
+                    kind: "dispatch_to".to_string(),
+                    recipient: "developer".to_string(),
+                    body: "opaque wake".to_string(),
+                    instructions: "read SLC".to_string(),
+                    attempts: 0,
+                },
+                Duration::from_secs(1),
+                "role busy",
+            )
+            .await?;
+        store
+            .finish_dispatch(
+                "dispatch_queued_1",
+                "accepted",
+                &json!({"ok": true, "queued": true}),
+                None,
+            )
+            .await?;
+        // Older than the short guard, still inside the content window.
+        sqlx::query(
+            "UPDATE dispatches SET created_ms = created_ms - 200000 WHERE id='dispatch_queued_1'",
+        )
+        .execute(store.pool())
+        .await?;
+
+        let repeated = store
+            .reserve_dispatch_guarded(
+                "dispatch_queued_2",
+                "manager",
+                "dispatch_to",
+                &targets,
+                None,
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        assert!(
+            matches!(repeated, Reservation::Existing(_)),
+            "an unconsumed queued wake must absorb the repeat: {repeated:?}"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(count, 1, "no second dispatch while the first is unconsumed");
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    /// Requirement: the explicit `idempotency_key` path is not weakened. A
+    /// consumed wake still replays its stored result for the same key (never a
+    /// second dispatch), whatever the content windows say.
+    #[tokio::test]
+    async fn explicit_idempotency_key_replay_is_unchanged_after_consumption() -> anyhow::Result<()>
+    {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-idempotent-wake-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let targets = vec!["developer".to_string()];
+        let fingerprint = "static-slc-task-message-wake";
+        store
+            .reserve_dispatch_guarded(
+                "dispatch_key_1",
+                "manager",
+                "dispatch_to",
+                &targets,
+                Some("stable-wake-key"),
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .finish_dispatch(
+                "dispatch_key_1",
+                "accepted",
+                &json!({"ok": true, "run_id": "run_key_1"}),
+                None,
+            )
+            .await?;
+        // Consumed AND older than both content windows.
+        sqlx::query(
+            "UPDATE dispatches SET created_ms = created_ms - 200000 WHERE id='dispatch_key_1'",
+        )
+        .execute(store.pool())
+        .await?;
+
+        let replayed = store
+            .reserve_dispatch_guarded(
+                "dispatch_key_2",
+                "manager",
+                "dispatch_to",
+                &targets,
+                Some("stable-wake-key"),
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        match replayed {
+            Reservation::Existing(result) => {
+                assert_eq!(result["run_id"], json!("run_key_1"));
+            }
+            other => panic!("a keyed replay must return the stored result, got {other:?}"),
+        }
+        // Same key, different content: still a conflict, never a new dispatch.
+        assert!(matches!(
+            store
+                .reserve_dispatch_guarded(
+                    "dispatch_key_3",
+                    "manager",
+                    "dispatch_to",
+                    &targets,
+                    Some("stable-wake-key"),
+                    "different-body",
+                    100,
+                    Duration::from_secs(60),
+                    Duration::from_secs(600),
+                    Duration::from_secs(60),
+                )
+                .await?,
+            Reservation::Conflict
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatches")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(count, 1, "keyed replays never create a new dispatch");
+
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    /// A wake from a revoked operator generation is never replayed, but it must
+    /// not refuse (starve) the fresh wake either: the caller gets a NEW dispatch
+    /// in the current generation instead of "stale generation replay refused".
+    #[tokio::test]
+    async fn revoked_generation_wake_is_neither_replayed_nor_refused() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-mcp-revoked-wake-test-{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let mut store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        store.configure_generation(false).await?;
+        let targets = vec!["developer".to_string()];
+        let fingerprint = "static-slc-task-message-wake";
+        store
+            .reserve_dispatch_guarded(
+                "dispatch_old_epoch",
+                "manager",
+                "dispatch_to",
+                &targets,
+                None,
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        store
+            .finish_dispatch(
+                "dispatch_old_epoch",
+                "accepted",
+                &json!({"ok": true, "run_id": "run_old_epoch"}),
+                None,
+            )
+            .await?;
+        store.rotate_generation(None, "incident-wake").await?;
+        store.generation = Some("incident-wake".into());
+        store.configure_generation(true).await?;
+
+        let fresh = store
+            .reserve_dispatch_guarded(
+                "dispatch_new_epoch",
+                "manager",
+                "dispatch_to",
+                &targets,
+                None,
+                fingerprint,
+                100,
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+            )
+            .await?;
+        assert!(
+            matches!(fresh, Reservation::Reserved),
+            "a revoked wake must not block a fresh wake: {fresh:?}"
+        );
         store.pool.close().await;
         remove_sqlite_files(&path).await;
         Ok(())
