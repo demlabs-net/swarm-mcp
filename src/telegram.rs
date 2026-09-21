@@ -795,12 +795,17 @@ impl TelegramGateway {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 if outcome.is_error && !audit_queued {
-                    let reason = outcome
-                        .value
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("the request was not accepted");
-                    let notice = format!("Swarm command {update_id} was not accepted: {reason}");
+                    let (reason, unknown) = dispatch_refusal(&outcome.value);
+                    // An indeterminate target may well have accepted the work, so
+                    // telling the operator it was "not accepted" invents a fact and
+                    // invites a needless resend.
+                    let notice = if unknown {
+                        format!(
+                            "Swarm command {update_id} was NOT confirmed (target status unknown): {reason}"
+                        )
+                    } else {
+                        format!("Swarm command {update_id} was not accepted: {reason}")
+                    };
                     if let Err(error) = self.send_text(message.chat.id, &notice, thread_id).await {
                         warn!(error = %error, "send Telegram dispatch rejection failed");
                     }
@@ -1447,6 +1452,56 @@ fn next_offset(update_id: i64) -> anyhow::Result<i64> {
         .context("Telegram update ID overflow")
 }
 
+/// Operator-facing refusal text for a dispatch outcome, plus whether the outcome
+/// is unknown rather than refused.
+///
+/// Per-target failures live under `results`, so the top-level `error` key is
+/// usually absent and the notice used to degrade to a generic sentence that hid
+/// the real cause. `recovery_required` marks an indeterminate target: the work
+/// may have started, so the notice must not claim a refusal.
+fn dispatch_refusal(value: &Value) -> (String, bool) {
+    let results = value.get("results").and_then(Value::as_object);
+    let reason = value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            results.and_then(|results| {
+                results.values().find_map(|result| {
+                    result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            })
+        })
+        .unwrap_or_else(|| "the request was not accepted".to_string());
+    let unknown = results.is_some_and(|results| {
+        !results.is_empty()
+            && results.values().all(|result| {
+                result
+                    .get("recovery_required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || result.get("status").and_then(Value::as_str) == Some("indeterminate")
+            })
+    });
+    (truncate_reason(&reason), unknown)
+}
+
+/// Keep an operator notice readable: the Bot API rejects over-long messages and a
+/// JSON blob is not a reason.
+fn truncate_reason(reason: &str) -> String {
+    const LIMIT: usize = 300;
+    let cleaned = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() <= LIMIT {
+        return cleaned;
+    }
+    let mut truncated: String = cleaned.chars().take(LIMIT).collect();
+    truncated.push('…');
+    truncated
+}
+
 async fn telegram_payload(response: reqwest::Response) -> anyhow::Result<Value> {
     let status = response.status();
     let mut body = Vec::new();
@@ -1482,6 +1537,50 @@ mod tests {
             "developer".to_string(),
             "lead-developer".to_string(),
         ]
+    }
+
+    /// The failure the operator actually saw: per-target error under `results`,
+    /// no top-level `error`, target status indeterminate.
+    #[test]
+    fn refusal_reason_comes_from_the_target_and_marks_unknown_status() {
+        let value = json!({
+            "dispatch_id": "telegram_329099109",
+            "ok": false,
+            "results": {
+                "manager": {
+                    "error": "manager API returned HTTP 503 Service Unavailable",
+                    "recovery_required": true,
+                    "status": "indeterminate",
+                }
+            },
+        });
+        let (reason, unknown) = dispatch_refusal(&value);
+        assert_eq!(reason, "manager API returned HTTP 503 Service Unavailable");
+        assert!(unknown, "an indeterminate target is not a refusal");
+    }
+
+    #[test]
+    fn refusal_reason_prefers_top_level_error_and_detects_rejected_targets() {
+        let value = json!({"error": "Telegram inbound is disabled"});
+        let (reason, unknown) = dispatch_refusal(&value);
+        assert_eq!(reason, "Telegram inbound is disabled");
+        assert!(!unknown, "a rejection must not be reported as unknown");
+
+        let value = json!({
+            "ok": false,
+            "results": {"manager": {"error": "unknown target role", "status": "failed"}},
+        });
+        let (reason, unknown) = dispatch_refusal(&value);
+        assert_eq!(reason, "unknown target role");
+        assert!(!unknown);
+    }
+
+    #[test]
+    fn refusal_reason_is_bounded_and_never_blank() {
+        assert_eq!(dispatch_refusal(&json!({"ok": false})).0, "the request was not accepted");
+        let long = "x".repeat(1000);
+        let (reason, _) = dispatch_refusal(&json!({"error": long}));
+        assert_eq!(reason.chars().count(), 301, "300 characters plus the ellipsis");
     }
 
     #[test]
