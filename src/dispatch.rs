@@ -544,6 +544,13 @@ impl Dispatcher {
     ///    SLC-менеджера, у которого своего Telegram-чата обычно нет);
     /// 3) иначе — общий чат с warn-логом. Молчаливая потеря невозможна.
     async fn track_reply_for_sender(&self, sender: &str, run_id: &str, recipient: &str) {
+        if !self.config.telegram_enabled {
+            // The Telegram channel is off (native manager Telegram): tracking a
+            // run here would make flush_run_replies enqueue the answer into a
+            // telegram_outbox nobody drains — the same forever-pending shape as
+            // the telegram_reply backlog.
+            return;
+        }
         if !self.config.telegram_track_dispatch_replies {
             // Indirect runs (dispatch_to/msg_to) can opt out of publishing
             // their terminal output into the sender's Telegram chat.
@@ -1511,6 +1518,13 @@ impl Dispatcher {
     }
 
     async fn flush_run_replies(&self) -> anyhow::Result<()> {
+        if !self.config.telegram_enabled {
+            // The channel is off: neither typing heartbeats nor answer
+            // deliveries may enqueue into a telegram_outbox nobody drains.
+            // Existing tracks stay parked and expire by their TTL once the
+            // channel is back.
+            return Ok(());
+        }
         let ttl = Duration::from_secs(6 * 60 * 60);
         let now = Utc::now().timestamp_millis();
         for (run_id, role, chat_id, message_id, thread_id, created_ms) in
@@ -4774,6 +4788,63 @@ mod tests {
             .await?
             .get::<i64, _>("n");
         assert_eq!(queued, 0, "nothing may be enqueued while disabled");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    /// dispatch_to must not register the run for a Telegram answer delivery
+    /// while the channel is off: the run-reply worker would otherwise enqueue
+    /// the terminal answer into the telegram_outbox nobody drains.
+    #[tokio::test]
+    async fn dispatch_to_does_not_track_run_replies_while_telegram_is_disabled()
+    -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes = Arc::new(|_bearer, body| {
+            if body.contains("\"input\"") {
+                (202, json!({"run_id": "run-track-test"}))
+            } else {
+                (404, json!({"error": "unexpected"}))
+            }
+        });
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        let outcome = dispatcher
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".to_string(),
+                    message: "заказ".to_string(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(!outcome.is_error, "dispatch must succeed: {:?}", outcome.value);
+        let tracks = store.due_run_replies().await?;
+        assert!(
+            tracks.is_empty(),
+            "no run may be tracked for Telegram delivery while disabled"
+        );
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    /// With the channel off, the run-reply worker must park existing tracks
+    /// (they expire by TTL) instead of enqueueing answers into the outbox.
+    #[tokio::test]
+    async fn run_reply_worker_parks_tracks_while_telegram_is_disabled() -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes =
+            Arc::new(|_, _| panic!("disabled channel must never poll or enqueue"));
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        store
+            .track_run_reply("run-old", "developer", 424_242, None, None)
+            .await?;
+        dispatcher.flush_run_replies().await?;
+        let tracks = store.due_run_replies().await?;
+        assert_eq!(tracks.len(), 1, "the track stays parked while disabled");
+        let queued = sqlx::query("SELECT COUNT(*) AS n FROM telegram_outbox")
+            .fetch_one(store.pool())
+            .await?
+            .get::<i64, _>("n");
+        assert_eq!(queued, 0, "no answer may be enqueued while disabled");
         testutil::remove_db_files(&path).await;
         Ok(())
     }
