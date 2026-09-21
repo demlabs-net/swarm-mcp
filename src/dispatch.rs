@@ -123,6 +123,29 @@ impl std::fmt::Display for RunFailure {
     }
 }
 
+/// Read `(error.code, error.message)` out of a refusal body.
+///
+/// Hermes answers a refused `POST /v1/runs` with
+/// `{"error": {"message": "...", "code": "operator_hold"}}`; other gateways use a
+/// bare string. Anything else yields `(None, None)` so the caller keeps its
+/// status-only classification.
+fn refusal_detail(body: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return (None, None);
+    };
+    let error = value.get("error");
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str))
+        .map(ToOwned::to_owned);
+    (code, message)
+}
+
 #[derive(Debug)]
 struct TelegramFailure {
     message: String,
@@ -1188,6 +1211,18 @@ impl Dispatcher {
         message: String,
         files: Vec<TelegramFileArgs>,
     ) -> ToolOutcome {
+        // Telegram is switched off on this deployment (the manager delivers to
+        // Telegram natively). flush_outbox() returns early while
+        // `telegram_enabled` is false, and the retention sweep deletes only
+        // terminal rows — anything enqueued here would sit `pending` forever
+        // (the 145-row backlog of 18–21.09.2026). Fail fast so the caller
+        // routes the answer through the canonical channel instead.
+        if !self.config.telegram_enabled {
+            return tool_error(json!({
+                "ok": false,
+                "error": "telegram_outbox is disabled on swarm-mcp (manager delivers to Telegram natively): message NOT queued. Reply through the canonical channel instead (SLC task_message / swarm send_message to the manager).",
+            }));
+        }
         // Files-only replies are valid: the message is optional when files
         // are attached, so only clean a non-empty message.
         let message = if message.trim().is_empty() {
@@ -2234,8 +2269,34 @@ impl Dispatcher {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1);
-            let error = anyhow!("{role} API returned HTTP {status}");
+            // Hermes refuses work with an explanatory body (`error.code` /
+            // `error.message`). Discarding it made an operator hold, a draining
+            // gateway and an unknown 5xx indistinguishable — both to the operator
+            // and to the retry classifier.
+            let detail: Vec<u8> = if response.content_length().is_some_and(|length| {
+                length > u64::try_from(self.config.max_request_body_bytes).unwrap_or(u64::MAX)
+            }) {
+                Vec::new()
+            } else {
+                response.bytes().await.map_err(|error| {
+                    RunFailure::indeterminate(anyhow!("read {role} API refusal body: {error}"))
+                })?
+                .into()
+            };
+            let (code, message) = refusal_detail(&detail);
+            let error = match message.as_deref() {
+                Some(message) => anyhow!("{role} API returned HTTP {status}: {message}"),
+                None => anyhow!("{role} API returned HTTP {status}"),
+            };
             return Err(if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                RunFailure::retryable(error, retry_after_seconds)
+            } else if code.as_deref() == Some("operator_hold") {
+                // An operator revocation barrier, not a transient fault: retrying
+                // cannot restore the grant, and the reason must reach the operator.
+                RunFailure::rejected(error)
+            } else if code.as_deref() == Some("gateway_draining") {
+                // Advertised as retryable by the gateway: let the durable delivery
+                // queue carry the command across the drain instead of dropping it.
                 RunFailure::retryable(error, retry_after_seconds)
             } else if status.is_server_error() {
                 RunFailure::indeterminate(error)
@@ -2943,6 +3004,26 @@ fn tool_error(value: Value) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_detail_reads_the_hermes_operator_hold_body() {
+        let body = br#"{"error":{"message":"[operator_hold] missing or stale operator generation","type":"invalid_request_error","param":null,"code":"operator_hold"}}"#;
+        let (code, message) = refusal_detail(body);
+        assert_eq!(code.as_deref(), Some("operator_hold"));
+        assert_eq!(
+            message.as_deref(),
+            Some("[operator_hold] missing or stale operator generation")
+        );
+    }
+
+    #[test]
+    fn refusal_detail_reads_a_bare_error_string_and_ignores_noise() {
+        let (code, message) = refusal_detail(br#"{"error":"Invalid JSON"}"#);
+        assert_eq!(code, None);
+        assert_eq!(message.as_deref(), Some("Invalid JSON"));
+        assert_eq!(refusal_detail(b"<html>502</html>"), (None, None));
+        assert_eq!(refusal_detail(b""), (None, None));
+    }
 
     #[test]
     fn template_substitution_is_single_pass() {
@@ -4660,6 +4741,39 @@ mod tests {
         assert_eq!(item.media[0].filename, "cover_ru.png");
         assert_eq!(item.media[0].mime_type.as_deref(), Some("image/png"));
         assert_eq!(item.media[1].filename, "report.pdf");
+        testutil::remove_db_files(&path).await;
+        Ok(())
+    }
+
+    /// When the Telegram channel is switched off (native manager Telegram),
+    /// `telegram_reply` must refuse instead of enqueueing: nothing drains the
+    /// outbox while `telegram_enabled` is false, so a queued row would sit
+    /// `pending` forever (the 18–21.09.2026 backlog).
+    #[tokio::test]
+    async fn telegram_reply_refuses_to_enqueue_while_telegram_is_disabled() -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes =
+            Arc::new(|_, _| panic!("disabled channel must not reach Hermes"));
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        assert!(
+            !dispatcher.config.telegram_enabled,
+            "fixture must run with the channel off"
+        );
+        let reply = dispatcher
+            .telegram_reply("developer", "отчёт в никуда".to_string(), vec![])
+            .await;
+        assert!(reply.is_error, "expected a refusal: {:?}", reply.value);
+        assert!(
+            reply.value["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("telegram_outbox is disabled")),
+            "refusal must explain the channel state: {:?}",
+            reply.value
+        );
+        let queued = sqlx::query("SELECT COUNT(*) AS n FROM telegram_outbox")
+            .fetch_one(store.pool())
+            .await?
+            .get::<i64, _>("n");
+        assert_eq!(queued, 0, "nothing may be enqueued while disabled");
         testutil::remove_db_files(&path).await;
         Ok(())
     }
