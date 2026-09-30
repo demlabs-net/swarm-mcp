@@ -1577,10 +1577,17 @@ mod tests {
 
     #[test]
     fn refusal_reason_is_bounded_and_never_blank() {
-        assert_eq!(dispatch_refusal(&json!({"ok": false})).0, "the request was not accepted");
+        assert_eq!(
+            dispatch_refusal(&json!({"ok": false})).0,
+            "the request was not accepted"
+        );
         let long = "x".repeat(1000);
         let (reason, _) = dispatch_refusal(&json!({"error": long}));
-        assert_eq!(reason.chars().count(), 301, "300 characters plus the ellipsis");
+        assert_eq!(
+            reason.chars().count(),
+            301,
+            "300 characters plus the ellipsis"
+        );
     }
 
     #[test]

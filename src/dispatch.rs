@@ -2292,10 +2292,13 @@ impl Dispatcher {
             }) {
                 Vec::new()
             } else {
-                response.bytes().await.map_err(|error| {
-                    RunFailure::indeterminate(anyhow!("read {role} API refusal body: {error}"))
-                })?
-                .into()
+                response
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        RunFailure::indeterminate(anyhow!("read {role} API refusal body: {error}"))
+                    })?
+                    .into()
             };
             let (code, message) = refusal_detail(&detail);
             let error = match message.as_deref() {
@@ -4792,9 +4795,9 @@ mod tests {
         Ok(())
     }
 
-    /// dispatch_to must not register the run for a Telegram answer delivery
+    /// `dispatch_to` must not register the run for a Telegram answer delivery
     /// while the channel is off: the run-reply worker would otherwise enqueue
-    /// the terminal answer into the telegram_outbox nobody drains.
+    /// the terminal answer into the `telegram_outbox` nobody drains.
     #[tokio::test]
     async fn dispatch_to_does_not_track_run_replies_while_telegram_is_disabled()
     -> anyhow::Result<()> {
@@ -4817,7 +4820,11 @@ mod tests {
                 },
             )
             .await;
-        assert!(!outcome.is_error, "dispatch must succeed: {:?}", outcome.value);
+        assert!(
+            !outcome.is_error,
+            "dispatch must succeed: {:?}",
+            outcome.value
+        );
         let tracks = store.due_run_replies().await?;
         assert!(
             tracks.is_empty(),
