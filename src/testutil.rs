@@ -92,6 +92,8 @@ pub(crate) fn fixture_config(state_db_path: &Path) -> Config {
         max_request_body_bytes: 64 * 1024,
         api_timeout: Duration::from_secs(5),
         hermes_model_alias: "fixture-model".to_string(),
+        task_service_token: None,
+        protected_roles: BTreeSet::new(),
         state_db_path: state_db_path.to_path_buf(),
         db_max_connections: 4,
         db_busy_timeout: Duration::from_secs(2),

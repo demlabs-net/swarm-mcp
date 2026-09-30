@@ -98,6 +98,11 @@ pub struct Config {
     pub max_request_body_bytes: usize,
     pub api_timeout: Duration,
     pub hermes_model_alias: String,
+    /// Independent SLC→Swarm service credential. Does not authorize MCP calls.
+    pub task_service_token: Option<Secret>,
+    /// Executor profiles whose generic dispatch ingress is fenced for SLC task admission.
+    /// The fence is independent of the downstream API's availability.
+    pub protected_roles: BTreeSet<String>,
     pub state_db_path: PathBuf,
     pub db_max_connections: u32,
     pub db_busy_timeout: Duration,
@@ -434,6 +439,37 @@ impl Config {
             );
         }
 
+        let task_service_token = optional(env, "SWARM_TASK_SERVICE_TOKEN").map(Secret);
+        if let Some(token) = &task_service_token {
+            ensure!(
+                token.expose().len() >= 32,
+                "SWARM_TASK_SERVICE_TOKEN is too short"
+            );
+            ensure!(
+                tokens.insert(token.expose().to_string()),
+                "SWARM_TASK_SERVICE_TOKEN must differ from every role token"
+            );
+        }
+
+        let protected_roles = optional(env, "SWARM_PROTECTED_ROLES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|role| role.trim().to_string())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        ensure!(
+            protected_roles
+                .iter()
+                .all(|role| executor_set.contains(role)),
+            "SWARM_PROTECTED_ROLES must contain only configured executor roles"
+        );
+        ensure!(
+            protected_roles.is_empty() || task_service_token.is_some(),
+            "SWARM_PROTECTED_ROLES requires SWARM_TASK_SERVICE_TOKEN"
+        );
+
         let allowed_hosts = csv_required(env, "SWARM_MCP_ALLOWED_HOSTS")?;
         ensure!(
             !allowed_hosts.is_empty(),
@@ -667,6 +703,8 @@ impl Config {
             max_request_body_bytes: positive(env, "SWARM_MCP_MAX_REQUEST_BODY_BYTES")?,
             api_timeout: seconds(env, "SWARM_API_TIMEOUT_SECONDS")?,
             hermes_model_alias: required(env, "SWARM_HERMES_MODEL_ALIAS")?,
+            task_service_token,
+            protected_roles,
             state_db_path: PathBuf::from(required(env, "SWARM_STATE_DB_PATH")?),
             db_max_connections: positive(env, "SWARM_DB_MAX_CONNECTIONS")?,
             db_busy_timeout: seconds(env, "SWARM_DB_BUSY_TIMEOUT_SECONDS")?,
@@ -1317,10 +1355,62 @@ mod tests {
         assert_eq!(config.manager_role, "manager");
         assert_eq!(config.agent_roles, vec!["developer", "lead-developer"]);
         assert!(config.global_authorities.contains("manager"));
+        assert!(config.task_service_token.is_none());
         // dispatch_sources() follows all_roles order: manager first, then executors.
         assert_eq!(
             config.dispatch_sources("developer"),
             vec!["manager", "lead-developer"]
+        );
+    }
+
+    #[test]
+    fn task_service_token_is_distinct_and_at_least_32_bytes() {
+        let mut env = valid_env();
+        env.insert("SWARM_TASK_SERVICE_TOKEN".into(), "short".into());
+        assert!(load(&env).err().unwrap().to_string().contains("too short"));
+        let role_token = env["MANAGER_SWARM_MCP_TOKEN"].clone();
+        env.insert("SWARM_TASK_SERVICE_TOKEN".into(), role_token);
+        assert!(
+            load(&env)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("must differ")
+        );
+        env.insert("SWARM_TASK_SERVICE_TOKEN".into(), "s".repeat(48));
+        assert_eq!(
+            load(&env).unwrap().task_service_token.unwrap().expose(),
+            "s".repeat(48)
+        );
+    }
+
+    #[test]
+    fn protected_roles_are_explicit_and_require_service_auth() {
+        let mut env = valid_env();
+        assert!(load(&env).unwrap().protected_roles.is_empty());
+        env.insert("SWARM_TASK_SERVICE_TOKEN".into(), "s".repeat(48));
+        assert!(
+            load(&env).unwrap().protected_roles.is_empty(),
+            "service token alone must not fence existing roles"
+        );
+        env.insert("SWARM_PROTECTED_ROLES".into(), "developer".into());
+        assert!(load(&env).unwrap().protected_roles.contains("developer"));
+        env.insert("SWARM_PROTECTED_ROLES".into(), "manager".into());
+        assert!(
+            load(&env)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("executor roles")
+        );
+        env.insert("SWARM_PROTECTED_ROLES".into(), "developer".into());
+        env.remove("SWARM_TASK_SERVICE_TOKEN");
+        assert!(
+            load(&env)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires SWARM_TASK_SERVICE_TOKEN")
         );
     }
 

@@ -419,6 +419,12 @@ impl Dispatcher {
                 "allowed": allowed,
             }));
         }
+        if self.config.protected_roles.contains(&target) {
+            return tool_error(json!({
+                "ok": false,
+                "error": format!("generic dispatch_to is denied for protected role '{target}'"),
+            }));
+        }
         if let Some(outcome) = self
             .messaging_block(sender, std::slice::from_ref(&target))
             .await
@@ -2049,6 +2055,11 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<DispatchHandle, RunFailure> {
+        if self.config.protected_roles.contains(role) {
+            return Err(RunFailure::rejected(anyhow!(
+                "generic delivery is denied for protected role '{role}'"
+            )));
+        }
         if self.config.operator_hold {
             return Err(RunFailure::rejected(anyhow!(
                 "operator hold is active; fresh operator authorization is required"
@@ -2150,6 +2161,11 @@ impl Dispatcher {
         message: &str,
         instructions: &str,
     ) -> Result<DispatchHandle, RunFailure> {
+        if self.config.protected_roles.contains(role) {
+            return Err(RunFailure::rejected(anyhow!(
+                "generic delivery is denied for protected role '{role}'"
+            )));
+        }
         if self.config.operator_hold {
             return Err(RunFailure::rejected(anyhow!(
                 "operator hold is active; executor initiation is disabled"
@@ -2292,10 +2308,13 @@ impl Dispatcher {
             }) {
                 Vec::new()
             } else {
-                response.bytes().await.map_err(|error| {
-                    RunFailure::indeterminate(anyhow!("read {role} API refusal body: {error}"))
-                })?
-                .into()
+                response
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        RunFailure::indeterminate(anyhow!("read {role} API refusal body: {error}"))
+                    })?
+                    .into()
             };
             let (code, message) = refusal_detail(&detail);
             let error = match message.as_deref() {
@@ -3183,6 +3202,98 @@ mod tests {
         let store = Store::connect(&config).await?;
         let dispatcher = Dispatcher::new(config.clone(), store.clone())?;
         Ok((dispatcher, store, path))
+    }
+
+    #[tokio::test]
+    async fn protected_role_rejects_generic_direct_broadcast_and_queued_delivery()
+    -> anyhow::Result<()> {
+        let behavior: testutil::MockHermes =
+            Arc::new(|_, _| (202, json!({"run_id":"unprotected-run"})));
+        let (dispatcher, store, path) = dispatcher_with_mock(behavior).await?;
+        let mut config = (*dispatcher.config).clone();
+        config.protected_roles.insert("developer".to_string());
+        let fenced = Dispatcher::new(Arc::new(config), store.clone())?;
+        let direct = fenced
+            .dispatch_to(
+                "manager",
+                DispatchArgs {
+                    agent: "developer".into(),
+                    message: "wake".into(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(direct.is_error);
+        assert!(direct.value.to_string().contains("protected role"));
+        let broadcast = fenced
+            .dispatch_all(
+                "manager",
+                BroadcastArgs {
+                    message: "wake".into(),
+                    correlation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await;
+        assert!(broadcast.is_error);
+        assert!(
+            broadcast.value["results"]["developer"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("protected role")
+        );
+        assert!(
+            fenced
+                .dispatch_role("developer", "wake", "opaque")
+                .await
+                .is_err()
+        );
+        let sends: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM delivery_outbox WHERE recipient='developer'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(sends, 0);
+        // A pre-existing generic wake must not bypass the new fence in the worker.
+        store
+            .reserve_dispatch(
+                "old-operation",
+                "manager",
+                "dispatch_to",
+                &["developer".to_string()],
+                None,
+                "old-fingerprint",
+                100,
+                Duration::from_secs(60),
+            )
+            .await?;
+        fenced
+            .queue_role_delivery(
+                "old-operation",
+                "manager",
+                "dispatch_to",
+                "developer",
+                "wake",
+                "opaque",
+                Duration::from_secs(1),
+                "old busy wake",
+            )
+            .await
+            .map_err(|error| anyhow!("{error}"))?;
+        sqlx::query("UPDATE delivery_outbox SET next_attempt_ms=0 WHERE recipient='developer'")
+            .execute(store.pool())
+            .await?;
+        fenced.flush_delivery_queue().await?;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM delivery_outbox WHERE recipient='developer'")
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(status, "dead");
+        drop(fenced);
+        drop(dispatcher);
+        drop(store);
+        testutil::remove_db_files(&path).await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -4792,9 +4903,9 @@ mod tests {
         Ok(())
     }
 
-    /// dispatch_to must not register the run for a Telegram answer delivery
+    /// `dispatch_to` must not register the run for a Telegram answer delivery
     /// while the channel is off: the run-reply worker would otherwise enqueue
-    /// the terminal answer into the telegram_outbox nobody drains.
+    /// the terminal answer into the `telegram_outbox` nobody drains.
     #[tokio::test]
     async fn dispatch_to_does_not_track_run_replies_while_telegram_is_disabled()
     -> anyhow::Result<()> {
@@ -4817,7 +4928,11 @@ mod tests {
                 },
             )
             .await;
-        assert!(!outcome.is_error, "dispatch must succeed: {:?}", outcome.value);
+        assert!(
+            !outcome.is_error,
+            "dispatch must succeed: {:?}",
+            outcome.value
+        );
         let tracks = store.due_run_replies().await?;
         assert!(
             tracks.is_empty(),

@@ -9,7 +9,7 @@ use std::{
 use axum::{
     Extension, Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::sse::{Event as SseEvent, KeepAlive, Sse},
@@ -84,6 +84,12 @@ struct ActivityCredential {
 
 #[derive(Clone)]
 struct AuthenticatedRole(String);
+
+#[derive(Clone)]
+struct TaskServiceAuth {
+    token: String,
+    limiter: Arc<RequestLimiter>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -431,6 +437,38 @@ pub(crate) fn build_router(state: Arc<AppState>, cancellation: &CancellationToke
             activity_auth,
         ));
 
+    // Service-only snapshot and readiness; task-dispatch returns authenticated
+    // 503 until SLC reserve/bind and Hermes held-run admission are available.
+    // These endpoints never confer task readiness or complete coverage.
+    if let Some(token) = &state.config.task_service_token {
+        app = app.merge(
+            Router::new()
+                .route(
+                    "/internal/task-transport/{task_id}",
+                    get(task_transport_snapshot),
+                )
+                .route(
+                    "/internal/task-transport/readiness/{role}",
+                    get(task_transport_readiness),
+                )
+                .route("/internal/task-dispatch", post(task_dispatch_unavailable))
+                .route(
+                    "/internal/task-transport/{task_id}/fence",
+                    post(task_transport_fence),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    TaskServiceAuth {
+                        token: token.expose().to_string(),
+                        limiter: Arc::new(RequestLimiter::new(
+                            state.config.mcp_request_rate_limit,
+                            state.config.mcp_request_rate_window,
+                        )),
+                    },
+                    task_service_auth,
+                )),
+        );
+    }
+
     // Each role/activity sub-router carries its own middleware state (RoleAuth /
     // ActivityAuth) embedded in the layer. The outer router state (Arc<AppState>)
     // is baked into the route handlers by `with_state`, after which the router
@@ -462,6 +500,94 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
                 Json(json!({"ok": false, "ready": false})),
             )
                 .into_response()
+        }
+    }
+}
+
+async fn task_dispatch_unavailable() -> Response {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "task admission is not enabled",
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskFenceInput {
+    assignee: String,
+    reason: String,
+    expected_generation: Option<String>,
+}
+
+async fn task_transport_fence(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+    Json(input): Json<TaskFenceInput>,
+) -> Response {
+    if !matches!(crate::dispatch::validate_identifier(&task_id, "task_id"), Ok(ref value) if value == &task_id)
+        || !state.config.protected_roles.contains(&input.assignee)
+        || input.reason.trim().is_empty()
+        || input.reason.len() > 200
+    {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid task fence identity",
+        );
+    }
+    match state
+        .store
+        .fence_task_transport(
+            &task_id,
+            &input.assignee,
+            input.expected_generation.as_deref(),
+        )
+        .await
+    {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => {
+            warn!(%error, "task transport fence rejected");
+            api_error(StatusCode::CONFLICT, "task transport fence unavailable")
+        }
+    }
+}
+
+async fn task_transport_readiness(
+    State(state): State<Arc<AppState>>,
+    Path(role): Path<String>,
+) -> Response {
+    if !state.config.agent_roles.contains(&role) {
+        return api_error(StatusCode::NOT_FOUND, "unknown executor role");
+    }
+    let protected = state.config.protected_roles.contains(&role);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "profile": role,
+            "protected": protected,
+            "generic_dispatch_denied": protected,
+            "ingress_ready": false,
+            "ledger_complete": false,
+        })),
+    )
+        .into_response()
+}
+
+async fn task_transport_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Response {
+    if !matches!(crate::dispatch::validate_identifier(&task_id, "task_id"), Ok(ref validated) if validated == &task_id)
+    {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid task_id");
+    }
+    match state.store.task_transport_snapshot(&task_id).await {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(error) => {
+            error!(error = %error, "task transport snapshot failed");
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "task transport snapshot unavailable",
+            )
         }
     }
 }
@@ -561,6 +687,23 @@ async fn role_auth(State(auth): State<RoleAuth>, request: Request, next: Next) -
     }
     if !auth.limiter.allow().await {
         warn!(role = %auth.role, "MCP request rate limit exceeded");
+        return api_error(StatusCode::TOO_MANY_REQUESTS, "request rate limit exceeded");
+    }
+    next.run(request).await
+}
+
+async fn task_service_auth(
+    State(auth): State<TaskServiceAuth>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(provided) = bearer_token(request.headers()) else {
+        return unauthorized();
+    };
+    if !constant_time_equal(provided, &auth.token) {
+        return unauthorized();
+    }
+    if !auth.limiter.allow().await {
         return api_error(StatusCode::TOO_MANY_REQUESTS, "request rate limit exceeded");
     }
     next.run(request).await
@@ -824,6 +967,175 @@ mod tests {
             .expect("request");
         assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
 
+        drop(state);
+        testutil::remove_db_files(&db_path).await;
+    }
+
+    #[tokio::test]
+    async fn task_ingress_stays_unregistered_and_snapshot_is_service_only() {
+        let path = testutil::temp_db_path("task-transport-http");
+        let mut config = testutil::fixture_config(&path);
+        config.task_service_token = Some(crate::config::Secret::new(
+            "task-service-only-token-0123456789abcdef".into(),
+        ));
+        config.protected_roles.insert("developer".into());
+        let (state, db_path) = test_state(config).await;
+        let router = build_router(state.clone(), &CancellationToken::new());
+        for token in [
+            None,
+            Some(MANAGER_TOKEN),
+            Some("task-service-only-token-0123456789abcdef"),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/internal/task-dispatch")
+                .header(header::HOST, "localhost")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.unwrap_or("invalid")))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"task_id":"task-1","assignee":"developer","profile":"default","queue_ready_event_id":"event-1","message":"wake","transport_key":"key-1"}"#))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if token == Some("task-service-only-token-0123456789abcdef") {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+        }
+        let fence_url = "/internal/task-transport/task-1/fence";
+        for token in [
+            None,
+            Some(MANAGER_TOKEN),
+            Some("task-service-only-token-0123456789abcdef"),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(fence_url)
+                .header(header::HOST, "localhost")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.unwrap_or("invalid")),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"assignee":"developer","reason":"terminal","expected_generation":null}"#,
+                ))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            if token == Some("task-service-only-token-0123456789abcdef") {
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["transport_fenced"], true);
+                assert_eq!(value["complete"], false);
+                assert_eq!(value["watermark"], 0);
+            } else {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+        let url = "/internal/task-transport/task-1";
+        for token in [None, Some(MANAGER_TOKEN), Some(DEVELOPER_TOKEN)] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(get_request(url, token))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let service_token = "task-service-only-token-0123456789abcdef";
+        let readiness_url = "/internal/task-transport/readiness/developer";
+        for token in [None, Some(MANAGER_TOKEN)] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(get_request(readiness_url, token))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let response = router
+            .clone()
+            .oneshot(get_request(readiness_url, Some(service_token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let readiness: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            readiness,
+            json!({"profile":"developer", "protected":true,
+            "generic_dispatch_denied":true, "ingress_ready":false, "ledger_complete":false})
+        );
+        let response = router
+            .clone()
+            .oneshot(get_request(
+                "/internal/task-transport/readiness/lead-developer",
+                Some(service_token),
+            ))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let unprotected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(unprotected["protected"], false);
+        let response = router
+            .clone()
+            .oneshot(get_request(url, Some(service_token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot["complete"], false);
+        assert_eq!(snapshot["scope"], "verified_task_transport_only");
+        assert_eq!(snapshot["deliveries"], json!([]));
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(get_request(
+                    "/internal/task-transport/invalid%20task",
+                    Some(service_token)
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        drop(router);
+        drop(state);
+        testutil::remove_db_files(&db_path).await;
+    }
+
+    #[tokio::test]
+    async fn task_service_snapshot_is_not_registered_without_service_credential() {
+        let path = testutil::temp_db_path("task-transport-disabled");
+        let (state, db_path) = test_state(testutil::fixture_config(&path)).await;
+        let router = build_router(state.clone(), &CancellationToken::new());
+        assert_eq!(
+            router
+                .oneshot(get_request(
+                    "/internal/task-transport/task-1",
+                    Some(MANAGER_TOKEN)
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         drop(state);
         testutil::remove_db_files(&db_path).await;
     }
