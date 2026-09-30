@@ -12,7 +12,10 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 13;
+// A lease bounds how long a healthy POST actor may retain ownership without
+// renewal. Expiration is NOT evidence that Hermes did not accept the request.
+const TASK_POST_LEASE_MS: i64 = 30_000;
 const TELEGRAM_OFFSET_KEY: &str = "telegram_update_offset";
 const TELEGRAM_POLL_SUCCESS_KEY: &str = "telegram_poll_success";
 
@@ -106,6 +109,21 @@ pub struct DeliveryQueueItem {
     pub body: String,
     pub instructions: String,
     pub attempts: i64,
+}
+
+/// Storage identity for a future *verified* SLC admission ticket. No opaque
+/// `correlation_id` may be promoted to this identity without ticket validation.
+#[derive(Debug)]
+pub struct TaskDeliveryReservation<'a> {
+    pub task_id: &'a str,
+    pub event_id: &'a str,
+    pub profile: &'a str,
+    pub attempt_id: &'a str,
+    pub ticket_digest: &'a str,
+    pub hermes_idempotency_key: &'a str,
+    /// Exact outbound bytes; the ticket itself is not accepted from an agent.
+    pub hermes_body: &'a [u8],
+    pub ticket: &'a str,
 }
 
 pub struct ActivityRecord<'a> {
@@ -454,6 +472,18 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        if !Self::has_column(&mut tx, "task_transport_deliveries", "post_owner").await? {
+            sqlx::query("ALTER TABLE task_transport_deliveries ADD COLUMN post_owner TEXT")
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !Self::has_column(&mut tx, "task_transport_deliveries", "post_lease_until_ms").await? {
+            sqlx::query(
+                "ALTER TABLE task_transport_deliveries ADD COLUMN post_lease_until_ms INTEGER",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
         for table in ["dispatches", "delivery_outbox", "telegram_outbox"] {
             if !Self::has_column(&mut tx, table, "generation").await? {
                 sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN generation TEXT"))
@@ -700,6 +730,409 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Called only after an admission ticket has been verified by the service.
+    /// The transport attempt and its Hermes replay key are committed together,
+    /// before any network call. A conflicting identity cannot authorize work.
+    pub async fn reserve_task_delivery(
+        &self,
+        identity: &TaskDeliveryReservation<'_>,
+    ) -> anyhow::Result<bool> {
+        for (name, value) in [
+            ("task_id", identity.task_id),
+            ("event_id", identity.event_id),
+            ("profile", identity.profile),
+            ("attempt_id", identity.attempt_id),
+            ("ticket_digest", identity.ticket_digest),
+            ("hermes_idempotency_key", identity.hermes_idempotency_key),
+            ("ticket", identity.ticket),
+        ] {
+            ensure!(!value.is_empty(), "{name} must not be empty");
+        }
+        ensure!(
+            !identity.hermes_body.is_empty(),
+            "Hermes body must not be empty"
+        );
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_generation(&mut tx).await?;
+        ensure!(
+            !Self::task_fenced(&mut tx, identity.task_id).await?,
+            "task transport is fenced"
+        );
+        let inserted = sqlx::query(
+            r#"INSERT OR IGNORE INTO task_transport_deliveries
+               (task_id,event_id,profile,attempt_id,ticket_digest,hermes_key,hermes_body,ticket,status,created_ms,updated_ms,generation)
+               VALUES (?,?,?,?,?,?,?,?,'reserved',?,?,?)"#,
+        )
+        .bind(identity.task_id)
+        .bind(identity.event_id)
+        .bind(identity.profile)
+        .bind(identity.attempt_id)
+        .bind(identity.ticket_digest)
+        .bind(identity.hermes_idempotency_key)
+        .bind(identity.hermes_body)
+        .bind(identity.ticket)
+        .bind(Utc::now().timestamp_millis())
+        .bind(Utc::now().timestamp_millis())
+        .bind(&self.generation)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if !inserted {
+            let row = sqlx::query(
+                r#"SELECT ticket_digest,hermes_key,hermes_body,ticket,generation FROM task_transport_deliveries
+                   WHERE task_id=? AND event_id=? AND profile=? AND attempt_id=?"#,
+            )
+            .bind(identity.task_id)
+            .bind(identity.event_id)
+            .bind(identity.profile)
+            .bind(identity.attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            ensure!(
+                row.get::<String, _>("ticket_digest") == identity.ticket_digest
+                    && row.get::<String, _>("hermes_key") == identity.hermes_idempotency_key
+                    && row.get::<Vec<u8>, _>("hermes_body") == identity.hermes_body
+                    && row.get::<String, _>("ticket") == identity.ticket
+                    && row.get::<Option<String>, _>("generation") == self.generation,
+                "task delivery attempt conflicts with its durable reservation"
+            );
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Mark the attempt ambiguous *before* POST. A crash after this commit is
+    /// unknown, even if the process actually died before sending any bytes.
+    pub async fn begin_task_post(
+        &self,
+        identity: &TaskDeliveryReservation<'_>,
+    ) -> anyhow::Result<String> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_generation(&mut tx).await?;
+        ensure!(
+            !Self::task_fenced(&mut tx, identity.task_id).await?,
+            "task transport is fenced"
+        );
+        let owner = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp_millis();
+        let changed = sqlx::query(
+            r#"UPDATE task_transport_deliveries SET status='unknown',updated_ms=?,
+               post_owner=?,post_lease_until_ms=?
+               WHERE task_id=? AND event_id=? AND profile=? AND attempt_id=?
+                 AND ticket_digest=? AND hermes_key=? AND hermes_body=? AND ticket=?
+                 AND generation IS ? AND status IN ('reserved','queued')"#,
+        )
+        .bind(now)
+        .bind(&owner)
+        .bind(now.saturating_add(TASK_POST_LEASE_MS))
+        .bind(identity.task_id)
+        .bind(identity.event_id)
+        .bind(identity.profile)
+        .bind(identity.attempt_id)
+        .bind(identity.ticket_digest)
+        .bind(identity.hermes_idempotency_key)
+        .bind(identity.hermes_body)
+        .bind(identity.ticket)
+        .bind(&self.generation)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        ensure!(
+            changed == 1,
+            "task attempt is not reserved; do not POST again"
+        );
+        tx.commit().await?;
+        Ok(owner)
+    }
+
+    /// A live POST actor may renew its cross-process lease. The owner token is
+    /// deliberately never reassigned: a timed-out or crashed POST remains unknown
+    /// until an authenticated exact-attempt reconciliation proves its outcome.
+    pub async fn renew_task_post(
+        &self,
+        identity: &TaskDeliveryReservation<'_>,
+        owner: &str,
+    ) -> anyhow::Result<()> {
+        ensure!(!owner.is_empty(), "POST ownership token required");
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_generation(&mut tx).await?;
+        let now = Utc::now().timestamp_millis();
+        let changed = sqlx::query(
+            r#"UPDATE task_transport_deliveries SET post_lease_until_ms=?
+               WHERE task_id=? AND event_id=? AND profile=? AND attempt_id=?
+                 AND ticket_digest=? AND hermes_key=? AND hermes_body=? AND ticket=?
+                 AND generation IS ? AND status='unknown' AND post_owner=?"#,
+        )
+        .bind(now.saturating_add(TASK_POST_LEASE_MS))
+        .bind(identity.task_id)
+        .bind(identity.event_id)
+        .bind(identity.profile)
+        .bind(identity.attempt_id)
+        .bind(identity.ticket_digest)
+        .bind(identity.hermes_idempotency_key)
+        .bind(identity.hermes_body)
+        .bind(identity.ticket)
+        .bind(&self.generation)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        ensure!(changed == 1, "POST actor no longer owns this attempt");
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Only a proven Hermes result can resolve an unknown POST. Busy 429 keeps
+    /// the same attempt and key for a later retry, never a new attempt.
+    /// A Hermes run is `held` until SLC bind confirms Started; it is not yet
+    /// admitted just because Hermes returned 202.
+    pub async fn resolve_task_post(
+        &self,
+        identity: &TaskDeliveryReservation<'_>,
+        owner: &str,
+        status: &str,
+        run_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        ensure!(!owner.is_empty(), "POST ownership token required");
+        ensure!(
+            matches!(status, "queued" | "held" | "refused"),
+            "invalid task delivery result"
+        );
+        ensure!(
+            status != "held" || run_id.is_some_and(|id| !id.is_empty()),
+            "held run needs run_id"
+        );
+        ensure!(
+            status == "held" || run_id.is_none(),
+            "non-held result cannot have run_id"
+        );
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_generation(&mut tx).await?;
+        let changed = sqlx::query(
+            r#"UPDATE task_transport_deliveries SET status=?,run_id=?,updated_ms=?,
+               post_owner=NULL,post_lease_until_ms=NULL
+               WHERE task_id=? AND event_id=? AND profile=? AND attempt_id=?
+                 AND ticket_digest=? AND hermes_key=? AND hermes_body=? AND ticket=?
+                 AND generation IS ? AND status='unknown' AND post_owner=?"#,
+        )
+        .bind(status)
+        .bind(run_id)
+        .bind(Utc::now().timestamp_millis())
+        .bind(identity.task_id)
+        .bind(identity.event_id)
+        .bind(identity.profile)
+        .bind(identity.attempt_id)
+        .bind(identity.ticket_digest)
+        .bind(identity.hermes_idempotency_key)
+        .bind(identity.hermes_body)
+        .bind(identity.ticket)
+        .bind(&self.generation)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        ensure!(
+            changed == 1,
+            "task attempt result is not owned by this POST actor"
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Complete a held Hermes run only after SLC bind has durably confirmed
+    /// Started for this exact attempt/run pair. A failed bind stays held.
+    pub async fn mark_task_bound(
+        &self,
+        identity: &TaskDeliveryReservation<'_>,
+        run_id: &str,
+    ) -> anyhow::Result<()> {
+        ensure!(!run_id.is_empty(), "bound run_id must not be empty");
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_generation(&mut tx).await?;
+        let changed = sqlx::query(
+            r#"UPDATE task_transport_deliveries SET status='bound',updated_ms=?
+               WHERE task_id=? AND event_id=? AND profile=? AND attempt_id=?
+                 AND ticket_digest=? AND hermes_key=? AND run_id=?
+                 AND generation IS ? AND status='held'"#,
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(identity.task_id)
+        .bind(identity.event_id)
+        .bind(identity.profile)
+        .bind(identity.attempt_id)
+        .bind(identity.ticket_digest)
+        .bind(identity.hermes_idempotency_key)
+        .bind(run_id)
+        .bind(&self.generation)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        ensure!(changed == 1, "task attempt was not held for this run");
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Unpaginated and transactionally consistent. The watermark and all rows
+    /// come from one read snapshot; no retention or limit applies to this ledger.
+    async fn task_fenced(tx: &mut Transaction<'_, Sqlite>, task_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM task_transport_fences WHERE task_id=?)",
+        )
+        .bind(task_id)
+        .fetch_one(&mut **tx)
+        .await?
+            != 0)
+    }
+
+    /// A permanent, task-scoped admission fence. It commits under the same `SQLite`
+    /// writer lock as reservation and `begin_task_post`, so no fresh POST can start
+    /// after the fence is visible. Unknown/queued/held work is never called drained.
+    /// The SLC owner must independently verify every Hermes run and task event;
+    /// this response only proves what this local ledger can prove.
+    pub async fn fence_task_transport(
+        &self,
+        task_id: &str,
+        assignee: &str,
+        expected_generation: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        ensure!(
+            !task_id.is_empty() && !assignee.is_empty(),
+            "task and assignee required"
+        );
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_generation(&mut tx).await?;
+        ensure!(
+            expected_generation == self.generation.as_deref(),
+            "delivery generation mismatch"
+        );
+        let existing = sqlx::query(
+            "SELECT assignee,fence_id,generation FROM task_transport_fences WHERE task_id=?",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let fence_id = if let Some(row) = existing {
+            ensure!(
+                row.get::<String, _>("assignee") == assignee
+                    && row.get::<Option<String>, _>("generation") == self.generation,
+                "task fence identity mismatch"
+            );
+            row.get::<String, _>("fence_id")
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO task_transport_fences(task_id,assignee,fence_id,generation,created_ms) VALUES(?,?,?,?,?)")
+                .bind(task_id).bind(assignee).bind(&id).bind(&self.generation)
+                .bind(Utc::now().timestamp_millis()).execute(&mut *tx).await?;
+            id
+        };
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence),0) FROM task_transport_deliveries")
+                .fetch_one(&mut *tx)
+                .await?;
+        let rows = sqlx::query("SELECT sequence,event_id,profile,attempt_id,ticket_digest,hermes_key,status,run_id,post_owner,post_lease_until_ms FROM task_transport_deliveries WHERE task_id=? AND sequence<=? ORDER BY sequence")
+            .bind(task_id).bind(watermark).fetch_all(&mut *tx).await?;
+        let pending_count = rows
+            .iter()
+            .filter(|row| matches!(row.get::<&str, _>("status"), "reserved" | "queued" | "held"))
+            .count();
+        let unknown_count = rows
+            .iter()
+            .filter(|row| row.get::<&str, _>("status") == "unknown")
+            .count();
+        let now = Utc::now().timestamp_millis();
+        let active_post_count = rows
+            .iter()
+            .filter(|row| {
+                row.get::<&str, _>("status") == "unknown"
+                    && row
+                        .get::<Option<i64>, _>("post_lease_until_ms")
+                        .is_some_and(|until| until > now)
+            })
+            .count();
+        let expired_post_count = rows
+            .iter()
+            .filter(|row| {
+                row.get::<&str, _>("status") == "unknown"
+                    && row.get::<Option<String>, _>("post_owner").is_some()
+                    && row
+                        .get::<Option<i64>, _>("post_lease_until_ms")
+                        .is_none_or(|until| until <= now)
+            })
+            .count();
+        let deliveries: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "sequence":row.get::<i64, _>("sequence"),
+                    "event_id":row.get::<String, _>("event_id"),
+                    "profile":row.get::<String, _>("profile"),
+                    "attempt_id":row.get::<String, _>("attempt_id"),
+                    "ticket_digest":row.get::<String, _>("ticket_digest"),
+                    "hermes_idempotency_key":row.get::<String, _>("hermes_key"),
+                    "status":row.get::<String, _>("status"),
+                    "run_id":row.get::<Option<String>, _>("run_id"),
+                })
+            })
+            .collect();
+        tx.commit().await?;
+        Ok(
+            json!({"task_id":task_id,"assignee":assignee,"fence_id":fence_id,
+            "watermark":watermark,"transport_fenced":true,"complete":false,
+            "pending_count":pending_count,"unknown_count":unknown_count,
+            "active_post_count":active_post_count,"expired_post_count":expired_post_count,
+            "incomplete_reason":"trusted admission ingress, authenticated Hermes attempt reconciliation, and all-attempt/legacy coverage are not enabled",
+            "deliveries":deliveries}),
+        )
+    }
+
+    pub async fn task_transport_snapshot(&self, task_id: &str) -> anyhow::Result<Value> {
+        ensure!(!task_id.is_empty(), "task_id must not be empty");
+        let mut tx = self.pool.begin().await?;
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence),0) FROM task_transport_deliveries")
+                .fetch_one(&mut *tx)
+                .await?;
+        let rows = sqlx::query(
+            r#"SELECT sequence,event_id,profile,attempt_id,ticket_digest,hermes_key,
+                      status,run_id,created_ms,updated_ms,generation
+               FROM task_transport_deliveries WHERE task_id=? AND sequence<=? ORDER BY sequence"#,
+        )
+        .bind(task_id)
+        .bind(watermark)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let deliveries = rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "sequence": row.get::<i64, _>("sequence"),
+                    "event_id": row.get::<String, _>("event_id"),
+                    "profile": row.get::<String, _>("profile"),
+                    "attempt_id": row.get::<String, _>("attempt_id"),
+                    "ticket_digest": row.get::<String, _>("ticket_digest"),
+                    "hermes_idempotency_key": row.get::<String, _>("hermes_key"),
+                    "status": row.get::<String, _>("status"),
+                    "run_id": row.get::<Option<String>, _>("run_id"),
+                    "created_at": millis_to_rfc3339(row.get("created_ms")),
+                    "updated_at": millis_to_rfc3339(row.get("updated_ms")),
+                    "generation": row.get::<Option<String>, _>("generation"),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "task_id": task_id,
+            "watermark": watermark,
+            // Storage alone cannot prove every SLC READY event entered this
+            // ledger while generic opaque dispatch remains available.
+            "complete": false,
+            "scope": "verified_task_transport_only",
+            "incomplete_reason": "trusted task admission ingress is not enabled",
+            "deliveries": deliveries,
+        }))
     }
 
     pub async fn record_activity(
@@ -2359,6 +2792,37 @@ const SCHEMA: &[&str] = &[
          received_ms INTEGER NOT NULL,
          PRIMARY KEY(sender, target)
        )"#,
+    // Dedicated ledger: only trusted admission may insert. Generic opaque
+    // dispatches intentionally never appear here or imply completeness.
+    r#"CREATE TABLE IF NOT EXISTS task_transport_deliveries (
+         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+         task_id TEXT NOT NULL,
+         event_id TEXT NOT NULL,
+         profile TEXT NOT NULL,
+         attempt_id TEXT NOT NULL,
+         ticket_digest TEXT NOT NULL,
+         hermes_key TEXT NOT NULL,
+         hermes_body BLOB NOT NULL,
+         ticket TEXT NOT NULL,
+         status TEXT NOT NULL CHECK(status IN ('reserved','unknown','queued','held','bound','refused')),
+         run_id TEXT,
+         created_ms INTEGER NOT NULL,
+         updated_ms INTEGER NOT NULL,
+         generation TEXT,
+         post_owner TEXT,
+         post_lease_until_ms INTEGER,
+         UNIQUE(task_id,event_id,profile,attempt_id),
+         UNIQUE(attempt_id),
+         UNIQUE(hermes_key)
+       )"#,
+    "CREATE INDEX IF NOT EXISTS task_transport_task_idx ON task_transport_deliveries(task_id,sequence)",
+    r#"CREATE TABLE IF NOT EXISTS task_transport_fences (
+         task_id TEXT PRIMARY KEY,
+         assignee TEXT NOT NULL,
+         fence_id TEXT NOT NULL UNIQUE,
+         generation TEXT,
+         created_ms INTEGER NOT NULL
+       )"#,
     r#"CREATE TABLE IF NOT EXISTS dispatches (
          id TEXT PRIMARY KEY,
          sender TEXT NOT NULL,
@@ -2457,6 +2921,252 @@ const SCHEMA: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn trusted_task_ledger_preserves_crash_unknown_retry_key_and_full_snapshot()
+    -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("swarm-task-ledger-{}.db", Uuid::new_v4()));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let identity = TaskDeliveryReservation {
+            task_id: "task-1",
+            event_id: "ready-1",
+            profile: "developer",
+            attempt_id: "attempt-1",
+            ticket_digest: "ticket-sha256",
+            hermes_idempotency_key: "key-1",
+            hermes_body: br#"{"model":"hermes","input":"wake"}"#,
+            ticket: "slc-ticket-1",
+        };
+        assert!(store.reserve_task_delivery(&identity).await?);
+        assert!(
+            !store.reserve_task_delivery(&identity).await?,
+            "repeat reservation cannot create another attempt"
+        );
+        assert!(
+            store
+                .reserve_task_delivery(&TaskDeliveryReservation {
+                    hermes_idempotency_key: "different-key",
+                    ..identity
+                })
+                .await
+                .is_err(),
+            "same attempt cannot change Hermes key"
+        );
+        let identity = TaskDeliveryReservation {
+            hermes_idempotency_key: "key-1",
+            ..identity
+        };
+        let persisted = sqlx::query(
+            "SELECT hermes_body,ticket FROM task_transport_deliveries WHERE attempt_id='attempt-1'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(
+            persisted.get::<Vec<u8>, _>("hermes_body"),
+            identity.hermes_body
+        );
+        assert_eq!(persisted.get::<String, _>("ticket"), identity.ticket);
+        let owner = store.begin_task_post(&identity).await?;
+        assert!(
+            store.begin_task_post(&identity).await.is_err(),
+            "ambiguous POST cannot automatically retry"
+        );
+        drop(store);
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let unknown = store.task_transport_snapshot("task-1").await?;
+        assert_eq!(unknown["deliveries"][0]["status"], "unknown");
+        assert_eq!(unknown["deliveries"][0]["hermes_idempotency_key"], "key-1");
+        assert_eq!(unknown["complete"], false);
+        assert!(
+            store.begin_task_post(&identity).await.is_err(),
+            "restart cannot reopen unknown POST"
+        );
+        store
+            .resolve_task_post(&identity, &owner, "held", Some("run-1"))
+            .await?;
+        assert!(
+            store
+                .resolve_task_post(&identity, &owner, "held", Some("run-2"))
+                .await
+                .is_err()
+        );
+        let held = store.task_transport_snapshot("task-1").await?;
+        assert_eq!(held["deliveries"][0]["status"], "held");
+        assert_eq!(held["deliveries"][0]["run_id"], "run-1");
+        assert!(store.mark_task_bound(&identity, "run-2").await.is_err());
+        store.mark_task_bound(&identity, "run-1").await?;
+        assert_eq!(
+            store.task_transport_snapshot("task-1").await?["deliveries"][0]["status"],
+            "bound"
+        );
+        assert_eq!(held["watermark"], unknown["watermark"]);
+        store
+            .cleanup(1, 1, 1, Duration::from_secs(1), Duration::from_secs(1))
+            .await?;
+        assert_eq!(
+            store.task_transport_snapshot("task-1").await?["deliveries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_task_fence_blocks_new_and_queued_posts_after_restart() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("swarm-task-fence-{}.db", Uuid::new_v4()));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let identity = TaskDeliveryReservation {
+            task_id: "task-fenced",
+            event_id: "ready-1",
+            profile: "developer",
+            attempt_id: "attempt-1",
+            ticket_digest: "digest-1",
+            hermes_idempotency_key: "key-1",
+            hermes_body: br#"{"input":"wake"}"#,
+            ticket: "ticket-1",
+        };
+        store.reserve_task_delivery(&identity).await?;
+        let owner = store.begin_task_post(&identity).await?;
+        store
+            .resolve_task_post(&identity, &owner, "queued", None)
+            .await?;
+        let first = store
+            .fence_task_transport("task-fenced", "developer", None)
+            .await?;
+        assert_eq!(first["transport_fenced"], true);
+        assert_eq!(first["complete"], false);
+        assert_eq!(first["pending_count"], 1);
+        assert_eq!(first["unknown_count"], 0);
+        assert!(store.begin_task_post(&identity).await.is_err());
+        assert!(store.reserve_task_delivery(&identity).await.is_err());
+        assert!(
+            store
+                .fence_task_transport("task-fenced", "other", None)
+                .await
+                .is_err()
+        );
+        drop(store);
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let replay = store
+            .fence_task_transport("task-fenced", "developer", None)
+            .await?;
+        assert_eq!(replay["fence_id"], first["fence_id"]);
+        assert_eq!(replay["watermark"], first["watermark"]);
+        assert!(store.begin_task_post(&identity).await.is_err());
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_fence_observes_cross_process_post_and_expired_lease_stays_unknown()
+    -> anyhow::Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("swarm-task-post-owner-{}.db", Uuid::new_v4()));
+        let actor = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let fencer = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let identity = TaskDeliveryReservation {
+            task_id: "task-cross-process",
+            event_id: "ready-1",
+            profile: "developer",
+            attempt_id: "attempt-202",
+            ticket_digest: "digest-1",
+            hermes_idempotency_key: "key-202",
+            hermes_body: br#"{"input":"wake"}"#,
+            ticket: "ticket-1",
+        };
+        actor.reserve_task_delivery(&identity).await?;
+        let owner = actor.begin_task_post(&identity).await?;
+        assert!(
+            actor
+                .renew_task_post(&identity, "wrong-owner")
+                .await
+                .is_err()
+        );
+        let first = fencer
+            .fence_task_transport(identity.task_id, identity.profile, None)
+            .await?;
+        assert_eq!(first["complete"], false);
+        assert_eq!(first["active_post_count"], 1);
+        assert!(fencer.begin_task_post(&identity).await.is_err());
+        // Crash after remote 202 and before local commit: expiration does not
+        // prove the remote run ended or that it never started.
+        sqlx::query(
+            "UPDATE task_transport_deliveries SET post_lease_until_ms=0 WHERE attempt_id=?",
+        )
+        .bind(identity.attempt_id)
+        .execute(actor.pool())
+        .await?;
+        drop(actor);
+        let restarted = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        let expired = restarted
+            .fence_task_transport(identity.task_id, identity.profile, None)
+            .await?;
+        assert_eq!(expired["complete"], false);
+        assert_eq!(expired["unknown_count"], 1);
+        assert_eq!(expired["expired_post_count"], 1);
+        assert_eq!(expired["active_post_count"], 0);
+        assert!(restarted.begin_task_post(&identity).await.is_err());
+        assert!(
+            restarted
+                .resolve_task_post(&identity, "impostor", "held", Some("run-202"))
+                .await
+                .is_err()
+        );
+        restarted
+            .resolve_task_post(&identity, &owner, "held", Some("run-202"))
+            .await?;
+        let held = restarted
+            .fence_task_transport(identity.task_id, identity.profile, None)
+            .await?;
+        assert_eq!(held["complete"], false);
+        assert_eq!(held["deliveries"][0]["run_id"], "run-202");
+        restarted.pool.close().await;
+        fencer.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_task_429_reuses_attempt_and_snapshot_is_not_limited() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("swarm-task-retry-{}.db", Uuid::new_v4()));
+        let store = Store::connect_path(&path, 2, Duration::from_secs(2)).await?;
+        for n in 0..30 {
+            let attempt_id = format!("attempt-{n}");
+            let event_id = format!("ready-{n}");
+            let key = format!("key-{n}");
+            let identity = TaskDeliveryReservation {
+                task_id: "task-retry",
+                event_id: &event_id,
+                profile: "developer",
+                attempt_id: &attempt_id,
+                ticket_digest: "digest",
+                hermes_idempotency_key: &key,
+                hermes_body: br#"{"model":"hermes","input":"wake"}"#,
+                ticket: "slc-ticket",
+            };
+            store.reserve_task_delivery(&identity).await?;
+            let owner = store.begin_task_post(&identity).await?;
+            store
+                .resolve_task_post(&identity, &owner, "queued", None)
+                .await?;
+            let owner = store.begin_task_post(&identity).await?;
+            store
+                .resolve_task_post(&identity, &owner, "held", Some("run"))
+                .await?;
+        }
+        let snapshot = store.task_transport_snapshot("task-retry").await?;
+        assert_eq!(snapshot["deliveries"].as_array().unwrap().len(), 30);
+        assert_eq!(snapshot["deliveries"][0]["status"], "held");
+        assert!(snapshot["watermark"].as_i64().unwrap() >= 30);
+        store.pool.close().await;
+        remove_sqlite_files(&path).await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn stale_restart_cannot_rotate_and_revoked_keys_survive_retention() -> anyhow::Result<()>
